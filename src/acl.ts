@@ -1,4 +1,5 @@
 import { auth, db } from "./firebase";
+import { logError, logInfo, logWarn, opaqueRef } from "./logger";
 
 import type { Access, BoardDoc, Identity, TeamDoc } from "./types";
 
@@ -10,20 +11,44 @@ export async function resolveIdentity(token?: string): Promise<Identity> {
   }
   try {
     const decoded = await auth().verifyIdToken(token);
+    logInfo("firebase.identity.resolved", {
+      subjectRef: opaqueRef(decoded.uid),
+    });
     return { uid: decoded.uid, email: decoded.email ?? null };
-  } catch {
+  } catch (error) {
+    logError("firebase.identity.resolve_failed", error);
     return ANONYMOUS;
   }
 }
 
 export async function loadBoard(roomId: string): Promise<BoardDoc | null> {
-  const snap = await db().collection("boards").doc(roomId).get();
-  return snap.exists ? (snap.data() as BoardDoc) : null;
+  try {
+    const snap = await db().collection("boards").doc(roomId).get();
+    logInfo("firestore.board.loaded", {
+      boardId: roomId,
+      exists: snap.exists,
+    });
+    return snap.exists ? (snap.data() as BoardDoc) : null;
+  } catch (error) {
+    logError("firestore.board.load_failed", error, { boardId: roomId });
+    throw error;
+  }
 }
 
 async function loadTeam(teamId: string): Promise<TeamDoc | null> {
-  const snap = await db().collection("teams").doc(teamId).get();
-  return snap.exists ? (snap.data() as TeamDoc) : null;
+  try {
+    const snap = await db().collection("teams").doc(teamId).get();
+    logInfo("firestore.team.loaded", {
+      teamRef: opaqueRef(teamId),
+      exists: snap.exists,
+    });
+    return snap.exists ? (snap.data() as TeamDoc) : null;
+  } catch (error) {
+    logError("firestore.team.load_failed", error, {
+      teamRef: opaqueRef(teamId),
+    });
+    throw error;
+  }
 }
 
 function evaluate(
@@ -65,7 +90,29 @@ export async function authorize(
   roomId: string,
   identity: Identity,
 ): Promise<Access> {
-  const board = await loadBoard(roomId);
-  const team = board?.teamId ? await loadTeam(board.teamId) : null;
-  return evaluate(identity, board, team);
+  try {
+    const board = await loadBoard(roomId);
+    if (!board) {
+      logWarn("acl.board_missing_defaults_to_open", { boardId: roomId });
+    }
+    const team = board?.teamId ? await loadTeam(board.teamId) : null;
+    const access = evaluate(identity, board, team);
+    logInfo("acl.evaluated", {
+      boardId: roomId,
+      subjectRef: opaqueRef(identity.uid),
+      boardType: board?.type,
+      readPolicy: board?.readPolicy,
+      writePolicy: board?.writePolicy,
+      hasTeam: !!board?.teamId,
+      canRead: access.canRead,
+      canWrite: access.canWrite,
+    });
+    return access;
+  } catch (error) {
+    logError("acl.evaluate_failed", error, {
+      boardId: roomId,
+      subjectRef: opaqueRef(identity.uid),
+    });
+    throw error;
+  }
 }

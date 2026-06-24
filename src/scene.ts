@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 
 import { db } from "./firebase";
 import { decryptJSON, encryptJSON } from "./encryption";
+import { logError, logInfo } from "./logger";
 
 import type { ExcalidrawElement } from "./types";
 
@@ -112,16 +113,30 @@ export async function loadScene(
   roomId: string,
   roomKey: string,
 ): Promise<ExcalidrawElement[] | null> {
-  const snap = await sceneRef(roomId).get();
-  if (!snap.exists) {
-    return null;
+  try {
+    const snap = await sceneRef(roomId).get();
+    if (!snap.exists) {
+      logInfo("firestore.scene.missing", { boardId: roomId });
+      return null;
+    }
+    const stored = snap.data() as StoredScene;
+    const elements = await decryptJSON<ExcalidrawElement[]>(
+      roomKey,
+      toUint8(stored.ciphertext),
+      toUint8(stored.iv),
+    );
+    logInfo("firestore.scene.loaded", {
+      boardId: roomId,
+      elementCount: elements.length,
+      sceneVersion: stored.sceneVersion,
+    });
+    return elements;
+  } catch (error) {
+    logError("firestore.scene.load_or_decrypt_failed", error, {
+      boardId: roomId,
+    });
+    throw error;
   }
-  const stored = snap.data() as StoredScene;
-  return decryptJSON<ExcalidrawElement[]>(
-    roomKey,
-    toUint8(stored.ciphertext),
-    toUint8(stored.iv),
-  );
 }
 
 export async function persistScene(
@@ -137,7 +152,21 @@ export async function persistScene(
     ciphertext: Buffer.from(ciphertext),
     iv: Buffer.from(iv),
   };
-  await sceneRef(roomId).set(stored);
+  try {
+    await sceneRef(roomId).set(stored);
+    logInfo("firestore.scene.persisted", {
+      boardId: roomId,
+      elementCount: syncable.length,
+      sceneVersion,
+    });
+  } catch (error) {
+    logError("firestore.scene.persist_failed", error, {
+      boardId: roomId,
+      elementCount: syncable.length,
+      sceneVersion,
+    });
+    throw error;
+  }
 }
 
 export async function appendSceneHistory(params: {
@@ -167,61 +196,79 @@ export async function appendSceneHistory(params: {
   const createdAt = Date.now();
   const fileIds = referencedFileIds(syncable);
 
-  await db().runTransaction(async (transaction) => {
-    const metaSnapshot = await transaction.get(metaRef);
-    const meta = metaSnapshot.exists
-      ? (metaSnapshot.data() as HistoryMetadata)
-      : null;
+  try {
+    let skippedDuplicate = false;
+    await db().runTransaction(async (transaction) => {
+      const metaSnapshot = await transaction.get(metaRef);
+      const meta = metaSnapshot.exists
+        ? (metaSnapshot.data() as HistoryMetadata)
+        : null;
 
-    if (
-      meta?.historyVersion === SCENE_HISTORY_VERSION &&
-      meta.currentSceneVersion === sceneVersion
-    ) {
-      return;
-    }
+      if (
+        meta?.historyVersion === SCENE_HISTORY_VERSION &&
+        meta.currentSceneVersion === sceneVersion
+      ) {
+        skippedDuplicate = true;
+        return;
+      }
 
-    const existingEntries = meta?.entries ?? [];
-    const sequence = (meta?.lastSequence ?? -1) + 1;
-    const entryKind: HistoryEntryKind = sequence === 0 ? "initial" : "change";
+      const existingEntries = meta?.entries ?? [];
+      const sequence = (meta?.lastSequence ?? -1) + 1;
+      const entryKind: HistoryEntryKind = sequence === 0 ? "initial" : "change";
 
-    const entryMeta: HistoryEntryMeta = {
-      id: entryId,
-      kind: entryKind,
-      sequence,
-      createdAt,
-      sessionId: SESSION_ID,
-      ...(author ? { author } : {}),
-      parentId: meta?.currentEntryId ?? null,
-      summary:
-        entryKind === "initial" ? "Initial version" : "Shared scene updated",
-      fileIds,
-      sceneVersion,
-    };
+      const entryMeta: HistoryEntryMeta = {
+        id: entryId,
+        kind: entryKind,
+        sequence,
+        createdAt,
+        sessionId: SESSION_ID,
+        ...(author ? { author } : {}),
+        parentId: meta?.currentEntryId ?? null,
+        summary:
+          entryKind === "initial" ? "Initial version" : "Shared scene updated",
+        fileIds,
+        sceneVersion,
+      };
 
-    const allEntries = [...existingEntries, entryMeta];
-    const overflow = Math.max(0, allEntries.length - MAX_SCENE_HISTORY_ENTRIES);
-    const trimmedEntries = allEntries.slice(0, overflow);
-    const nextEntries = allEntries.slice(overflow);
+      const allEntries = [...existingEntries, entryMeta];
+      const overflow = Math.max(
+        0,
+        allEntries.length - MAX_SCENE_HISTORY_ENTRIES,
+      );
+      const trimmedEntries = allEntries.slice(0, overflow);
+      const nextEntries = allEntries.slice(overflow);
 
-    const nextMetadata: HistoryMetadata = {
-      historyVersion: SCENE_HISTORY_VERSION,
-      currentEntryId: entryId,
-      currentSceneVersion: sceneVersion,
-      lastSequence: sequence,
-      updatedAt: createdAt,
-      entries: nextEntries,
-    };
+      const nextMetadata: HistoryMetadata = {
+        historyVersion: SCENE_HISTORY_VERSION,
+        currentEntryId: entryId,
+        currentSceneVersion: sceneVersion,
+        lastSequence: sequence,
+        updatedAt: createdAt,
+        entries: nextEntries,
+      };
 
-    transaction.set(historyEntryRef(roomId, entryId), {
-      historyVersion: SCENE_HISTORY_VERSION,
-      sceneVersion,
-      ciphertext: Buffer.from(ciphertext),
-      iv: Buffer.from(iv),
+      transaction.set(historyEntryRef(roomId, entryId), {
+        historyVersion: SCENE_HISTORY_VERSION,
+        sceneVersion,
+        ciphertext: Buffer.from(ciphertext),
+        iv: Buffer.from(iv),
+      });
+      transaction.set(metaRef, nextMetadata);
+
+      for (const trimmed of trimmedEntries) {
+        transaction.delete(historyEntryRef(roomId, trimmed.id));
+      }
     });
-    transaction.set(metaRef, nextMetadata);
-
-    for (const trimmed of trimmedEntries) {
-      transaction.delete(historyEntryRef(roomId, trimmed.id));
-    }
-  });
+    logInfo("firestore.scene_history.appended", {
+      boardId: roomId,
+      sceneVersion,
+      skippedDuplicate,
+    });
+  } catch (error) {
+    logError("firestore.scene_history.append_failed", error, {
+      boardId: roomId,
+      sceneVersion,
+    });
+    throw error;
+  }
 }

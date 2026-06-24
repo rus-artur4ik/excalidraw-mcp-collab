@@ -5,6 +5,14 @@ import { auth, db } from "../firebase";
 import { decryptJSON, encryptJSON } from "../encryption";
 import { appendSceneHistory, loadScene, persistScene } from "../scene";
 import { applyUpdate, buildNewElement, markDeleted } from "../elements";
+import {
+  currentRequestId,
+  logError,
+  logInfo,
+  logWarn,
+  opaqueRef,
+  safeUrl,
+} from "../logger";
 
 import type { ExcalidrawElement, Role } from "../types";
 
@@ -77,52 +85,156 @@ export class CollabBot {
   // and its own ACL enforces read-only.
   private async mintIdToken(): Promise<string> {
     if (this.idToken && Date.now() < this.idTokenExpiresAt) {
+      logInfo("firebase.bot_id_token.cache_hit", {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
+      });
       return this.idToken;
     }
-    const customToken = await auth().createCustomToken(this.uid);
-    const response = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${config.firebaseWebApiKey}`,
-      {
+    let customToken: string;
+    try {
+      logInfo("firebase.custom_token.create_started", {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
+      });
+      customToken = await auth().createCustomToken(this.uid);
+      logInfo("firebase.custom_token.created", {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
+      });
+    } catch (error) {
+      logError("firebase.custom_token.create_failed", error, {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
+      });
+      throw error;
+    }
+
+    const exchangeUrl =
+      "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken";
+    let response: Response;
+    try {
+      logInfo("firebase.id_token.exchange_started", {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
+      });
+      response = await fetch(`${exchangeUrl}?key=${config.firebaseWebApiKey}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: customToken, returnSecureToken: true }),
-      },
-    );
-    if (!response.ok) {
-      throw new Error(`custom token exchange failed: ${response.status}`);
+      });
+    } catch (error) {
+      logError("firebase.id_token.exchange_network_failed", error, {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
+      });
+      throw error;
     }
-    const data = (await response.json()) as { idToken?: string };
+    if (!response.ok) {
+      const responseText = await response.text().catch(() => "");
+      const error = new Error(
+        `custom token exchange failed: ${response.status} ${response.statusText}`,
+      );
+      logError("firebase.id_token.exchange_rejected", error, {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
+        responseStatus: response.status,
+        responseBody: responseText.slice(0, 1000),
+      });
+      throw error;
+    }
+    let data: { idToken?: string };
+    try {
+      data = (await response.json()) as { idToken?: string };
+    } catch (error) {
+      logError("firebase.id_token.exchange_invalid_json", error, {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
+      });
+      throw error;
+    }
     if (!data.idToken) {
-      throw new Error("custom token exchange returned no idToken");
+      const error = new Error("custom token exchange returned no idToken");
+      logError("firebase.id_token.exchange_missing_token", error, {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
+      });
+      throw error;
     }
     this.idToken = data.idToken;
     this.idTokenExpiresAt = Date.now() + ID_TOKEN_TTL_MS;
+    logInfo("firebase.id_token.exchange_succeeded", {
+      boardId: this.boardId,
+      expiresInMs: ID_TOKEN_TTL_MS,
+    });
     return this.idToken;
   }
 
   private async loadBoardContext(): Promise<void> {
-    const keySnap = await db().collection("boardKeys").doc(this.boardId).get();
+    const keySnap = await (async () => {
+      try {
+        logInfo("firestore.board_key.load_started", { boardId: this.boardId });
+        return await db().collection("boardKeys").doc(this.boardId).get();
+      } catch (error) {
+        logError("firestore.board_key.load_failed", error, {
+          boardId: this.boardId,
+        });
+        throw error;
+      }
+    })();
     const roomKey = keySnap.exists
       ? (keySnap.data() as { roomKey?: string }).roomKey
       : undefined;
     if (!roomKey) {
-      throw new Error(`missing roomKey for board ${this.boardId}`);
+      const error = new Error(`missing roomKey for board ${this.boardId}`);
+      logError("firestore.board_key.missing", error, {
+        boardId: this.boardId,
+        documentExists: keySnap.exists,
+      });
+      throw error;
     }
     this.roomKey = roomKey;
+    logInfo("firestore.board_key.loaded", { boardId: this.boardId });
 
     try {
       const user = await auth().getUser(this.uid);
       this.displayName = user.displayName ?? user.email ?? this.uid;
-    } catch {
+      logInfo("firebase.bot_user.loaded", {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
+      });
+    } catch (error) {
+      logWarn("firebase.bot_user.load_failed_using_uid", {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
+        error:
+          error instanceof Error
+            ? { name: error.name, message: error.message }
+            : String(error),
+      });
       this.displayName = this.uid;
     }
   }
 
   private async initElements(): Promise<void> {
-    const stored = await loadScene(this.boardId, this.roomKey);
-    this.elements.clear();
-    for (const element of stored ?? []) {
-      this.elements.set(element.id, element);
+    try {
+      logInfo("collab.scene_initialization.started", {
+        boardId: this.boardId,
+      });
+      const stored = await loadScene(this.boardId, this.roomKey);
+      this.elements.clear();
+      for (const element of stored ?? []) {
+        this.elements.set(element.id, element);
+      }
+      logInfo("collab.scene_initialization.succeeded", {
+        boardId: this.boardId,
+        elementCount: this.elements.size,
+      });
+    } catch (error) {
+      logError("collab.scene_initialization.failed", error, {
+        boardId: this.boardId,
+      });
+      throw error;
     }
   }
 
@@ -158,12 +270,22 @@ export class CollabBot {
 
   async ensureConnected(): Promise<void> {
     if (this.accessDenied) {
+      logWarn("collab.connection.previously_denied", {
+        boardId: this.boardId,
+      });
       throw new BotAccessDeniedError(this.boardId);
     }
     if (this.socket?.connected) {
+      logInfo("collab.connection.reused", {
+        boardId: this.boardId,
+        socketId: this.socket.id,
+      });
       return;
     }
     if (this.connecting) {
+      logInfo("collab.connection.awaiting_inflight", {
+        boardId: this.boardId,
+      });
       return this.connecting;
     }
     this.connecting = this.connect().finally(() => {
@@ -173,6 +295,13 @@ export class CollabBot {
   }
 
   private async connect(): Promise<void> {
+    const startedAt = Date.now();
+    logInfo("collab.connection.started", {
+      boardId: this.boardId,
+      subjectRef: opaqueRef(this.uid),
+      role: this.role,
+      wsServerUrl: safeUrl(config.wsServerUrl),
+    });
     if (!this.roomKey) {
       await this.loadBoardContext();
       await this.initElements();
@@ -182,16 +311,29 @@ export class CollabBot {
     await new Promise<void>((resolve, reject) => {
       const socket = io(config.wsServerUrl, {
         transports: ["websocket", "polling"],
-        auth: { token },
+        auth: { token, traceId: currentRequestId() },
       });
       this.socket = socket;
 
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const settle = (action: () => void) => {
+      let settled = false;
+      const settle = (event: string, action: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         clearTimeout(timer);
+        logInfo("collab.connection.settled", {
+          boardId: this.boardId,
+          event,
+          socketId: socket.id,
+          connected: socket.connected,
+          durationMs: Date.now() - startedAt,
+        });
         action();
       };
       const detach = () => {
+        socket.removeAllListeners();
         socket.close();
         if (this.socket === socket) {
           this.socket = null;
@@ -199,40 +341,99 @@ export class CollabBot {
       };
 
       const onError = (error: unknown) => {
+        logError("collab.connection.failed", error, {
+          boardId: this.boardId,
+          socketId: socket.id,
+          connected: socket.connected,
+          durationMs: Date.now() - startedAt,
+          wsServerUrl: safeUrl(config.wsServerUrl),
+        });
         detach();
-        settle(() =>
+        settle("error", () =>
           reject(error instanceof Error ? error : new Error(String(error))),
         );
       };
 
-      socket.on("init-room", () => {
-        socket.emit("join-room", this.boardId);
+      socket.on("connect", () => {
+        logInfo("collab.socket.connected", {
+          boardId: this.boardId,
+          socketId: socket.id,
+          transport: socket.io.engine.transport.name,
+        });
       });
-      socket.on("first-in-room", () => settle(resolve));
-      socket.on("room-user-change", () => settle(resolve));
-      socket.on("new-user", () => settle(resolve));
-      socket.on("access-denied", () => {
+      socket.on("init-room", () => {
+        logInfo("collab.socket.init_room_received", {
+          boardId: this.boardId,
+          socketId: socket.id,
+        });
+        socket.emit("join-room", this.boardId);
+        logInfo("collab.socket.join_room_sent", {
+          boardId: this.boardId,
+          socketId: socket.id,
+        });
+      });
+      socket.on("first-in-room", () => settle("first-in-room", resolve));
+      socket.on("room-user-change", () =>
+        settle("room-user-change", resolve),
+      );
+      socket.on("new-user", () => settle("new-user", resolve));
+      socket.on("access-denied", (payload: unknown) => {
+        logWarn("collab.socket.access_denied", {
+          boardId: this.boardId,
+          socketId: socket.id,
+          payload,
+        });
         this.accessDenied = true;
         detach();
-        settle(() => reject(new BotAccessDeniedError(this.boardId)));
+        settle("access-denied", () =>
+          reject(new BotAccessDeniedError(this.boardId)),
+        );
       });
       socket.on("client-broadcast", (data: ArrayBuffer, iv: Uint8Array) => {
         void this.handleClientBroadcast(data, iv);
       });
       socket.on("connect_error", onError);
+      socket.on("disconnect", (reason, description) => {
+        logWarn("collab.socket.disconnected", {
+          boardId: this.boardId,
+          socketId: socket.id,
+          reason,
+          description:
+            description instanceof Error
+              ? description.message
+              : description === undefined
+                ? undefined
+                : String(description),
+          settled,
+        });
+        if (!settled) {
+          onError(new Error(`collab socket disconnected before join: ${reason}`));
+        }
+      });
 
       timer = setTimeout(() => {
         if (socket.connected) {
-          resolve();
+          logWarn("collab.connection.join_ack_timeout_connected", {
+            boardId: this.boardId,
+            socketId: socket.id,
+            durationMs: Date.now() - startedAt,
+          });
+          settle("connected-without-room-ack", resolve);
           return;
         }
-        onError(new Error(`collab connection timed out for board ${this.boardId}`));
+        onError(
+          new Error(`collab connection timed out for board ${this.boardId}`),
+        );
       }, 4000);
     });
   }
 
   private async broadcastUpdate(changed: ExcalidrawElement[]): Promise<void> {
     if (!this.socket?.connected) {
+      logWarn("collab.broadcast.skipped_disconnected", {
+        boardId: this.boardId,
+        changedCount: changed.length,
+      });
       return;
     }
     const data: Broadcast = {
@@ -249,18 +450,37 @@ export class CollabBot {
       ),
       iv,
     );
+    logInfo("collab.broadcast.sent", {
+      boardId: this.boardId,
+      changedCount: changed.length,
+      socketId: this.socket.id,
+    });
   }
 
   private async commit(changed: ExcalidrawElement[]): Promise<void> {
     const all = [...this.elements.values()];
-    await this.broadcastUpdate(changed);
-    await persistScene(this.boardId, this.roomKey, all);
-    await appendSceneHistory({
-      roomId: this.boardId,
-      roomKey: this.roomKey,
-      author: this.authorLabel,
-      elements: all,
-    });
+    try {
+      await this.broadcastUpdate(changed);
+      await persistScene(this.boardId, this.roomKey, all);
+      await appendSceneHistory({
+        roomId: this.boardId,
+        roomKey: this.roomKey,
+        author: this.authorLabel,
+        elements: all,
+      });
+      logInfo("collab.commit.succeeded", {
+        boardId: this.boardId,
+        changedCount: changed.length,
+        totalCount: all.length,
+      });
+    } catch (error) {
+      logError("collab.commit.failed", error, {
+        boardId: this.boardId,
+        changedCount: changed.length,
+        totalCount: all.length,
+      });
+      throw error;
+    }
   }
 
   private requireEditor(): void {
@@ -283,10 +503,8 @@ export class CollabBot {
       if (filter?.type && element.type !== filter.type) {
         return false;
       }
-      if (filter?.ids && !filter.ids.includes(element.id)) {
-        return false;
-      }
-      return true;
+      return !(filter?.ids && !filter.ids.includes(element.id));
+
     });
   }
 
@@ -347,6 +565,10 @@ export class CollabBot {
   }
 
   dispose(): void {
+    logInfo("collab.bot.disposed", {
+      boardId: this.boardId,
+      socketId: this.socket?.id,
+    });
     this.socket?.close();
     this.socket = null;
   }
@@ -360,6 +582,7 @@ export function getOrCreateBot(
 ): CollabBot {
   const existing = bots.get(token);
   if (existing && existing.matches(identity)) {
+    logInfo("collab.bot.reused", { boardId: identity.boardId });
     return existing;
   }
   if (existing) {
@@ -367,6 +590,11 @@ export function getOrCreateBot(
   }
   const bot = new CollabBot(identity);
   bots.set(token, bot);
+  logInfo("collab.bot.created", {
+    boardId: identity.boardId,
+    role: identity.role,
+    subjectRef: opaqueRef(identity.uid),
+  });
   return bot;
 }
 

@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v3";
 
 import { ReadOnlyError, type CollabBot } from "./bot/CollabBot";
+import { logError, logInfo, logWarn } from "./logger";
 
 import type { ExcalidrawElement } from "./types";
 
@@ -64,13 +65,25 @@ const errorResult = (message: string) => ({
   content: [{ type: "text" as const, text: message }],
 });
 
-const runTool = async (fn: () => Promise<unknown>) => {
+const runTool = async (name: string, fn: () => Promise<unknown>) => {
+  const startedAt = Date.now();
+  logInfo("mcp.tool.started", { tool: name });
   try {
-    return textResult(await fn());
+    const result = await fn();
+    logInfo("mcp.tool.succeeded", {
+      tool: name,
+      durationMs: Date.now() - startedAt,
+    });
+    return textResult(result);
   } catch (error) {
     if (error instanceof ReadOnlyError) {
+      logWarn("mcp.tool.read_only_denied", { tool: name });
       return errorResult("read-only access");
     }
+    logError("mcp.tool.failed", error, {
+      tool: name,
+      durationMs: Date.now() - startedAt,
+    });
     return errorResult(error instanceof Error ? error.message : String(error));
   }
 };
@@ -88,7 +101,7 @@ export function buildMcpServer(bot: CollabBot): McpServer {
         "Return the current non-deleted elements of the collab board as JSON.",
       inputSchema: {},
     },
-    async () => runTool(() => bot.describeScene()),
+    async () => runTool("describe_scene", () => bot.describeScene()),
   );
 
   server.registerTool(
@@ -98,7 +111,7 @@ export function buildMcpServer(bot: CollabBot): McpServer {
       inputSchema: queryShape,
     },
     async (args) =>
-      runTool(() =>
+      runTool("query_elements", () =>
         bot.queryElements(args as { type?: string; ids?: string[] }),
       ),
   );
@@ -111,7 +124,7 @@ export function buildMcpServer(bot: CollabBot): McpServer {
       inputSchema: createShape,
     },
     async (args) =>
-      runTool(() =>
+      runTool("create_element", () =>
         bot.createElement(
           args as Partial<ExcalidrawElement> & { type: string },
         ),
@@ -127,7 +140,7 @@ export function buildMcpServer(bot: CollabBot): McpServer {
     },
     async (args) => {
       const { id, ...patch } = args as { id: string } & Partial<ExcalidrawElement>;
-      return runTool(() => bot.updateElement(id, patch));
+      return runTool("update_element", () => bot.updateElement(id, patch));
     },
   );
 
@@ -138,7 +151,7 @@ export function buildMcpServer(bot: CollabBot): McpServer {
       inputSchema: deleteShape,
     },
     async (args) =>
-      runTool(async () => {
+      runTool("delete_element", async () => {
         const { id } = args as { id: string };
         await bot.deleteElement(id);
         return { deleted: id };
@@ -152,7 +165,9 @@ export function buildMcpServer(bot: CollabBot): McpServer {
       inputSchema: {},
     },
     async () =>
-      runTool(async () => ({ deletedCount: await bot.clearCanvas() })),
+      runTool("clear_canvas", async () => ({
+        deletedCount: await bot.clearCanvas(),
+      })),
   );
 
   return server;

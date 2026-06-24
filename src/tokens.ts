@@ -1,6 +1,7 @@
 import { randomBytes } from "crypto";
 
 import { db } from "./firebase";
+import { logError, logInfo, opaqueRef } from "./logger";
 
 import type { McpTokenDoc, Role } from "./types";
 
@@ -23,13 +24,36 @@ export async function createToken(params: {
     createdAt: Date.now(),
     revoked: false,
   };
-  await db().collection(COLLECTION).doc(token).set(doc);
-  return { token, doc };
+  try {
+    await db().collection(COLLECTION).doc(token).set(doc);
+    logInfo("firestore.mcp_token.created", {
+      boardId: params.boardId,
+      role: params.role,
+      tokenRef: opaqueRef(token),
+    });
+    return { token, doc };
+  } catch (error) {
+    logError("firestore.mcp_token.create_failed", error, {
+      boardId: params.boardId,
+      role: params.role,
+    });
+    throw error;
+  }
 }
 
 export async function getToken(token: string): Promise<McpTokenDoc | null> {
-  const snap = await db().collection(COLLECTION).doc(token).get();
-  return snap.exists ? (snap.data() as McpTokenDoc) : null;
+  const tokenRef = opaqueRef(token);
+  try {
+    const snap = await db().collection(COLLECTION).doc(token).get();
+    logInfo("firestore.mcp_token.loaded", {
+      tokenRef,
+      exists: snap.exists,
+    });
+    return snap.exists ? (snap.data() as McpTokenDoc) : null;
+  } catch (error) {
+    logError("firestore.mcp_token.load_failed", error, { tokenRef });
+    throw error;
+  }
 }
 
 export async function listTokens(params: {
@@ -42,10 +66,31 @@ export async function listTokens(params: {
   if (params.boardId) {
     query = query.where("boardId", "==", params.boardId);
   }
-  const snap = await query.get();
-  return snap.docs.map((d) => ({ token: d.id, doc: d.data() as McpTokenDoc }));
+  try {
+    const snap = await query.get();
+    logInfo("firestore.mcp_token.listed", {
+      boardId: params.boardId,
+      count: snap.size,
+    });
+    return snap.docs.map((d) => ({
+      token: d.id,
+      doc: d.data() as McpTokenDoc,
+    }));
+  } catch (error) {
+    logError("firestore.mcp_token.list_failed", error, {
+      boardId: params.boardId,
+    });
+    throw error;
+  }
 }
 
 export async function revokeToken(token: string): Promise<void> {
-  await db().collection(COLLECTION).doc(token).update({ revoked: true });
+  const tokenRef = opaqueRef(token);
+  try {
+    await db().collection(COLLECTION).doc(token).update({ revoked: true });
+    logInfo("firestore.mcp_token.revoked", { tokenRef });
+  } catch (error) {
+    logError("firestore.mcp_token.revoke_failed", error, { tokenRef });
+    throw error;
+  }
 }
