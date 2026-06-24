@@ -1,0 +1,33 @@
+{
+  "name": "excalidraw-access-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Per-board access-controlled MCP, token, and file backend for a self-hosted Excalidraw fork",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.2",
+    "firebase-admin": "^14.0.0",
+    "fractional-indexing": "^3.3.0",
+    "socket.io-client": "^4.8.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.23",
+    "@types/node": "^20.19.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  }
+}
