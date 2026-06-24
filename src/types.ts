@@ -30,14 +30,20 @@ export type ExcalidrawElement = {
 
 export type Role = "editor" | "viewer";
 
+export type BotPolicy = "none" | "read" | "write";
+
+export const DEFAULT_BOT_POLICY: BotPolicy = "write";
+
 export type BoardDoc = {
   ownerUid?: string;
   ownerEmail?: string;
   type?: "personal" | "team";
   teamId?: string;
+  title?: string;
   readPolicy?: "public" | "members";
   writePolicy?: "everyone" | "whitelist" | "owner";
   editors?: string[];
+  botPolicy?: BotPolicy;
 };
 
 export type TeamDoc = {
@@ -49,10 +55,11 @@ export type TeamDoc = {
 export type McpTokenDoc = {
   uid: string;
   email: string | null;
-  boardId: string;
-  role: Role;
   createdAt: number;
   revoked: boolean;
+  // Legacy single-board tokens still carry these; account-scoped tokens omit them.
+  boardId?: string;
+  role?: Role;
 };
 
 export type Identity = {

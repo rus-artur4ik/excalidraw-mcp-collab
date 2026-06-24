@@ -8,6 +8,7 @@ import express, {
 
 import { config, getMcpUrl } from "./config";
 import { authorize } from "./acl";
+import { listAccessibleBoards } from "./boards";
 import { auth } from "./firebase";
 import {
   createToken,
@@ -17,8 +18,9 @@ import {
 } from "./tokens";
 import {
   BotAccessDeniedError,
-  disposeBot,
+  disposeBotsForToken,
   getOrCreateBot,
+  type CollabBot,
 } from "./bot/CollabBot";
 import { buildMcpServer } from "./mcp";
 import { getFile, putFile } from "./files";
@@ -151,32 +153,17 @@ app.post("/mcp/tokens", express.json(), asyncRoute(async (req, res) => {
   if (!user) {
     return;
   }
-  const boardId = (req.body as { boardId?: string })?.boardId;
-  if (!boardId) {
-    logWarn("mcp_token.create.missing_board_id");
-    res.status(400).json({ error: "boardId required" });
-    return;
-  }
-  setLogContext({ boardId });
 
-  const access = await authorize(boardId, user);
-  if (!access.canRead) {
-    logWarn("mcp_token.create.access_denied");
-    res.sendStatus(403);
-    return;
-  }
-  const role = access.canWrite ? "editor" : "viewer";
   const { token } = await createToken({
     uid: user.uid,
     email: user.email,
-    boardId,
-    role,
   });
 
   const mcpUrl = getMcpUrl(config.port);
+  const serverName = "excalidraw-team";
   const configSnippet = {
     mcpServers: {
-      "excalidraw-board": {
+      [serverName]: {
         type: "http",
         url: mcpUrl,
         headers: { Authorization: `Bearer ${token}` },
@@ -184,9 +171,8 @@ app.post("/mcp/tokens", express.json(), asyncRoute(async (req, res) => {
     },
   };
 
-  res.json({ token, mcpUrl, role, configSnippet });
+  res.json({ token, mcpUrl, serverName, configSnippet });
   logInfo("mcp_token.create.succeeded", {
-    role,
     tokenRef: opaqueRef(token),
   });
 }));
@@ -196,17 +182,10 @@ app.get("/mcp/tokens", asyncRoute(async (req, res) => {
   if (!user) {
     return;
   }
-  const boardId =
-    typeof req.query.boardId === "string" ? req.query.boardId : undefined;
-  if (boardId) {
-    setLogContext({ boardId });
-  }
-  const tokens = await listTokens({ uid: user.uid, boardId });
+  const tokens = await listTokens({ uid: user.uid });
   res.json({
     tokens: tokens.map(({ token, doc }) => ({
       token,
-      boardId: doc.boardId,
-      role: doc.role,
       createdAt: doc.createdAt,
       revoked: doc.revoked,
     })),
@@ -228,11 +207,10 @@ app.delete("/mcp/tokens/:token", asyncRoute(async (req, res) => {
     return;
   }
   setLogContext({
-    boardId: doc.boardId,
     tokenRef: opaqueRef(req.params.token),
   });
   await revokeToken(req.params.token);
-  disposeBot(req.params.token);
+  disposeBotsForToken(req.params.token);
   res.sendStatus(204);
   logInfo("mcp_token.revoke.succeeded");
 }));
@@ -269,45 +247,32 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     res.status(401).json({ error: "invalid or revoked token" });
     return;
   }
-  setLogContext({
-    boardId: doc.boardId,
-    subjectRef: opaqueRef(doc.uid),
-  });
-  logInfo("mcp.connect.token_resolved", { storedRole: doc.role });
+  const account = { uid: doc.uid, email: doc.email };
+  setLogContext({ subjectRef: opaqueRef(account.uid) });
+  logInfo("mcp.connect.token_resolved");
 
-  const access = await authorize(doc.boardId, {
-    uid: doc.uid,
-    email: doc.email,
-  });
-  if (!access.canRead) {
-    logWarn("mcp.connect.access_denied");
-    disposeBot(connectToken);
-    res.status(403).json({ error: "access denied to board" });
-    return;
-  }
-
-  const bot = getOrCreateBot(connectToken, {
-    uid: doc.uid,
-    boardId: doc.boardId,
-    role: access.canWrite ? "editor" : "viewer",
-  });
-
-  try {
-    await bot.ensureConnected();
-  } catch (error) {
-    if (error instanceof BotAccessDeniedError) {
-      logError("mcp.connect.room_access_denied", error);
-      disposeBot(connectToken);
-      res.status(403).json({ error: "access denied to board" });
-      return;
+  // An account token attaches a bot per board on demand; each board is
+  // authorized (and bot-policy capped) when a tool first targets it.
+  const resolveBot = async (boardId: string): Promise<CollabBot> => {
+    setLogContext({ boardId });
+    const access = await authorize(boardId, account, { asBot: true });
+    if (!access.canRead) {
+      logWarn("mcp.board.access_denied", { boardId });
+      throw new BotAccessDeniedError(boardId);
     }
-    logError("mcp.connect.bot_attach_failed", error);
-    res.status(502).json({ error: "failed to attach to collab board" });
-    return;
-  }
-  logInfo("mcp.connect.bot_attached");
+    const bot = getOrCreateBot(connectToken, {
+      uid: account.uid,
+      boardId,
+      role: access.canWrite ? "editor" : "viewer",
+    });
+    await bot.ensureConnected();
+    return bot;
+  };
 
-  const server = buildMcpServer(bot);
+  const server = buildMcpServer({
+    resolveBot,
+    listBoards: () => listAccessibleBoards(account),
+  });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });
@@ -364,6 +329,7 @@ app.listen(config.port, () => {
       ? safeUrl(config.publicBaseUrl)
       : undefined,
     credentialPath:
-      process.env.GOOGLE_APPLICATION_CREDENTIALS || "<not-configured>",
+      config.serviceAccountPath,
+    credentialType: "service-account-cert",
   });
 });

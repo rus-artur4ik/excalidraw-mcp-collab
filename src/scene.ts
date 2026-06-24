@@ -197,20 +197,11 @@ export async function appendSceneHistory(params: {
   const fileIds = referencedFileIds(syncable);
 
   try {
-    let skippedDuplicate = false;
     await db().runTransaction(async (transaction) => {
       const metaSnapshot = await transaction.get(metaRef);
       const meta = metaSnapshot.exists
         ? (metaSnapshot.data() as HistoryMetadata)
         : null;
-
-      if (
-        meta?.historyVersion === SCENE_HISTORY_VERSION &&
-        meta.currentSceneVersion === sceneVersion
-      ) {
-        skippedDuplicate = true;
-        return;
-      }
 
       const existingEntries = meta?.entries ?? [];
       const sequence = (meta?.lastSequence ?? -1) + 1;
@@ -262,7 +253,6 @@ export async function appendSceneHistory(params: {
     logInfo("firestore.scene_history.appended", {
       boardId: roomId,
       sceneVersion,
-      skippedDuplicate,
     });
   } catch (error) {
     logError("firestore.scene_history.append_failed", error, {

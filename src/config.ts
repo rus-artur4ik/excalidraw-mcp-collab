@@ -12,6 +12,7 @@ export const config = {
   port: Number(process.env.PORT ?? 3015),
   corsOrigin: process.env.CORS_ORIGIN ?? "*",
   firebaseProjectId: process.env.FIREBASE_PROJECT_ID ?? "excalidraw-team",
+  serviceAccountPath: required("GOOGLE_APPLICATION_CREDENTIALS"),
   firebaseWebApiKey: required("FIREBASE_WEB_API_KEY", "MISSING_WEB_API_KEY"),
   wsServerUrl: process.env.WS_SERVER_URL ?? "http://localhost:3002",
   dataDir: process.env.DATA_DIR ?? "./data",

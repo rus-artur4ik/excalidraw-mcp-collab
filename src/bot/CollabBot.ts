@@ -18,12 +18,35 @@ import type { ExcalidrawElement, Role } from "../types";
 
 const WS_SUBTYPE_INIT = "SCENE_INIT";
 const WS_SUBTYPE_UPDATE = "SCENE_UPDATE";
+const WS_SUBTYPE_MOUSE_LOCATION = "MOUSE_LOCATION";
 const ID_TOKEN_TTL_MS = 50 * 60 * 1000;
+const CURSOR_STEPS = 6;
+const CURSOR_STEP_DELAY_MS = 45;
 
 type Broadcast = {
   type: typeof WS_SUBTYPE_INIT | typeof WS_SUBTYPE_UPDATE;
   payload: { elements: ExcalidrawElement[] };
 };
+
+type CursorFrame = {
+  type: typeof WS_SUBTYPE_MOUSE_LOCATION;
+  payload: {
+    socketId: string;
+    pointer: { x: number; y: number; tool: "pointer" };
+    button: "up" | "down";
+    selectedElementIds: Record<string, true>;
+    username: string;
+    avatarUrl: string | null;
+  };
+};
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+const elementCenter = (element: ExcalidrawElement): { x: number; y: number } => ({
+  x: element.x + (element.width || 0) / 2,
+  y: element.y + (element.height || 0) / 2,
+});
 
 export type BotIdentity = {
   uid: string;
@@ -60,6 +83,7 @@ export class CollabBot {
   private connecting: Promise<void> | null = null;
 
   private elements = new Map<string, ExcalidrawElement>();
+  private lastPointer = { x: 0, y: 0 };
 
   constructor(identity: BotIdentity) {
     this.uid = identity.uid;
@@ -77,6 +101,77 @@ export class CollabBot {
 
   private get authorLabel(): string {
     return `Бот ${this.displayName || this.uid}`;
+  }
+
+  private get presenceName(): string {
+    return `🤖 ${this.displayName || "Bot"}`;
+  }
+
+  private async emitCursor(
+    pointer: { x: number; y: number },
+    selectedElementIds: Record<string, true>,
+  ): Promise<void> {
+    const socket = this.socket;
+    if (!socket?.connected || !socket.id) {
+      return;
+    }
+    const frame: CursorFrame = {
+      type: WS_SUBTYPE_MOUSE_LOCATION,
+      payload: {
+        socketId: socket.id,
+        pointer: { x: pointer.x, y: pointer.y, tool: "pointer" },
+        button: "up",
+        selectedElementIds,
+        username: this.presenceName,
+        avatarUrl: null,
+      },
+    };
+    try {
+      const { ciphertext, iv } = await encryptJSON(this.roomKey, frame);
+      socket.emit(
+        "server-volatile-broadcast",
+        this.boardId,
+        ciphertext.buffer.slice(
+          ciphertext.byteOffset,
+          ciphertext.byteOffset + ciphertext.byteLength,
+        ),
+        iv,
+      );
+    } catch (error) {
+      logWarn("collab.presence.emit_failed", {
+        boardId: this.boardId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async showActivity(
+    targets: ExcalidrawElement[],
+    select: boolean,
+  ): Promise<void> {
+    if (!this.socket?.connected || !targets.length) {
+      return;
+    }
+    const focus = elementCenter(targets[targets.length - 1]);
+    const selectedElementIds: Record<string, true> = {};
+    if (select) {
+      for (const target of targets) {
+        selectedElementIds[target.id] = true;
+      }
+    }
+    const from = this.lastPointer;
+    for (let step = 1; step <= CURSOR_STEPS; step++) {
+      const progress = step / CURSOR_STEPS;
+      await this.emitCursor(
+        {
+          x: from.x + (focus.x - from.x) * progress,
+          y: from.y + (focus.y - from.y) * progress,
+        },
+        step === CURSOR_STEPS ? selectedElementIds : {},
+      );
+      await sleep(CURSOR_STEP_DELAY_MS);
+    }
+    this.lastPointer = focus;
   }
 
   // The room socket server authenticates with a Firebase ID token. The Admin
@@ -311,7 +406,7 @@ export class CollabBot {
     await new Promise<void>((resolve, reject) => {
       const socket = io(config.wsServerUrl, {
         transports: ["websocket", "polling"],
-        auth: { token, traceId: currentRequestId() },
+        auth: { token, traceId: currentRequestId(), asBot: true },
       });
       this.socket = socket;
 
@@ -426,6 +521,25 @@ export class CollabBot {
         );
       }, 4000);
     });
+
+    this.lastPointer = this.sceneCentroid();
+    await this.emitCursor(this.lastPointer, {});
+  }
+
+  private sceneCentroid(): { x: number; y: number } {
+    let sumX = 0;
+    let sumY = 0;
+    let count = 0;
+    for (const element of this.elements.values()) {
+      if (element.isDeleted) {
+        continue;
+      }
+      const center = elementCenter(element);
+      sumX += center.x;
+      sumY += center.y;
+      count += 1;
+    }
+    return count ? { x: sumX / count, y: sumY / count } : { x: 0, y: 0 };
   }
 
   private async broadcastUpdate(changed: ExcalidrawElement[]): Promise<void> {
@@ -459,28 +573,29 @@ export class CollabBot {
 
   private async commit(changed: ExcalidrawElement[]): Promise<void> {
     const all = [...this.elements.values()];
+    await this.broadcastUpdate(changed);
+    await persistScene(this.boardId, this.roomKey, all);
+    // History is recorded independently: a history failure must not lose the
+    // user-visible change (already broadcast + persisted), but must be loud.
     try {
-      await this.broadcastUpdate(changed);
-      await persistScene(this.boardId, this.roomKey, all);
       await appendSceneHistory({
         roomId: this.boardId,
         roomKey: this.roomKey,
         author: this.authorLabel,
         elements: all,
       });
-      logInfo("collab.commit.succeeded", {
-        boardId: this.boardId,
-        changedCount: changed.length,
-        totalCount: all.length,
-      });
     } catch (error) {
-      logError("collab.commit.failed", error, {
+      logError("collab.commit.history_failed", error, {
         boardId: this.boardId,
         changedCount: changed.length,
         totalCount: all.length,
       });
-      throw error;
     }
+    logInfo("collab.commit.succeeded", {
+      boardId: this.boardId,
+      changedCount: changed.length,
+      totalCount: all.length,
+    });
   }
 
   private requireEditor(): void {
@@ -516,6 +631,7 @@ export class CollabBot {
     const element = buildNewElement(attrs, [...this.elements.values()]);
     this.elements.set(element.id, element);
     await this.commit([element]);
+    await this.showActivity([element], true);
     return element;
   }
 
@@ -532,6 +648,7 @@ export class CollabBot {
     const updated = applyUpdate(current, patch);
     this.elements.set(id, updated);
     await this.commit([updated]);
+    await this.showActivity([updated], true);
     return updated;
   }
 
@@ -544,6 +661,7 @@ export class CollabBot {
     }
     const deleted = markDeleted(current);
     this.elements.set(id, deleted);
+    await this.showActivity([current], false);
     await this.commit([deleted]);
   }
 
@@ -576,11 +694,15 @@ export class CollabBot {
 
 const bots = new Map<string, CollabBot>();
 
+const botKey = (token: string, boardId: string): string => `${token}:${boardId}`;
+const tokenPrefix = (token: string): string => `${token}:`;
+
 export function getOrCreateBot(
   token: string,
   identity: BotIdentity,
 ): CollabBot {
-  const existing = bots.get(token);
+  const key = botKey(token, identity.boardId);
+  const existing = bots.get(key);
   if (existing && existing.matches(identity)) {
     logInfo("collab.bot.reused", { boardId: identity.boardId });
     return existing;
@@ -589,7 +711,7 @@ export function getOrCreateBot(
     existing.dispose();
   }
   const bot = new CollabBot(identity);
-  bots.set(token, bot);
+  bots.set(key, bot);
   logInfo("collab.bot.created", {
     boardId: identity.boardId,
     role: identity.role,
@@ -598,10 +720,12 @@ export function getOrCreateBot(
   return bot;
 }
 
-export function disposeBot(token: string): void {
-  const bot = bots.get(token);
-  if (bot) {
-    bot.dispose();
-    bots.delete(token);
+export function disposeBotsForToken(token: string): void {
+  const prefix = tokenPrefix(token);
+  for (const [key, bot] of bots) {
+    if (key.startsWith(prefix)) {
+      bot.dispose();
+      bots.delete(key);
+    }
   }
 }

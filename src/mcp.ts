@@ -1,12 +1,24 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v3";
 
-import { ReadOnlyError, type CollabBot } from "./bot/CollabBot";
+import {
+  BotAccessDeniedError,
+  ReadOnlyError,
+  type CollabBot,
+} from "./bot/CollabBot";
 import { logError, logInfo, logWarn } from "./logger";
 
+import type { AccessibleBoard } from "./boards";
 import type { ExcalidrawElement } from "./types";
 
+const boardIdShape = {
+  boardId: z
+    .string()
+    .describe("Target board id. Use list_boards to discover accessible boards."),
+};
+
 const createShape = {
+  ...boardIdShape,
   type: z
     .string()
     .describe("Excalidraw element type, e.g. rectangle, ellipse, text, line"),
@@ -29,6 +41,7 @@ const createShape = {
 };
 
 const updateShape = {
+  ...boardIdShape,
   id: z.string(),
   x: z.number().optional(),
   y: z.number().optional(),
@@ -48,11 +61,13 @@ const updateShape = {
 };
 
 const queryShape = {
+  ...boardIdShape,
   type: z.string().optional(),
   ids: z.array(z.string()).optional(),
 };
 
 const deleteShape = {
+  ...boardIdShape,
   id: z.string(),
 };
 
@@ -78,7 +93,11 @@ const runTool = async (name: string, fn: () => Promise<unknown>) => {
   } catch (error) {
     if (error instanceof ReadOnlyError) {
       logWarn("mcp.tool.read_only_denied", { tool: name });
-      return errorResult("read-only access");
+      return errorResult("read-only access on this board");
+    }
+    if (error instanceof BotAccessDeniedError) {
+      logWarn("mcp.tool.access_denied", { tool: name });
+      return errorResult(error.message);
     }
     logError("mcp.tool.failed", error, {
       tool: name,
@@ -88,71 +107,103 @@ const runTool = async (name: string, fn: () => Promise<unknown>) => {
   }
 };
 
-export function buildMcpServer(bot: CollabBot): McpServer {
+export type McpContext = {
+  resolveBot: (boardId: string) => Promise<CollabBot>;
+  listBoards: () => Promise<AccessibleBoard[]>;
+};
+
+export function buildMcpServer(ctx: McpContext): McpServer {
   const server = new McpServer({
-    name: "excalidraw-access-backend",
+    name: "excalidraw-team",
     version: "1.0.0",
   });
 
   server.registerTool(
-    "describe_scene",
+    "list_boards",
     {
       description:
-        "Return the current non-deleted elements of the collab board as JSON.",
+        "List the boards this account can access through the bot, with the bot's access level (read or write) on each.",
       inputSchema: {},
     },
-    async () => runTool("describe_scene", () => bot.describeScene()),
+    async () => runTool("list_boards", () => ctx.listBoards()),
+  );
+
+  server.registerTool(
+    "describe_scene",
+    {
+      description: "Return the current non-deleted elements of a board as JSON.",
+      inputSchema: boardIdShape,
+    },
+    async (args) =>
+      runTool("describe_scene", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.describeScene();
+      }),
   );
 
   server.registerTool(
     "query_elements",
     {
-      description: "Return elements optionally filtered by type and/or ids.",
+      description: "Return elements of a board optionally filtered by type and/or ids.",
       inputSchema: queryShape,
     },
     async (args) =>
-      runTool("query_elements", () =>
-        bot.queryElements(args as { type?: string; ids?: string[] }),
-      ),
+      runTool("query_elements", async () => {
+        const { boardId, ...filter } = args as {
+          boardId: string;
+          type?: string;
+          ids?: string[];
+        };
+        const bot = await ctx.resolveBot(boardId);
+        return bot.queryElements(filter);
+      }),
   );
 
   server.registerTool(
     "create_element",
     {
       description:
-        "Create a new Excalidraw element on the board (editor role required).",
+        "Create a new Excalidraw element on a board (bot write access required).",
       inputSchema: createShape,
     },
     async (args) =>
-      runTool("create_element", () =>
-        bot.createElement(
-          args as Partial<ExcalidrawElement> & { type: string },
-        ),
-      ),
+      runTool("create_element", async () => {
+        const { boardId, ...attrs } = args as {
+          boardId: string;
+        } & Partial<ExcalidrawElement> & { type: string };
+        const bot = await ctx.resolveBot(boardId);
+        return bot.createElement(attrs);
+      }),
   );
 
   server.registerTool(
     "update_element",
     {
       description:
-        "Update properties of an existing element by id (editor role required).",
+        "Update properties of an existing element by id (bot write access required).",
       inputSchema: updateShape,
     },
-    async (args) => {
-      const { id, ...patch } = args as { id: string } & Partial<ExcalidrawElement>;
-      return runTool("update_element", () => bot.updateElement(id, patch));
-    },
+    async (args) =>
+      runTool("update_element", async () => {
+        const { boardId, id, ...patch } = args as {
+          boardId: string;
+          id: string;
+        } & Partial<ExcalidrawElement>;
+        const bot = await ctx.resolveBot(boardId);
+        return bot.updateElement(id, patch);
+      }),
   );
 
   server.registerTool(
     "delete_element",
     {
-      description: "Delete an element by id (editor role required).",
+      description: "Delete an element by id (bot write access required).",
       inputSchema: deleteShape,
     },
     async (args) =>
       runTool("delete_element", async () => {
-        const { id } = args as { id: string };
+        const { boardId, id } = args as { boardId: string; id: string };
+        const bot = await ctx.resolveBot(boardId);
         await bot.deleteElement(id);
         return { deleted: id };
       }),
@@ -161,13 +212,14 @@ export function buildMcpServer(bot: CollabBot): McpServer {
   server.registerTool(
     "clear_canvas",
     {
-      description: "Delete all elements on the board (editor role required).",
-      inputSchema: {},
+      description: "Delete all elements on a board (bot write access required).",
+      inputSchema: boardIdShape,
     },
-    async () =>
-      runTool("clear_canvas", async () => ({
-        deletedCount: await bot.clearCanvas(),
-      })),
+    async (args) =>
+      runTool("clear_canvas", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return { deletedCount: await bot.clearCanvas() };
+      }),
   );
 
   return server;

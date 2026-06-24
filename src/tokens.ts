@@ -3,7 +3,7 @@ import { randomBytes } from "crypto";
 import { db } from "./firebase";
 import { logError, logInfo, opaqueRef } from "./logger";
 
-import type { McpTokenDoc, Role } from "./types";
+import type { McpTokenDoc } from "./types";
 
 const COLLECTION = "mcpTokens";
 
@@ -12,31 +12,22 @@ export const generateToken = (): string => randomBytes(32).toString("hex");
 export async function createToken(params: {
   uid: string;
   email: string | null;
-  boardId: string;
-  role: Role;
 }): Promise<{ token: string; doc: McpTokenDoc }> {
   const token = generateToken();
   const doc: McpTokenDoc = {
     uid: params.uid,
     email: params.email,
-    boardId: params.boardId,
-    role: params.role,
     createdAt: Date.now(),
     revoked: false,
   };
   try {
     await db().collection(COLLECTION).doc(token).set(doc);
     logInfo("firestore.mcp_token.created", {
-      boardId: params.boardId,
-      role: params.role,
       tokenRef: opaqueRef(token),
     });
     return { token, doc };
   } catch (error) {
-    logError("firestore.mcp_token.create_failed", error, {
-      boardId: params.boardId,
-      role: params.role,
-    });
+    logError("firestore.mcp_token.create_failed", error);
     throw error;
   }
 }

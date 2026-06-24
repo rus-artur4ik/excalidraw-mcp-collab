@@ -1,4 +1,4 @@
-import { applicationDefault, initializeApp, type App } from "firebase-admin/app";
+import { cert, initializeApp, type App } from "firebase-admin/app";
 import { getAuth, type Auth } from "firebase-admin/auth";
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 
@@ -9,7 +9,7 @@ let app: App | null = null;
 const getApp = (): App => {
   if (!app) {
     app = initializeApp({
-      credential: applicationDefault(),
+      credential: cert(config.serviceAccountPath),
       projectId: config.firebaseProjectId,
     });
   }

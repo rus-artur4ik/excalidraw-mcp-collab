@@ -1,9 +1,22 @@
 import { auth, db } from "./firebase";
 import { logError, logInfo, logWarn, opaqueRef } from "./logger";
 
-import type { Access, BoardDoc, Identity, TeamDoc } from "./types";
+import { DEFAULT_BOT_POLICY } from "./types";
+import type { Access, BoardDoc, BotPolicy, Identity, TeamDoc } from "./types";
 
 const ANONYMOUS: Identity = { uid: null, email: null };
+
+// A bot impersonates the token owner, so it never exceeds that user's access;
+// `botPolicy` only narrows it further per board.
+function capByBotPolicy(access: Access, botPolicy: BotPolicy): Access {
+  if (botPolicy === "none") {
+    return { canRead: false, canWrite: false };
+  }
+  if (botPolicy === "read") {
+    return { canRead: access.canRead, canWrite: false };
+  }
+  return access;
+}
 
 export async function resolveIdentity(token?: string): Promise<Identity> {
   if (!token) {
@@ -55,9 +68,11 @@ function evaluate(
   identity: Identity,
   board: BoardDoc | null,
   team: TeamDoc | null,
+  asBot: boolean,
 ): Access {
   if (!board) {
-    return { canRead: true, canWrite: true };
+    const open: Access = { canRead: true, canWrite: true };
+    return asBot ? capByBotPolicy(open, DEFAULT_BOT_POLICY) : open;
   }
 
   const { uid, email } = identity;
@@ -83,23 +98,29 @@ function evaluate(
     (board.writePolicy === "whitelist" && isWhitelisted) ||
     teamEditor;
 
-  return { canRead, canWrite };
+  const access: Access = { canRead, canWrite };
+  return asBot
+    ? capByBotPolicy(access, board.botPolicy ?? DEFAULT_BOT_POLICY)
+    : access;
 }
 
 export async function authorize(
   roomId: string,
   identity: Identity,
+  opts: { asBot?: boolean } = {},
 ): Promise<Access> {
+  const asBot = opts.asBot === true;
   try {
     const board = await loadBoard(roomId);
     if (!board) {
       logWarn("acl.board_missing_defaults_to_open", { boardId: roomId });
     }
     const team = board?.teamId ? await loadTeam(board.teamId) : null;
-    const access = evaluate(identity, board, team);
+    const access = evaluate(identity, board, team, asBot);
     logInfo("acl.evaluated", {
       boardId: roomId,
       subjectRef: opaqueRef(identity.uid),
+      asBot,
       boardType: board?.type,
       readPolicy: board?.readPolicy,
       writePolicy: board?.writePolicy,
