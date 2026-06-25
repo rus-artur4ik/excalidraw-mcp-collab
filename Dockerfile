@@ -14,6 +14,8 @@ FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 
+RUN apk add --no-cache fontconfig font-dejavu
+
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 

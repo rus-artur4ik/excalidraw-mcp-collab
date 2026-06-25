@@ -1,20 +1,31 @@
-import { io, type Socket } from "socket.io-client";
+import {randomUUID} from "crypto";
 
-import { config } from "../config";
-import { auth, db } from "../firebase";
-import { decryptJSON, encryptJSON } from "../encryption";
-import { appendSceneHistory, loadScene, persistScene } from "../scene";
-import { applyUpdate, buildNewElement, markDeleted } from "../elements";
+import {io, type Socket} from "socket.io-client";
+
+import {config} from "../config";
+import {auth, db} from "../firebase";
+import {decryptJSON, encryptJSON} from "../encryption";
+import {appendSceneHistory, getSceneVersion, loadScene, persistScene,} from "../scene";
+import {applyUpdate, buildNewElement, markDeleted} from "../elements";
 import {
-  currentRequestId,
-  logError,
-  logInfo,
-  logWarn,
-  opaqueRef,
-  safeUrl,
-} from "../logger";
+  type ArrangeOptions,
+  arrangePositions,
+  type Bounds,
+  elementAtPoint,
+  getCommonBounds,
+  getElementBounds,
+  isBindable,
+  lintElement,
+  type LintFinding,
+  lintScene,
+  planConnection,
+  type RenderOptions,
+  renderSvg,
+  svgToPngBase64,
+} from "../verify";
+import {currentRequestId, logError, logInfo, logWarn, opaqueRef, safeUrl,} from "../logger";
 
-import type { ExcalidrawElement, Role } from "../types";
+import type {ExcalidrawElement, Role} from "../types";
 
 const WS_SUBTYPE_INIT = "SCENE_INIT";
 const WS_SUBTYPE_UPDATE = "SCENE_UPDATE";
@@ -54,6 +65,13 @@ export type BotIdentity = {
   role: Role;
 };
 
+export type ElementWriteResult = {
+  element: ExcalidrawElement;
+  sceneVersion: number;
+  readback: { found: boolean; version?: number };
+  warnings: LintFinding[];
+};
+
 export class ReadOnlyError extends Error {
   constructor() {
     super("read-only access");
@@ -84,6 +102,18 @@ export class CollabBot {
 
   private elements = new Map<string, ExcalidrawElement>();
   private lastPointer = { x: 0, y: 0 };
+
+  private static readonly MAX_WRITE_LOG = 1000;
+  private static readonly MAX_UNDO = 50;
+  private writeLog: Array<{
+    id: string;
+    origin: "bot" | "incoming";
+    sceneVersionAfter: number;
+    updated: number;
+  }> = [];
+  private writeLogEvicted = false;
+  private undoStack: Array<Array<{ id: string; prior: ExcalidrawElement | null }>> = [];
+  private undoing = false;
 
   constructor(identity: BotIdentity) {
     this.uid = identity.uid;
@@ -333,13 +363,23 @@ export class CollabBot {
     }
   }
 
-  private reconcileIncoming(elements: ExcalidrawElement[]): void {
-    for (const incoming of elements) {
-      const current = this.elements.get(incoming.id);
-      if (!current || incoming.version > current.version) {
-        this.elements.set(incoming.id, incoming);
-      }
-    }
+  async createElement(
+    attrs: Partial<ExcalidrawElement> & { type: string },
+  ): Promise<ElementWriteResult> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const element = buildNewElement(attrs, [...this.elements.values()]);
+    this.pushUndo([{ id: element.id, prior: null }]);
+    this.elements.set(element.id, element);
+    await this.commit([element]);
+    this.recordWrites([element], "bot");
+    await this.showActivity([element], true);
+    return {
+      element,
+      sceneVersion: this.currentSceneVersion(),
+      readback: this.readback(element.id),
+      warnings: lintElement(element, this.liveElements()),
+    };
   }
 
   private async handleClientBroadcast(
@@ -604,6 +644,212 @@ export class CollabBot {
     }
   }
 
+  async updateElement(
+    id: string,
+    patch: Partial<ExcalidrawElement>,
+  ): Promise<ElementWriteResult> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const current = this.elements.get(id);
+    if (!current || current.isDeleted) {
+      throw new Error(`element not found: ${id}`);
+    }
+    this.pushUndo([{ id, prior: current }]);
+    const updated = applyUpdate(current, patch);
+    this.elements.set(id, updated);
+    await this.commit([updated]);
+    this.recordWrites([updated], "bot");
+    await this.showActivity([updated], true);
+    return {
+      element: updated,
+      sceneVersion: this.currentSceneVersion(),
+      readback: this.readback(id),
+      warnings: lintElement(updated, this.liveElements()),
+    };
+  }
+
+  async deleteElement(
+    id: string,
+  ): Promise<{ deleted: string; sceneVersion: number }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const current = this.elements.get(id);
+    if (!current || current.isDeleted) {
+      throw new Error(`element not found: ${id}`);
+    }
+    this.pushUndo([{ id, prior: current }]);
+    const deleted = markDeleted(current);
+    this.elements.set(id, deleted);
+    await this.showActivity([current], false);
+    await this.commit([deleted]);
+    this.recordWrites([deleted], "bot");
+    return { deleted: id, sceneVersion: this.currentSceneVersion() };
+  }
+
+  async clearCanvas(): Promise<number> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const changed: ExcalidrawElement[] = [];
+    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
+    for (const element of this.elements.values()) {
+      if (!element.isDeleted) {
+        frame.push({ id: element.id, prior: element });
+        const deleted = markDeleted(element);
+        this.elements.set(deleted.id, deleted);
+        changed.push(deleted);
+      }
+    }
+    if (changed.length) {
+      this.pushUndo(frame);
+      await this.commit(changed);
+      this.recordWrites(changed, "bot");
+    }
+    return changed.length;
+  }
+
+  async createElements(
+    items: Array<Partial<ExcalidrawElement> & { type: string }>,
+  ): Promise<{
+    created: ExcalidrawElement[];
+    sceneVersion: number;
+    warnings: LintFinding[];
+  }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const working = [...this.elements.values()];
+    const created: ExcalidrawElement[] = [];
+    for (const attrs of items) {
+      const element = buildNewElement(attrs, working);
+      working.push(element);
+      created.push(element);
+    }
+    this.pushUndo(created.map((element) => ({ id: element.id, prior: null })));
+    for (const element of created) {
+      this.elements.set(element.id, element);
+    }
+    if (created.length) {
+      await this.commit(created);
+      this.recordWrites(created, "bot");
+      await this.showActivity(created, true);
+    }
+    const live = this.liveElements();
+    const warnings = created.flatMap((element) => lintElement(element, live));
+    return { created, sceneVersion: this.currentSceneVersion(), warnings };
+  }
+
+  async connectElements(
+    fromId: string,
+    toId: string,
+    options: {
+      mode?: "inside" | "orbit" | "skip";
+      startArrowhead?: string | null;
+      endArrowhead?: string | null;
+    } = {},
+  ): Promise<ElementWriteResult> {
+    this.requireEditor();
+    await this.ensureConnected();
+    if (fromId === toId) {
+      throw new Error("cannot connect an element to itself");
+    }
+    const from = this.elements.get(fromId);
+    const to = this.elements.get(toId);
+    if (!from || from.isDeleted) {
+      throw new Error(`element not found: ${fromId}`);
+    }
+    if (!to || to.isDeleted) {
+      throw new Error(`element not found: ${toId}`);
+    }
+    if (!isBindable(from) || !isBindable(to)) {
+      throw new Error("both elements must be bindable shapes to connect");
+    }
+
+    const arrowId = randomUUID();
+    const plan = planConnection(from, to, {
+      arrowId,
+      mode: options.mode,
+      startArrowhead: options.startArrowhead,
+      endArrowhead: options.endArrowhead,
+    });
+    const arrow = buildNewElement(
+      { ...plan.arrow, id: arrowId },
+      [...this.elements.values()],
+    );
+    const pruneBackrefs = (
+      entries: { id: string; type: string }[],
+    ): { id: string; type: string }[] =>
+      entries.filter((entry) => {
+        if (entry.type !== "arrow" || entry.id === arrowId) {
+          return true;
+        }
+        const target = this.elements.get(entry.id);
+        return !!target && !target.isDeleted;
+      });
+    const fromUpdated = applyUpdate(from, {
+      boundElements: pruneBackrefs(plan.fromBoundElements),
+    });
+    const toUpdated = applyUpdate(to, {
+      boundElements: pruneBackrefs(plan.toBoundElements),
+    });
+
+    this.pushUndo([
+      { id: arrowId, prior: null },
+      { id: fromId, prior: from },
+      { id: toId, prior: to },
+    ]);
+    this.elements.set(arrowId, arrow);
+    this.elements.set(fromId, fromUpdated);
+    this.elements.set(toId, toUpdated);
+    const changed = [arrow, fromUpdated, toUpdated];
+    await this.commit(changed);
+    this.recordWrites(changed, "bot");
+    await this.showActivity([arrow], true);
+
+    return {
+      element: arrow,
+      sceneVersion: this.currentSceneVersion(),
+      readback: this.readback(arrowId),
+      warnings: lintElement(arrow, this.liveElements()),
+    };
+  }
+
+  async arrange(
+    ids: string[],
+    options: ArrangeOptions,
+  ): Promise<{ moved: ExcalidrawElement[]; sceneVersion: number }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const targets = ids
+      .map((id) => this.elements.get(id))
+      .filter((element): element is ExcalidrawElement => !!element && !element.isDeleted);
+    if (!targets.length) {
+      throw new Error("no matching elements to arrange");
+    }
+    const positions = arrangePositions(targets, options);
+    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
+    const changed: ExcalidrawElement[] = [];
+    for (const target of targets) {
+      const next = positions.get(target.id);
+      if (!next) {
+        continue;
+      }
+      frame.push({ id: target.id, prior: target });
+      const [minX, minY] = getElementBounds(target);
+      const updated = applyUpdate(target, {
+        x: target.x + (next[0] - minX),
+        y: target.y + (next[1] - minY),
+      });
+      this.elements.set(target.id, updated);
+      changed.push(updated);
+    }
+    if (changed.length) {
+      this.pushUndo(frame);
+      await this.commit(changed);
+      this.recordWrites(changed, "bot");
+      await this.showActivity(changed, true);
+    }
+    return { moved: changed, sceneVersion: this.currentSceneVersion() };
+  }
+
   async describeScene(): Promise<ExcalidrawElement[]> {
     await this.ensureConnected();
     return [...this.elements.values()].filter((element) => !element.isDeleted);
@@ -623,63 +869,236 @@ export class CollabBot {
     });
   }
 
-  async createElement(
-    attrs: Partial<ExcalidrawElement> & { type: string },
-  ): Promise<ExcalidrawElement> {
+  async undoLast(): Promise<{ undone: number; sceneVersion: number }> {
     this.requireEditor();
     await this.ensureConnected();
-    const element = buildNewElement(attrs, [...this.elements.values()]);
-    this.elements.set(element.id, element);
-    await this.commit([element]);
-    await this.showActivity([element], true);
-    return element;
-  }
-
-  async updateElement(
-    id: string,
-    patch: Partial<ExcalidrawElement>,
-  ): Promise<ExcalidrawElement> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const current = this.elements.get(id);
-    if (!current || current.isDeleted) {
-      throw new Error(`element not found: ${id}`);
+    const frame = this.undoStack.pop();
+    if (!frame) {
+      return { undone: 0, sceneVersion: this.currentSceneVersion() };
     }
-    const updated = applyUpdate(current, patch);
-    this.elements.set(id, updated);
-    await this.commit([updated]);
-    await this.showActivity([updated], true);
-    return updated;
-  }
-
-  async deleteElement(id: string): Promise<void> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const current = this.elements.get(id);
-    if (!current || current.isDeleted) {
-      throw new Error(`element not found: ${id}`);
-    }
-    const deleted = markDeleted(current);
-    this.elements.set(id, deleted);
-    await this.showActivity([current], false);
-    await this.commit([deleted]);
-  }
-
-  async clearCanvas(): Promise<number> {
-    this.requireEditor();
-    await this.ensureConnected();
     const changed: ExcalidrawElement[] = [];
-    for (const element of this.elements.values()) {
-      if (!element.isDeleted) {
-        const deleted = markDeleted(element);
-        this.elements.set(deleted.id, deleted);
-        changed.push(deleted);
+    for (const { id, prior } of frame) {
+      const current = this.elements.get(id);
+      if (prior === null) {
+        if (current && !current.isDeleted) {
+          const deleted = markDeleted(current);
+          this.elements.set(id, deleted);
+          changed.push(deleted);
+        }
+        continue;
       }
+      const base = current ?? prior;
+      const restored = applyUpdate(base, prior);
+      this.elements.set(id, restored);
+      changed.push(restored);
     }
     if (changed.length) {
-      await this.commit(changed);
+      this.undoing = true;
+      try {
+        await this.commit(changed);
+      } finally {
+        this.undoing = false;
+      }
+      this.recordWrites(changed, "bot");
     }
-    return changed.length;
+    return { undone: changed.length, sceneVersion: this.currentSceneVersion() };
+  }
+
+  async getBounds(ids?: string[]): Promise<{
+    bounds: Bounds;
+    width: number;
+    height: number;
+    elements: string[];
+  }> {
+    await this.ensureConnected();
+    const live = this.liveElements();
+    const targets =
+      ids && ids.length
+        ? live.filter((element) => ids.includes(element.id))
+        : live;
+    const bounds = getCommonBounds(targets);
+    return {
+      bounds,
+      width: bounds[2] - bounds[0],
+      height: bounds[3] - bounds[1],
+      elements: targets.map((element) => element.id),
+    };
+  }
+
+  async elementAt(x: number, y: number): Promise<ExcalidrawElement | null> {
+    await this.ensureConnected();
+    return elementAtPoint([...this.elements.values()], x, y);
+  }
+
+  async validateScene(options?: {
+    disabledRules?: string[];
+    viewBackgroundColor?: string;
+  }): Promise<ReturnType<typeof lintScene> & { sceneVersion: number }> {
+    await this.ensureConnected();
+    const result = lintScene(this.liveElements(), options);
+    return { ...result, sceneVersion: this.currentSceneVersion() };
+  }
+
+  async sceneDiff(sinceVersion?: number): Promise<{
+    sceneVersion: number;
+    since: number | null;
+    truncated: boolean;
+    changes: Array<{
+      id: string;
+      type: string;
+      origin: "bot" | "incoming";
+      version: number;
+      status: "present" | "deleted";
+    }>;
+    byOrigin: { bot: string[]; incoming: string[] };
+  }> {
+    await this.ensureConnected();
+    const sceneVersion = this.currentSceneVersion();
+    const oldestLogged = this.writeLog.length
+      ? this.writeLog[0].sceneVersionAfter
+      : sceneVersion;
+    const truncated =
+      sinceVersion !== undefined &&
+      this.writeLogEvicted &&
+      sinceVersion < oldestLogged;
+    const latestById = new Map<string, "bot" | "incoming">();
+    if (sinceVersion === undefined || truncated) {
+      for (const element of this.liveElements()) {
+        latestById.set(element.id, this.lastOrigin(element.id));
+      }
+    } else {
+      for (const entry of this.writeLog) {
+        if (entry.sceneVersionAfter > sinceVersion) {
+          latestById.set(entry.id, entry.origin);
+        }
+      }
+    }
+    const changes: Array<{
+      id: string;
+      type: string;
+      origin: "bot" | "incoming";
+      version: number;
+      status: "present" | "deleted";
+    }> = [];
+    const byOrigin = { bot: [] as string[], incoming: [] as string[] };
+    for (const [id, origin] of latestById) {
+      const element = this.elements.get(id);
+      if (!element) {
+        continue;
+      }
+      changes.push({
+        id,
+        type: element.type,
+        origin,
+        version: element.version,
+        status: element.isDeleted ? "deleted" : "present",
+      });
+      byOrigin[origin].push(id);
+    }
+    return {
+      sceneVersion,
+      since: sinceVersion ?? null,
+      truncated,
+      changes,
+      byOrigin,
+    };
+  }
+
+  async render(options: RenderOptions & { format?: "png" | "svg" }): Promise<{
+    format: "png" | "svg";
+    png?: string;
+    svg?: string;
+    transform: ReturnType<typeof renderSvg>["transform"];
+    legend: ReturnType<typeof renderSvg>["legend"];
+    width: number;
+    height: number;
+    sceneVersion: number;
+  }> {
+    await this.ensureConnected();
+    const rendered = renderSvg([...this.elements.values()], options);
+    const png =
+      options.format === "svg" ? null : svgToPngBase64(rendered.svg);
+    return {
+      format: png ? "png" : "svg",
+      ...(png ? { png } : { svg: rendered.svg }),
+      transform: rendered.transform,
+      legend: rendered.legend,
+      width: rendered.width,
+      height: rendered.height,
+      sceneVersion: this.currentSceneVersion(),
+    };
+  }
+
+  private reconcileIncoming(elements: ExcalidrawElement[]): void {
+    const accepted: ExcalidrawElement[] = [];
+    for (const incoming of elements) {
+      const current = this.elements.get(incoming.id);
+      if (!current || incoming.version > current.version) {
+        this.elements.set(incoming.id, incoming);
+        accepted.push(incoming);
+      }
+    }
+    if (accepted.length) {
+      this.recordWrites(accepted, "incoming");
+    }
+  }
+
+  private currentSceneVersion(): number {
+    return getSceneVersion([...this.elements.values()]);
+  }
+
+  private liveElements(): ExcalidrawElement[] {
+    return [...this.elements.values()].filter((element) => !element.isDeleted);
+  }
+
+  private recordWrites(
+    changed: ExcalidrawElement[],
+    origin: "bot" | "incoming",
+  ): void {
+    const sceneVersionAfter = this.currentSceneVersion();
+    for (const element of changed) {
+      this.writeLog.push({
+        id: element.id,
+        origin,
+        sceneVersionAfter,
+        updated: element.updated,
+      });
+    }
+    const overflow = this.writeLog.length - CollabBot.MAX_WRITE_LOG;
+    if (overflow > 0) {
+      this.writeLog.splice(0, overflow);
+      this.writeLogEvicted = true;
+    }
+  }
+
+  private lastOrigin(id: string): "bot" | "incoming" {
+    for (let i = this.writeLog.length - 1; i >= 0; i--) {
+      if (this.writeLog[i].id === id) {
+        return this.writeLog[i].origin;
+      }
+    }
+    return "bot";
+  }
+
+  private pushUndo(
+    frame: Array<{ id: string; prior: ExcalidrawElement | null }>,
+  ): void {
+    if (this.undoing) {
+      return;
+    }
+    this.undoStack.push(frame);
+    if (this.undoStack.length > CollabBot.MAX_UNDO) {
+      this.undoStack.shift();
+    }
+  }
+
+  private readback(
+    id: string,
+  ): { found: boolean; version?: number } {
+    const element = this.elements.get(id);
+    return element && !element.isDeleted
+      ? { found: true, version: element.version }
+      : { found: false };
   }
 
   dispose(): void {

@@ -1,10 +1,10 @@
-import { randomUUID } from "crypto";
+import {randomUUID} from "crypto";
 
-import { db } from "./firebase";
-import { decryptJSON, encryptJSON } from "./encryption";
-import { logError, logInfo } from "./logger";
+import {db} from "./firebase";
+import {decryptJSON, encryptJSON} from "./encryption";
+import {logError, logInfo} from "./logger";
 
-import type { ExcalidrawElement } from "./types";
+import type {ExcalidrawElement} from "./types";
 
 const toUint8 = (value: unknown): Uint8Array => {
   if (value instanceof Uint8Array) {
@@ -87,6 +87,15 @@ export const getSceneVersion = (
 const isSyncable = (element: ExcalidrawElement): boolean => {
   if (element.isDeleted) {
     return element.updated > Date.now() - 24 * 60 * 60 * 1000;
+  }
+  if (
+    element.type === "line" ||
+    element.type === "arrow" ||
+    element.type === "freedraw"
+  ) {
+    const points = (element as { points?: unknown }).points;
+    const hasPoints = Array.isArray(points) && points.length >= 2;
+    return hasPoints || element.width > 0 || element.height > 0;
   }
   return element.width > 0 && element.height > 0;
 };
