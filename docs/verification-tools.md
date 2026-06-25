@@ -9,22 +9,47 @@ as pure functions over the in-memory element model; `CollabBot` exposes them and
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `validate_scene` | read | Deterministic lint over the whole board; returns machine-actionable findings with element ids + suggested fixes. |
+| `validate_scene` | read | Deterministic lint; scope with `ids`/`region`, trim with `codes`/`minSeverity`/`summaryOnly`. Returns machine-actionable findings with element ids + suggested fixes. |
 | `measure_text` | read | Wrapped text width/height for a font, plus the container size needed to fit it. |
 | `get_bounds` | read | Rotation-aware bounding box of the whole board or a set of ids. |
 | `element_at` | read | Top-most element under a scene point (z-order aware hit-test). |
 | `scene_diff` | read | Elements changed since a given `sceneVersion`, split by origin (bot vs incoming human edits). |
 | `render_scene` | read | SVG (always) + PNG (when `@resvg/resvg-js` is present) of the board, with Set-of-Mark id labels, an optional grid, a coordinate transform and an element legend. |
 | `render_region` | read | Same, clipped to a scene rectangle. |
-| `render_element` | read | Same, cropped to one or more elements (focus render). |
+| `render_element` | read | Same, cropped to one or more elements by `ids` or `groupId` (focus render). |
+| `create_element` | write | Create one element. Text auto-sizes to its content; `containerId`/`label` make bound text; `points` make a real line/arrow. |
+| `update_element` | write | Patch one element; standalone text re-measures when its content/font changes. |
+| `batch_create` | write | Create N elements in a single broadcast/persist/history commit (bound text + points supported). `return:"ids"` keeps the response small. |
+| `update_elements` | write | Patch N elements in a single commit. `return:"ids"` supported. |
+| `delete_elements` | write | Delete N elements by `ids` or by `groupId` in a single commit (bound text cascades with its container). |
+| `delete_region` | write | Delete everything inside a scene rectangle (`mode` intersect/contain, optional `type` filter). |
+| `group_elements` / `ungroup_elements` | write | Assign / remove a shared `groupId` so a set moves, renders and deletes as one unit. |
+| `create_frame` | write | Create a frame from explicit bounds or sized to fit `childIds` (children get `frameId`). |
 | `connect` | write | Create a properly bound arrow between two shapes (`FixedPointBinding` + back-references). |
-| `batch_create` | write | Create N elements in a single broadcast/persist/history commit. |
 | `arrange` | write | Re-layout a set of elements (grid / row / column / align / distribute). |
+| `clear_canvas` | write | Wipe the board. Safe by default: needs `confirm:true`, otherwise returns a dry-run count. |
 | `undo_last` | write | Revert the bot's last mutation (session-scoped, version-safe). |
 
-`create_element` / `update_element` / `batch_create` / `connect` additionally
-return inline `warnings` (a focused lint pass on the affected element) so the
-agent gets self-review feedback without a separate call.
+`create_element` / `update_element` / `update_elements` / `batch_create` /
+`connect` additionally return inline `warnings` (a focused lint pass on the
+affected element) so the agent gets self-review feedback without a separate call.
+Inline warnings are computed at commit time: when several writes race in parallel,
+a warning may reflect state a sibling write has not applied yet — re-run
+`validate_scene` for the authoritative picture.
+
+### Text, labels and lines
+- **Text auto-sizes.** A `text` element with no explicit `width` is sized to its
+  content via the same engine as `measure_text` (no more magic `100×100`). Pass
+  `width` to get a fixed wrapping box (`autoResize` is turned off and the height
+  follows the wrapped content).
+- **Bound text.** Set `containerId` on a `text` to bind it to an existing
+  rectangle/ellipse/diamond, or set `label` on the container itself to create the
+  bound text in the same call. Bound text is centered, sized to the container,
+  grows the container height if needed, moves with it, and is excluded from
+  `overlap` warnings.
+- **Lines/arrows.** Pass `points` (relative to `x,y`) for real polylines. A
+  line/arrow created from `width`/`height` only is auto-converted to a 2-point
+  segment so it is never an invisible zero-length element.
 
 Every write tool also returns `sceneVersion` and a `readback` confirmation
 (re-read of the element from the authoritative in-memory map after commit), which
@@ -81,7 +106,7 @@ Each finding: `{ code, severity, elementIds, message, suggestion? }`.
 ### Visual defects (warning)
 | code | trigger | threshold |
 | --- | --- | --- |
-| `overlap` | two eligible shapes' rotated AABBs overlap | `intersection / min(areaA,areaB) > 0.15`; excludes container↔bound-text, frame↔child, same-group pairs, lines/arrows. |
+| `overlap` | two eligible shapes' rotated AABBs overlap | `intersection / min(areaA,areaB) > 0.15`; excludes container↔bound-text, frame↔child, same-group pairs, lines/arrows, and any text whose box is fully inside a shape (treated as a label). |
 | `text_overflow` | bound text exceeds container's bound-text max box, or non-autoResize standalone text exceeds its box | wrapped measured size vs `getBoundTextMaxWidth/Height`. |
 | `occlusion` | opaque solid element fully covers a lower-z element with content | `E.index > O.index`, `opacity>=90`, AABB-contains. |
 | `off_canvas_outlier` | element entirely outside the cluster of all others | gap `> max(4000, 2×clusterDiagonal)`, only with `>=3` elements. |
@@ -91,12 +116,12 @@ Each finding: `{ code, severity, elementIds, message, suggestion? }`.
 | `invisible_opacity` | `opacity<=0`. | |
 | `out_of_range` | `opacity∉[0,100]`, `roughness∉{0,1,2}`, `strokeWidth<=0`, `fontSize<=0`. | |
 | `invalid_enum` | unknown `fillStyle`/`strokeStyle`/`fontFamily`/arrowhead. | |
-| `low_contrast` | text vs its background contrast below WCAG | `<4.5` normal, `<3.0` for `fontSize>=24`; standalone text assumes white canvas. |
+| `low_contrast` | text vs its background contrast below WCAG | `<4.5` normal, `<3.0` for `fontSize>=24`. Background is the top-most solid opaque shape below the text in z-order (so white-on-a-colored-header is judged against the header), falling back to the canvas color when nothing backs it. |
 
 ### Style / layout hints (info)
 | code | trigger |
 | --- | --- |
-| `alignment_near_miss` | an edge/center coordinate differs by `0 < d <= 4px` (probably meant to align). |
+| `alignment_near_miss` | an edge/center coordinate differs by `1px <= d <= 4px` (probably meant to align). Suppressed when the pair is already aligned (`<1px`) on another anchor of the same axis — e.g. centered shapes of different sizes no longer nag about their top edges. |
 | `style_many_fonts` | more than 2 distinct font families among text. |
 | `style_many_stroke_colors` | more than 6 distinct stroke colors. |
 
@@ -104,6 +129,14 @@ Each finding: `{ code, severity, elementIds, message, suggestion? }`.
 where `graph` is an informational connectivity summary `{ nodes, edges, isolated }`
 built from shapes + bound arrows (useful for flowchart review). Rule categories
 and thresholds can be toggled via tool params.
+
+**Scoping (keeps the response small on big/shared boards).** `ids` or `region`
+restrict findings to those touching the selected elements (the lint still runs
+against the whole scene, so an overlap with an out-of-scope element still
+surfaces); when scoped, the response also carries `scope:{ kind, matched }`.
+`codes` keeps only the listed rule codes, `minSeverity` drops anything below the
+given severity, and `summaryOnly` returns the counts/graph with an empty
+`findings` list. All filters compose, and `summary` reflects the filtered set.
 
 ## Versioning / consistency notes
 - `sceneVersion` = sum of element `version`s (`scene.ts:getSceneVersion`); it is

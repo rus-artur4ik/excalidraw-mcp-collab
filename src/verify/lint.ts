@@ -1,27 +1,28 @@
 import type {ExcalidrawElement} from "../types";
 import {
-    ARROWHEADS,
-    asLinear,
-    asText,
-    BOUND_TEXT_PADDING,
-    FILL_STYLES,
-    FONT_LINE_HEIGHTS,
-    isBindable,
-    isLinear,
-    isTransparent,
-    MAX_BINDING_DISTANCE,
-    type Point,
-    ROUGHNESS_VALUES,
-    STROKE_STYLES,
+  ARROWHEADS,
+  asLinear,
+  asText,
+  BOUND_TEXT_PADDING,
+  type Bounds,
+  FILL_STYLES,
+  FONT_LINE_HEIGHTS,
+  isBindable,
+  isLinear,
+  isTransparent,
+  MAX_BINDING_DISTANCE,
+  type Point,
+  ROUGHNESS_VALUES,
+  STROKE_STYLES,
 } from "./model";
 import {
-    boundsArea,
-    boundsContain,
-    distanceToElement,
-    getCommonBounds,
-    getElementBounds,
-    intersectionArea,
-    pointInElement,
+  boundsArea,
+  boundsContain,
+  distanceToElement,
+  getCommonBounds,
+  getElementBounds,
+  intersectionArea,
+  pointInElement,
 } from "./geometry";
 import {bindingGap} from "./bindings";
 import {contrastRatio, parseColor} from "./colors";
@@ -42,11 +43,49 @@ export type LintOptions = {
   viewBackgroundColor?: string;
 };
 
+export type LintScopeOptions = LintOptions & {
+  ids?: string[];
+  region?: Bounds;
+  codes?: string[];
+  minSeverity?: Severity;
+  summaryOnly?: boolean;
+};
+
+const SEVERITY_RANK: Record<Severity, number> = {
+  error: 3,
+  warning: 2,
+  info: 1,
+};
+
+const boundsIntersect = (a: Bounds, b: Bounds): boolean =>
+  a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+
+const scopeIdSet = (
+  live: readonly ExcalidrawElement[],
+  options: LintScopeOptions,
+): Set<string> | null => {
+  if (options.ids && options.ids.length) {
+    return new Set(options.ids);
+  }
+  if (options.region) {
+    const set = new Set<string>();
+    for (const element of live) {
+      if (boundsIntersect(getElementBounds(element), options.region)) {
+        set.add(element.id);
+      }
+    }
+    return set;
+  }
+  return null;
+};
+
 const OVERLAP_RATIO = 0.15;
 const DUP_POS = 1.5;
 const DUP_SIZE = 1.5;
 const ALIGN_SNAP = 4;
+const ALIGN_MIN = 1;
 const OPAQUE_OCCLUSION_OPACITY = 90;
+const SOLID_BACKING_OPACITY = 60;
 const OUTLIER_ABS_GAP = 4000;
 const MAX_FONTS = 2;
 const MAX_STROKE_COLORS = 6;
@@ -439,6 +478,20 @@ const eligibleForOverlap = (element: ExcalidrawElement): boolean =>
   OVERLAP_TYPES.has(element.type) ||
   (element.type === "text" && typeof asText(element).containerId !== "string");
 
+const isContainedLabel = (
+  a: ExcalidrawElement,
+  b: ExcalidrawElement,
+  aBounds: ReturnType<typeof getElementBounds>,
+  bBounds: ReturnType<typeof getElementBounds>,
+): boolean => {
+  if ((a.type === "text") === (b.type === "text")) {
+    return false;
+  }
+  const [text, shape, textBounds, shapeBounds] =
+    a.type === "text" ? [a, b, aBounds, bBounds] : [b, a, bBounds, aBounds];
+  return OVERLAP_TYPES.has(shape.type) && boundsContain(shapeBounds, textBounds);
+};
+
 const pairwiseChecks = (
   elements: readonly ExcalidrawElement[],
 ): LintFinding[] => {
@@ -467,7 +520,7 @@ const pairwiseChecks = (
       const ba = boundsById.get(a.id)!;
       const bb = boundsById.get(b.id)!;
       const inter = intersectionArea(ba, bb);
-      if (inter > 0) {
+      if (inter > 0 && !isContainedLabel(a, b, ba, bb)) {
         const ratio = inter / Math.max(1, Math.min(boundsArea(ba), boundsArea(bb)));
         if (ratio > OVERLAP_RATIO) {
           findings.push({
@@ -518,41 +571,50 @@ const pairwiseChecks = (
   return findings;
 };
 
-const nearMissAlignment = (
-  a: ExcalidrawElement,
-  b: ExcalidrawElement,
+const nearMissOnAxis = (
+  aCoords: readonly number[],
+  bCoords: readonly number[],
+  edges: readonly string[],
+  ids: [string, string],
 ): LintFinding | null => {
-  const ax = [a.x, a.x + (a.width || 0) / 2, a.x + (a.width || 0)];
-  const bx = [b.x, b.x + (b.width || 0) / 2, b.x + (b.width || 0)];
-  const ay = [a.y, a.y + (a.height || 0) / 2, a.y + (a.height || 0)];
-  const by = [b.y, b.y + (b.height || 0) / 2, b.y + (b.height || 0)];
-  const edges = ["left", "centerX", "right"] as const;
-  for (let k = 0; k < 3; k++) {
-    const d = Math.abs(ax[k] - bx[k]);
-    if (d > 0 && d <= ALIGN_SNAP) {
-      return {
-        code: "alignment_near_miss",
-        severity: "info",
-        elementIds: [a.id, b.id],
-        message: `${edges[k]} edges are ${d.toFixed(1)}px apart — likely meant to align.`,
-        suggestion: { action: "align", edge: edges[k], ids: [a.id, b.id] },
-      };
-    }
+  const diffs = aCoords.map((v, i) => Math.abs(v - bCoords[i]));
+  if (diffs.some((d) => d < ALIGN_MIN)) {
+    return null;
   }
-  const vEdges = ["top", "centerY", "bottom"] as const;
-  for (let k = 0; k < 3; k++) {
-    const d = Math.abs(ay[k] - by[k]);
-    if (d > 0 && d <= ALIGN_SNAP) {
+  for (let k = 0; k < diffs.length; k++) {
+    if (diffs[k] >= ALIGN_MIN && diffs[k] <= ALIGN_SNAP) {
       return {
         code: "alignment_near_miss",
         severity: "info",
-        elementIds: [a.id, b.id],
-        message: `${vEdges[k]} edges are ${d.toFixed(1)}px apart — likely meant to align.`,
-        suggestion: { action: "align", edge: vEdges[k], ids: [a.id, b.id] },
+        elementIds: ids,
+        message: `${edges[k]} edges are ${diffs[k].toFixed(1)}px apart — likely meant to align.`,
+        suggestion: { action: "align", edge: edges[k], ids },
       };
     }
   }
   return null;
+};
+
+const nearMissAlignment = (
+  a: ExcalidrawElement,
+  b: ExcalidrawElement,
+): LintFinding | null => {
+  const ids: [string, string] = [a.id, b.id];
+  const horizontal = nearMissOnAxis(
+    [a.x, a.x + (a.width || 0) / 2, a.x + (a.width || 0)],
+    [b.x, b.x + (b.width || 0) / 2, b.x + (b.width || 0)],
+    ["left", "centerX", "right"],
+    ids,
+  );
+  if (horizontal) {
+    return horizontal;
+  }
+  return nearMissOnAxis(
+    [a.y, a.y + (a.height || 0) / 2, a.y + (a.height || 0)],
+    [b.y, b.y + (b.height || 0) / 2, b.y + (b.height || 0)],
+    ["top", "centerY", "bottom"],
+    ids,
+  );
 };
 
 const occlusionChecks = (
@@ -649,13 +711,55 @@ const outlierChecks = (
   return findings;
 };
 
+const isAboveByZ = (
+  a: ExcalidrawElement,
+  b: ExcalidrawElement,
+): boolean =>
+  typeof a.index === "string" && typeof b.index === "string"
+    ? a.index > b.index
+    : false;
+
+const backingColor = (
+  text: ExcalidrawElement,
+  scene: readonly ExcalidrawElement[],
+  boundsById: Map<string, ReturnType<typeof getElementBounds>>,
+  fallback: string,
+): string => {
+  const textBounds = boundsById.get(text.id) ?? getElementBounds(text);
+  let best: ExcalidrawElement | null = null;
+  for (const candidate of scene) {
+    if (
+      candidate.id === text.id ||
+      !OVERLAP_TYPES.has(candidate.type) ||
+      isTransparent(candidate.backgroundColor) ||
+      candidate.fillStyle !== "solid" ||
+      (candidate.opacity ?? 100) < SOLID_BACKING_OPACITY ||
+      !isAboveByZ(text, candidate)
+    ) {
+      continue;
+    }
+    const candidateBounds = boundsById.get(candidate.id) ?? getElementBounds(candidate);
+    if (!boundsContain(candidateBounds, textBounds)) {
+      continue;
+    }
+    if (!best || (typeof candidate.index === "string" && candidate.index > (best.index ?? ""))) {
+      best = candidate;
+    }
+  }
+  return best ? best.backgroundColor : fallback;
+};
+
 const contrastChecks = (
-  elements: readonly ExcalidrawElement[],
-  byId: Map<string, ExcalidrawElement>,
+  texts: readonly ExcalidrawElement[],
+  scene: readonly ExcalidrawElement[],
   viewBackgroundColor: string,
 ): LintFinding[] => {
   const findings: LintFinding[] = [];
-  for (const element of elements) {
+  const boundsById = new Map<string, ReturnType<typeof getElementBounds>>();
+  for (const element of scene) {
+    boundsById.set(element.id, getElementBounds(element));
+  }
+  for (const element of texts) {
     if (element.type !== "text" || !textContent(element).trim()) {
       continue;
     }
@@ -663,15 +767,9 @@ const contrastChecks = (
     if (!fg) {
       continue;
     }
-    const containerId = asText(element).containerId;
-    let bgColor = viewBackgroundColor;
-    if (typeof containerId === "string") {
-      const container = byId.get(containerId);
-      if (container && !isTransparent(container.backgroundColor)) {
-        bgColor = container.backgroundColor;
-      }
-    }
-    const bg = parseColor(bgColor);
+    const bg = parseColor(
+      backingColor(element, scene, boundsById, viewBackgroundColor),
+    );
     if (!bg) {
       continue;
     }
@@ -751,11 +849,12 @@ export const buildConnectivityGraph = (
 
 export const lintScene = (
   elements: readonly ExcalidrawElement[],
-  options: LintOptions = {},
+  options: LintScopeOptions = {},
 ): {
   findings: LintFinding[];
   summary: { errors: number; warnings: number; infos: number };
   graph: { nodeCount: number; edgeCount: number; isolated: string[] };
+  scope?: { kind: "ids" | "region"; matched: number };
 } => {
   const disabled = new Set(options.disabledRules ?? []);
   const live = elements.filter(notDeleted);
@@ -779,10 +878,23 @@ export const lintScene = (
       message: `Scene has ${live.length} elements; pairwise checks (overlap, duplicate, occlusion, alignment, outlier) were skipped.`,
     });
   }
-  findings.push(...contrastChecks(live, byId, viewBackgroundColor));
+  findings.push(...contrastChecks(live, live, viewBackgroundColor));
   findings.push(...styleChecks(live));
 
   findings = findings.filter((f) => !disabled.has(f.code));
+
+  const scope = scopeIdSet(live, options);
+  if (scope) {
+    findings = findings.filter((f) => f.elementIds.some((id) => scope.has(id)));
+  }
+  if (options.codes && options.codes.length) {
+    const allow = new Set(options.codes);
+    findings = findings.filter((f) => allow.has(f.code));
+  }
+  if (options.minSeverity) {
+    const floor = SEVERITY_RANK[options.minSeverity];
+    findings = findings.filter((f) => SEVERITY_RANK[f.severity] >= floor);
+  }
 
   const summary = { errors: 0, warnings: 0, infos: 0 };
   for (const finding of findings) {
@@ -795,7 +907,14 @@ export const lintScene = (
     }
   }
 
-  return { findings, summary, graph: buildConnectivityGraph(live) };
+  return {
+    findings: options.summaryOnly ? [] : findings,
+    summary,
+    graph: buildConnectivityGraph(live),
+    ...(scope
+      ? { scope: { kind: options.ids?.length ? "ids" : "region", matched: scope.size } as const }
+      : {}),
+  };
 };
 
 export const lintElement = (
@@ -826,10 +945,11 @@ export const lintElement = (
       ) {
         continue;
       }
-      const inter = intersectionArea(myBounds, getElementBounds(other));
-      if (inter > 0) {
+      const otherBounds = getElementBounds(other);
+      const inter = intersectionArea(myBounds, otherBounds);
+      if (inter > 0 && !isContainedLabel(element, other, myBounds, otherBounds)) {
         const ratio =
-          inter / Math.max(1, Math.min(boundsArea(myBounds), boundsArea(getElementBounds(other))));
+          inter / Math.max(1, Math.min(boundsArea(myBounds), boundsArea(otherBounds)));
         if (ratio > OVERLAP_RATIO) {
           findings.push({
             code: "overlap",
@@ -843,6 +963,6 @@ export const lintElement = (
     }
   }
 
-  findings.push(...contrastChecks([element], byId, viewBackgroundColor));
+  findings.push(...contrastChecks([element], [...byId.values()], viewBackgroundColor));
   return findings.filter((f) => !disabled.has(f.code));
 };

@@ -36,6 +36,28 @@ const elementFields = {
   fontFamily: z.number().optional(),
   textAlign: z.string().optional(),
   verticalAlign: z.string().optional(),
+  points: z
+    .array(z.tuple([z.number(), z.number()]))
+    .optional()
+    .describe(
+      "line/arrow vertices relative to x,y. Omit and a line/arrow is auto-built as a 2-point segment from width/height (so it is never zero-length).",
+    ),
+  containerId: z
+    .string()
+    .optional()
+    .describe(
+      "Bind this text to a container shape: it is centered, auto-sized and moves with the container, and is excluded from overlap warnings.",
+    ),
+  label: z
+    .string()
+    .optional()
+    .describe(
+      "On rectangle/ellipse/diamond: also create a bound text label inside the shape in the same call.",
+    ),
+  labelColor: z
+    .string()
+    .optional()
+    .describe("Stroke color for the bound text created via `label`."),
 };
 
 const createShape = {
@@ -67,6 +89,7 @@ const queryShape = {
   ...boardIdShape,
   type: z.string().optional(),
   ids: z.array(z.string()).optional(),
+  groupId: z.string().optional(),
 };
 
 const deleteShape = {
@@ -74,10 +97,103 @@ const deleteShape = {
   id: z.string(),
 };
 
+const returnFieldShape = {
+  return: z
+    .enum(["full", "ids"])
+    .optional()
+    .describe(
+      'Response shape. "ids" returns only created/updated element ids (default \"full\" echoes whole elements, which can be large).',
+    ),
+};
+
+const updateElementsShape = {
+  ...boardIdShape,
+  ...returnFieldShape,
+  elements: z
+    .array(z.object({ id: z.string() }).catchall(z.unknown()))
+    .describe("Patches, each an object with `id` plus the fields to change."),
+};
+
+const deleteElementsShape = {
+  ...boardIdShape,
+  ids: z.array(z.string()).optional(),
+  groupId: z
+    .string()
+    .optional()
+    .describe("Delete every element carrying this groupId (whole-group delete)."),
+};
+
+const deleteRegionShape = {
+  ...boardIdShape,
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
+  mode: z
+    .enum(["intersect", "contain"])
+    .optional()
+    .describe(
+      "intersect (default) deletes anything touching the rect; contain deletes only fully-enclosed elements.",
+    ),
+  type: z.string().optional().describe("Restrict deletion to this element type."),
+};
+
+const groupShape = {
+  ...boardIdShape,
+  ids: z.array(z.string()),
+};
+
+const ungroupShape = {
+  ...boardIdShape,
+  ids: z.array(z.string()).optional(),
+  groupId: z.string().optional(),
+};
+
+const createFrameShape = {
+  ...boardIdShape,
+  x: z.number().optional(),
+  y: z.number().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+  name: z.string().optional(),
+  childIds: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Elements to put inside the frame; if x/y/width/height are omitted the frame is sized to fit them.",
+    ),
+};
+
+const regionShape = z
+  .object({
+    x: z.number(),
+    y: z.number(),
+    width: z.number(),
+    height: z.number(),
+  })
+  .describe("Scene-coordinate rectangle to scope the lint to.");
+
 const validateShape = {
   ...boardIdShape,
   disabledRules: z.array(z.string()).optional(),
   viewBackgroundColor: z.string().optional(),
+  ids: z
+    .array(z.string())
+    .optional()
+    .describe("Only report findings that involve at least one of these elements."),
+  region: regionShape.optional(),
+  codes: z
+    .array(z.string())
+    .optional()
+    .describe("Only report findings with one of these rule codes."),
+  minSeverity: z
+    .enum(["error", "warning", "info"])
+    .optional()
+    .describe("Drop findings below this severity."),
+  summaryOnly: z
+    .boolean()
+    .optional()
+    .describe("Return only the counts/summary and graph, omitting the findings list."),
 };
 
 const measureShape = {
@@ -130,7 +246,11 @@ const renderRegionShape = {
 const renderElementShape = {
   ...boardIdShape,
   ...renderFields,
-  ids: z.array(z.string()),
+  ids: z.array(z.string()).optional(),
+  groupId: z
+    .string()
+    .optional()
+    .describe("Focus-render every element in this group instead of explicit ids."),
 };
 
 const connectShape = {
@@ -144,7 +264,18 @@ const connectShape = {
 
 const batchCreateShape = {
   ...boardIdShape,
+  ...returnFieldShape,
   elements: z.array(z.object(elementFields)),
+};
+
+const clearShape = {
+  ...boardIdShape,
+  confirm: z
+    .boolean()
+    .optional()
+    .describe(
+      "Must be true to actually wipe the board. Without it, returns a dry-run count so a shared board is never cleared by accident.",
+    ),
 };
 
 const arrangeShape = {
@@ -292,6 +423,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
           boardId: string;
           type?: string;
           ids?: string[];
+          groupId?: string;
         };
         const bot = await ctx.resolveBot(boardId);
         return bot.queryElements(filter);
@@ -349,15 +481,64 @@ export function buildMcpServer(ctx: McpContext): McpServer {
   );
 
   server.registerTool(
+    "update_elements",
+    {
+      description:
+        "Update many elements in a single commit. Each item is { id, ...fields }. Standalone text auto-resizes to its new content unless an explicit width+height is given. Use return:\"ids\" to keep the response small. Bot write access required.",
+      inputSchema: updateElementsShape,
+    },
+    async (args) =>
+      runTool("update_elements", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.updateElements(
+          args.elements as Array<{ id: string } & Partial<ExcalidrawElement>>,
+          { returnIds: args.return === "ids" },
+        );
+      }),
+  );
+
+  server.registerTool(
+    "delete_elements",
+    {
+      description:
+        "Delete many elements in a single commit, by ids or by groupId (whole group). Bound text is removed with its container. Bot write access required.",
+      inputSchema: deleteElementsShape,
+    },
+    async (args) =>
+      runTool("delete_elements", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.deleteElements({ ids: args.ids, groupId: args.groupId });
+      }),
+  );
+
+  server.registerTool(
+    "delete_region",
+    {
+      description:
+        "Delete every element inside a scene-coordinate rectangle (mode intersect|contain), optionally filtered by type. Useful for \"erase the old drawing then redraw\". Bot write access required.",
+      inputSchema: deleteRegionShape,
+    },
+    async (args) =>
+      runTool("delete_region", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.deleteRegion(
+          [args.x, args.y, args.x + args.width, args.y + args.height],
+          { mode: args.mode, type: args.type },
+        );
+      }),
+  );
+
+  server.registerTool(
     "clear_canvas",
     {
-      description: "Delete all elements on a board (bot write access required).",
-      inputSchema: boardIdShape,
+      description:
+        "Delete all elements on a board. Safe by default: without confirm:true it only reports how many elements would be removed. Prefer delete_elements/delete_region on shared boards. Bot write access required.",
+      inputSchema: clearShape,
     },
     async (args) =>
       runTool("clear_canvas", async () => {
         const bot = await ctx.resolveBot(args.boardId);
-        return { deletedCount: await bot.clearCanvas() };
+        return bot.clearCanvas(args.confirm === true);
       }),
   );
 
@@ -365,14 +546,19 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "validate_scene",
     {
       description:
-        "Run the deterministic self-review lint over a board: overlaps, text overflow, broken/unbound arrow bindings, occlusion, duplicates, alignment, contrast and style issues. Returns findings with element ids and machine-actionable suggestions, plus a connectivity graph.",
+        "Run the deterministic self-review lint over a board: overlaps, text overflow, broken/unbound arrow bindings, occlusion, duplicates, alignment, contrast and style issues. Scope it with ids/region and trim it with codes/minSeverity/summaryOnly to keep the response small on big or shared boards. Returns findings with element ids and machine-actionable suggestions, plus a connectivity graph.",
       inputSchema: validateShape,
     },
     async (args) =>
       runTool("validate_scene", async () => {
-        const { boardId, ...options } = args;
+        const { boardId, region, ...rest } = args;
         const bot = await ctx.resolveBot(boardId);
-        return bot.validateScene(options);
+        return bot.validateScene({
+          ...rest,
+          region: region
+            ? [region.x, region.y, region.x + region.width, region.y + region.height]
+            : undefined,
+        });
       }),
   );
 
@@ -494,7 +680,11 @@ export function buildMcpServer(ctx: McpContext): McpServer {
   const renderHandler = (
     name: string,
     args: { boardId: string; format?: "png" | "svg" } & Record<string, unknown>,
-    extra: { region?: [number, number, number, number]; ids?: string[] },
+    extra: {
+      region?: [number, number, number, number];
+      ids?: string[];
+      groupId?: string;
+    },
   ) =>
     runRawTool(name, async () => {
       const bot = await ctx.resolveBot(args.boardId);
@@ -551,10 +741,14 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "render_element",
     {
       description:
-        "Focus-render one or more elements by id (cropped to their bounds) the same way as render_scene.",
+        "Focus-render one or more elements (by id or by groupId), cropped to their bounds, the same way as render_scene.",
       inputSchema: renderElementShape,
     },
-    async (args) => renderHandler("render_element", args, { ids: args.ids }),
+    async (args) =>
+      renderHandler("render_element", args, {
+        ids: args.ids,
+        groupId: args.groupId,
+      }),
   );
 
   server.registerTool(
@@ -579,7 +773,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "batch_create",
     {
       description:
-        "Create multiple elements in a single commit (one broadcast/persist). Returns the created elements plus inline lint warnings. Bot write access required.",
+        "Create multiple elements in a single commit (one broadcast/persist). Supports bound text (containerId / label) and line/arrow points. Returns the created elements (or just ids with return:\"ids\") plus inline lint warnings computed at commit time. Bot write access required.",
       inputSchema: batchCreateShape,
     },
     async (args) =>
@@ -587,6 +781,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
         const bot = await ctx.resolveBot(args.boardId);
         return bot.createElements(
           args.elements as Array<Partial<ExcalidrawElement> & { type: string }>,
+          { returnIds: args.return === "ids" },
         );
       }),
   );
@@ -602,6 +797,55 @@ export function buildMcpServer(ctx: McpContext): McpServer {
       runTool("arrange", async () => {
         const bot = await ctx.resolveBot(args.boardId);
         return bot.arrange(args.ids, buildArrangeOptions(args));
+      }),
+  );
+
+  server.registerTool(
+    "group_elements",
+    {
+      description:
+        "Group elements under a shared groupId so they can be moved, rendered (render_element groupId) or deleted (delete_elements groupId) as one unit. Bot write access required.",
+      inputSchema: groupShape,
+    },
+    async (args) =>
+      runTool("group_elements", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.groupElements(args.ids);
+      }),
+  );
+
+  server.registerTool(
+    "ungroup_elements",
+    {
+      description:
+        "Remove the innermost group from elements (by ids) or dissolve a group entirely (by groupId). Bot write access required.",
+      inputSchema: ungroupShape,
+    },
+    async (args) =>
+      runTool("ungroup_elements", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.ungroupElements({ ids: args.ids, groupId: args.groupId });
+      }),
+  );
+
+  server.registerTool(
+    "create_frame",
+    {
+      description:
+        "Create a frame (named container region) either with explicit x/y/width/height or sized to fit childIds. Listed children get frameId set so they move with the frame. Bot write access required.",
+      inputSchema: createFrameShape,
+    },
+    async (args) =>
+      runTool("create_frame", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.createFrame({
+          x: args.x,
+          y: args.y,
+          width: args.width,
+          height: args.height,
+          name: args.name,
+          childIds: args.childIds,
+        });
       }),
   );
 

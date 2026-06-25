@@ -182,3 +182,118 @@ describe("contrast + graph", () => {
     expect(graph.isolated).toContain("C");
   });
 });
+
+describe("contrast reads z-order backing", () => {
+  it("uses the filled shape under the text, not the white canvas", () => {
+    const header = el({
+      type: "rectangle",
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 60,
+      backgroundColor: "#1e1e1e",
+      fillStyle: "solid",
+    });
+    const label = el({
+      type: "text",
+      x: 20,
+      y: 20,
+      width: 120,
+      height: 24,
+      fontSize: 18,
+      text: "Header",
+      strokeColor: "#ffffff",
+    });
+    const { findings } = lintScene([header, label]);
+    expect(codes(findings)).not.toContain("low_contrast");
+  });
+
+  it("still flags text that clashes with the backing shape", () => {
+    const header = el({
+      type: "rectangle",
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 60,
+      backgroundColor: "#1e1e1e",
+      fillStyle: "solid",
+    });
+    const label = el({
+      type: "text",
+      x: 20,
+      y: 20,
+      width: 120,
+      height: 24,
+      fontSize: 18,
+      text: "Header",
+      strokeColor: "#222222",
+    });
+    const { findings } = lintScene([header, label]);
+    expect(codes(findings)).toContain("low_contrast");
+  });
+});
+
+describe("overlap treats contained text as a label", () => {
+  it("does not flag text fully inside a shape", () => {
+    const box = el({ type: "rectangle", x: 0, y: 0, width: 200, height: 100 });
+    const label = el({ type: "text", x: 20, y: 30, width: 80, height: 24, text: "Label" });
+    const { findings } = lintScene([box, label]);
+    expect(codes(findings)).not.toContain("overlap");
+  });
+
+  it("still flags text that spills out of the shape", () => {
+    const box = el({ type: "rectangle", x: 0, y: 0, width: 80, height: 40 });
+    const label = el({ type: "text", x: 40, y: 10, width: 200, height: 24, text: "Way too long" });
+    const { findings } = lintScene([box, label]);
+    expect(codes(findings)).toContain("overlap");
+  });
+});
+
+describe("alignment near-miss noise reduction", () => {
+  it("stays quiet when already centered on an axis", () => {
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
+    const b = el({ type: "rectangle", x: 300, y: 2, width: 100, height: 96 });
+    const { findings } = lintScene([a, b]);
+    expect(codes(findings)).not.toContain("alignment_near_miss");
+  });
+
+  it("still flags a genuine few-px misalignment", () => {
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
+    const b = el({ type: "rectangle", x: 2, y: 300, width: 100, height: 100 });
+    const { findings } = lintScene([a, b]);
+    expect(codes(findings)).toContain("alignment_near_miss");
+  });
+});
+
+describe("scoped validate", () => {
+  it("keeps only findings touching scoped ids", () => {
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100, fillStyle: "plaid" });
+    const b = el({ type: "rectangle", x: 500, y: 0, width: 0, height: 50 });
+    const scoped = lintScene([a, b], { ids: [b.id] });
+    expect(scoped.findings.length).toBeGreaterThan(0);
+    expect(scoped.findings.every((f) => f.elementIds.includes(b.id))).toBe(true);
+    expect(scoped.scope).toEqual({ kind: "ids", matched: 1 });
+  });
+
+  it("summaryOnly drops findings but keeps the counts", () => {
+    const b = el({ type: "rectangle", x: 0, y: 0, width: 0, height: 50 });
+    const result = lintScene([b], { summaryOnly: true });
+    expect(result.findings).toEqual([]);
+    expect(result.summary.errors).toBeGreaterThan(0);
+  });
+
+  it("minSeverity drops lower-severity findings", () => {
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
+    const b = el({ type: "rectangle", x: 2, y: 300, width: 100, height: 100 });
+    const result = lintScene([a, b], { minSeverity: "warning" });
+    expect(result.findings.some((f) => f.severity === "info")).toBe(false);
+  });
+
+  it("codes keeps only the requested rule", () => {
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100, fillStyle: "plaid" });
+    const b = el({ type: "rectangle", x: 0, y: 0, width: 0, height: 50 });
+    const result = lintScene([a, b], { codes: ["degenerate_size"] });
+    expect(result.findings.every((f) => f.code === "degenerate_size")).toBe(true);
+    expect(result.findings.length).toBeGreaterThan(0);
+  });
+});

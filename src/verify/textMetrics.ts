@@ -1,10 +1,12 @@
 import {
-    ARROW_LABEL_FONT_SIZE_TO_MIN_WIDTH_RATIO,
-    ARROW_LABEL_HEIGHT_PADDING_MULTIPLIER,
-    ARROW_LABEL_WIDTH_FRACTION,
-    BOUND_TEXT_PADDING,
-    lineHeightForFamily,
-    MONOSPACE_FAMILIES,
+  ARROW_LABEL_FONT_SIZE_TO_MIN_WIDTH_RATIO,
+  ARROW_LABEL_HEIGHT_PADDING_MULTIPLIER,
+  ARROW_LABEL_WIDTH_FRACTION,
+  BOUND_TEXT_PADDING,
+  DEFAULT_FONT_FAMILY,
+  DEFAULT_FONT_SIZE,
+  lineHeightForFamily,
+  MONOSPACE_FAMILIES,
 } from "./model";
 import type {ExcalidrawElement} from "../types";
 
@@ -257,6 +259,64 @@ export const getBoundTextMaxWidth = (
     default:
       return width - BOUND_TEXT_PADDING * 2;
   }
+};
+
+export type TextLayout = {
+  width: number;
+  height: number;
+  lineHeight: number;
+  text: string;
+};
+
+export const layoutText = (
+  text: string,
+  fontSize: number = DEFAULT_FONT_SIZE,
+  fontFamily: number = DEFAULT_FONT_FAMILY,
+  maxWidth?: number,
+): TextLayout => {
+  const bounded = typeof maxWidth === "number" && maxWidth > 0;
+  const wrapped = bounded
+    ? wrapText(text, fontSize, fontFamily, maxWidth)
+    : normalizeText(text);
+  const measured = measureText(wrapped, fontSize, fontFamily);
+  return {
+    width: bounded ? maxWidth : Math.ceil(measured.width),
+    height: Math.ceil(measured.height),
+    lineHeight: lineHeightForFamily(fontFamily),
+    text: wrapped,
+  };
+};
+
+export type BoundTextLayout = TextLayout & {
+  x: number;
+  y: number;
+  containerHeight: number;
+};
+
+export const layoutBoundText = (
+  container: ExcalidrawElement,
+  text: string,
+  fontSize: number = DEFAULT_FONT_SIZE,
+  fontFamily: number = DEFAULT_FONT_FAMILY,
+): BoundTextLayout => {
+  const maxWidth = getBoundTextMaxWidth(container, fontSize);
+  const wrapped = wrapText(text, fontSize, fontFamily, maxWidth);
+  const measured = measureText(wrapped, fontSize, fontFamily);
+  const width = Math.min(Math.ceil(measured.width), Math.floor(maxWidth));
+  const height = Math.ceil(measured.height);
+  const containerHeight = Math.max(
+    container.height || 0,
+    height + BOUND_TEXT_PADDING * 2,
+  );
+  return {
+    width,
+    height,
+    lineHeight: lineHeightForFamily(fontFamily),
+    text: wrapped,
+    x: (container.x || 0) + ((container.width || 0) - width) / 2,
+    y: (container.y || 0) + (containerHeight - height) / 2,
+    containerHeight,
+  };
 };
 
 export const getBoundTextMaxHeight = (

@@ -6,18 +6,23 @@ import {config} from "../config";
 import {auth, db} from "../firebase";
 import {decryptJSON, encryptJSON} from "../encryption";
 import {appendSceneHistory, getSceneVersion, loadScene, persistScene,} from "../scene";
-import {applyUpdate, buildNewElement, markDeleted} from "../elements";
+import {applyUpdate, buildNewElement, type CreateAttrs, markDeleted, planCreations,} from "../elements";
 import {
   type ArrangeOptions,
   arrangePositions,
+  asText,
   type Bounds,
+  DEFAULT_FONT_FAMILY,
+  DEFAULT_FONT_SIZE,
   elementAtPoint,
   getCommonBounds,
   getElementBounds,
   isBindable,
+  layoutText,
   lintElement,
   type LintFinding,
   lintScene,
+  type LintScopeOptions,
   planConnection,
   type RenderOptions,
   renderSvg,
@@ -70,6 +75,7 @@ export type ElementWriteResult = {
   sceneVersion: number;
   readback: { found: boolean; version?: number };
   warnings: LintFinding[];
+  related?: ExcalidrawElement[];
 };
 
 export class ReadOnlyError extends Error {
@@ -363,20 +369,35 @@ export class CollabBot {
     }
   }
 
-  async createElement(
-    attrs: Partial<ExcalidrawElement> & { type: string },
-  ): Promise<ElementWriteResult> {
+  async createElement(attrs: CreateAttrs): Promise<ElementWriteResult> {
     this.requireEditor();
     await this.ensureConnected();
-    const element = buildNewElement(attrs, [...this.elements.values()]);
-    this.pushUndo([{ id: element.id, prior: null }]);
-    this.elements.set(element.id, element);
-    await this.commit([element], { targets: [element], select: true });
-    this.recordWrites([element], "bot");
+    const { created, containerUpdates } = planCreations(
+      [attrs],
+      [...this.elements.values()],
+    );
+    await this.commitCreations(created, containerUpdates, { select: true });
+    const live = this.liveElements();
+    const primary = created[0];
+    return {
+      element: primary,
+      sceneVersion: this.currentSceneVersion(),
+      readback: this.readback(primary.id),
+      warnings: created.flatMap((element) => lintElement(element, live)),
+      ...(created.length > 1 ? { related: created.slice(1) } : {}),
+    };
+  }
+
+  async updateElement(
+    id: string,
+    patch: Partial<ExcalidrawElement>,
+  ): Promise<ElementWriteResult> {
+    const { updated } = await this.updateElements([{ id, ...patch }]);
+    const element = (updated as ExcalidrawElement[])[0];
     return {
       element,
       sceneVersion: this.currentSceneVersion(),
-      readback: this.readback(element.id),
+      readback: this.readback(id),
       warnings: lintElement(element, this.liveElements()),
     };
   }
@@ -610,26 +631,112 @@ export class CollabBot {
     });
   }
 
-  async updateElement(
-    id: string,
-    patch: Partial<ExcalidrawElement>,
-  ): Promise<ElementWriteResult> {
+  async updateElements(
+    patches: Array<{ id: string } & Partial<ExcalidrawElement>>,
+    opts: { returnIds?: boolean } = {},
+  ): Promise<{
+    updated: ExcalidrawElement[] | string[];
+    sceneVersion: number;
+    warnings: LintFinding[];
+  }> {
     this.requireEditor();
     await this.ensureConnected();
-    const current = this.elements.get(id);
-    if (!current || current.isDeleted) {
-      throw new Error(`element not found: ${id}`);
+    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
+    const changed: ExcalidrawElement[] = [];
+    for (const { id, ...patch } of patches) {
+      const current = this.elements.get(id);
+      if (!current || current.isDeleted) {
+        throw new Error(`element not found: ${id}`);
+      }
+      frame.push({ id, prior: current });
+      const updated = applyUpdate(current, this.withTextSizing(current, patch));
+      this.elements.set(id, updated);
+      changed.push(updated);
     }
-    this.pushUndo([{ id, prior: current }]);
-    const updated = applyUpdate(current, patch);
-    this.elements.set(id, updated);
-    await this.commit([updated], { targets: [updated], select: true });
-    this.recordWrites([updated], "bot");
+    if (changed.length) {
+      this.pushUndo(frame);
+      await this.commit(changed, { targets: changed, select: true });
+      this.recordWrites(changed, "bot");
+    }
+    const live = this.liveElements();
     return {
-      element: updated,
+      updated: opts.returnIds ? changed.map((element) => element.id) : changed,
       sceneVersion: this.currentSceneVersion(),
-      readback: this.readback(id),
-      warnings: lintElement(updated, this.liveElements()),
+      warnings: changed.flatMap((element) => lintElement(element, live)),
+    };
+  }
+
+  async createElements(
+    items: CreateAttrs[],
+    opts: { returnIds?: boolean } = {},
+  ): Promise<{
+    created: ExcalidrawElement[] | string[];
+    sceneVersion: number;
+    warnings: LintFinding[];
+  }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const { created, containerUpdates } = planCreations(items, [
+      ...this.elements.values(),
+    ]);
+    await this.commitCreations(created, containerUpdates, { select: true });
+    const live = this.liveElements();
+    const warnings = created.flatMap((element) => lintElement(element, live));
+    return {
+      created: opts.returnIds ? created.map((element) => element.id) : created,
+      sceneVersion: this.currentSceneVersion(),
+      warnings,
+    };
+  }
+
+  async deleteElements(selector: {
+    ids?: string[];
+    groupId?: string;
+  }): Promise<{ deleted: string[]; sceneVersion: number }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    return this.deleteResolved(this.resolveTargets(selector));
+  }
+
+  async deleteRegion(
+    region: Bounds,
+    opts: { mode?: "intersect" | "contain"; type?: string } = {},
+  ): Promise<{ deleted: string[]; sceneVersion: number }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const mode = opts.mode ?? "intersect";
+    const targets = this.liveElements().filter((element) => {
+      if (opts.type && element.type !== opts.type) {
+        return false;
+      }
+      const [x1, y1, x2, y2] = getElementBounds(element);
+      return mode === "contain"
+        ? x1 >= region[0] && y1 >= region[1] && x2 <= region[2] && y2 <= region[3]
+        : x1 <= region[2] && x2 >= region[0] && y1 <= region[3] && y2 >= region[1];
+    });
+    return this.deleteResolved(targets);
+  }
+
+  async groupElements(
+    ids: string[],
+  ): Promise<{ groupId: string; updated: string[]; sceneVersion: number }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const targets = this.resolveTargets({ ids });
+    if (targets.length < 2) {
+      throw new Error("need at least two existing elements to group");
+    }
+    const groupId = randomUUID();
+    const changed = await this.patchMany(
+      targets.map((element) => ({
+        id: element.id,
+        patch: { groupIds: [...(element.groupIds ?? []), groupId] },
+      })),
+    );
+    return {
+      groupId,
+      updated: changed.map((element) => element.id),
+      sceneVersion: this.currentSceneVersion(),
     };
   }
 
@@ -639,33 +746,27 @@ export class CollabBot {
     }
   }
 
-  async createElements(
-    items: Array<Partial<ExcalidrawElement> & { type: string }>,
-  ): Promise<{
-    created: ExcalidrawElement[];
-    sceneVersion: number;
-    warnings: LintFinding[];
-  }> {
+  async ungroupElements(selector: {
+    ids?: string[];
+    groupId?: string;
+  }): Promise<{ updated: string[]; sceneVersion: number }> {
     this.requireEditor();
     await this.ensureConnected();
-    const working = [...this.elements.values()];
-    const created: ExcalidrawElement[] = [];
-    for (const attrs of items) {
-      const element = buildNewElement(attrs, working);
-      working.push(element);
-      created.push(element);
-    }
-    this.pushUndo(created.map((element) => ({ id: element.id, prior: null })));
-    for (const element of created) {
-      this.elements.set(element.id, element);
-    }
-    if (created.length) {
-      await this.commit(created, { targets: created, select: true });
-      this.recordWrites(created, "bot");
-    }
-    const live = this.liveElements();
-    const warnings = created.flatMap((element) => lintElement(element, live));
-    return { created, sceneVersion: this.currentSceneVersion(), warnings };
+    const targets = this.resolveTargets(selector);
+    const changed = await this.patchMany(
+      targets.map((element) => ({
+        id: element.id,
+        patch: {
+          groupIds: selector.groupId
+            ? (element.groupIds ?? []).filter((g) => g !== selector.groupId)
+            : (element.groupIds ?? []).slice(0, -1),
+        },
+      })),
+    );
+    return {
+      updated: changed.map((element) => element.id),
+      sceneVersion: this.currentSceneVersion(),
+    };
   }
 
   async deleteElement(
@@ -686,9 +787,76 @@ export class CollabBot {
     return { deleted: id, sceneVersion: this.currentSceneVersion() };
   }
 
-  async clearCanvas(): Promise<number> {
+  async createFrame(opts: {
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+    name?: string;
+    childIds?: string[];
+  }): Promise<{ frame: ExcalidrawElement; children: string[]; sceneVersion: number }> {
     this.requireEditor();
     await this.ensureConnected();
+    const children = opts.childIds
+      ? this.resolveTargets({ ids: opts.childIds })
+      : [];
+    let bounds: Bounds;
+    if (
+      typeof opts.x === "number" &&
+      typeof opts.y === "number" &&
+      typeof opts.width === "number" &&
+      typeof opts.height === "number"
+    ) {
+      bounds = [opts.x, opts.y, opts.x + opts.width, opts.y + opts.height];
+    } else if (children.length) {
+      const [x1, y1, x2, y2] = getCommonBounds(children);
+      const pad = 24;
+      bounds = [x1 - pad, y1 - pad, x2 + pad, y2 + pad];
+    } else {
+      throw new Error("createFrame needs explicit x/y/width/height or childIds");
+    }
+    const frame = buildNewElement(
+      {
+        type: "frame",
+        x: bounds[0],
+        y: bounds[1],
+        width: bounds[2] - bounds[0],
+        height: bounds[3] - bounds[1],
+        name: opts.name ?? null,
+        backgroundColor: "transparent",
+      },
+      [...this.elements.values()],
+    );
+    const frameUndo: Array<{ id: string; prior: ExcalidrawElement | null }> = [
+      { id: frame.id, prior: null },
+    ];
+    const changed: ExcalidrawElement[] = [frame];
+    for (const child of children) {
+      frameUndo.push({ id: child.id, prior: child });
+      const updated = applyUpdate(child, { frameId: frame.id });
+      this.elements.set(child.id, updated);
+      changed.push(updated);
+    }
+    this.elements.set(frame.id, frame);
+    this.pushUndo(frameUndo);
+    await this.commit(changed, { targets: [frame], select: true });
+    this.recordWrites(changed, "bot");
+    return {
+      frame,
+      children: children.map((child) => child.id),
+      sceneVersion: this.currentSceneVersion(),
+    };
+  }
+
+  async clearCanvas(
+    confirm: boolean,
+  ): Promise<{ deletedCount: number; requiresConfirm: boolean; wouldDelete?: number }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const live = this.liveElements();
+    if (!confirm) {
+      return { deletedCount: 0, requiresConfirm: true, wouldDelete: live.length };
+    }
     const changed: ExcalidrawElement[] = [];
     const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
     for (const element of this.elements.values()) {
@@ -704,7 +872,140 @@ export class CollabBot {
       await this.commit(changed);
       this.recordWrites(changed, "bot");
     }
-    return changed.length;
+    return { deletedCount: changed.length, requiresConfirm: false };
+  }
+
+  async queryElements(filter?: {
+    type?: string;
+    ids?: string[];
+    groupId?: string;
+  }): Promise<ExcalidrawElement[]> {
+    const all = await this.describeScene();
+    return all.filter((element) => {
+      if (filter?.type && element.type !== filter.type) {
+        return false;
+      }
+      if (filter?.ids && !filter.ids.includes(element.id)) {
+        return false;
+      }
+      return !(
+        filter?.groupId && !(element.groupIds ?? []).includes(filter.groupId)
+      );
+    });
+  }
+
+  async validateScene(
+    options?: LintScopeOptions,
+  ): Promise<ReturnType<typeof lintScene> & { sceneVersion: number }> {
+    await this.ensureConnected();
+    const result = lintScene(this.liveElements(), options);
+    return { ...result, sceneVersion: this.currentSceneVersion() };
+  }
+
+  async render(
+    options: RenderOptions & { format?: "png" | "svg"; groupId?: string },
+  ): Promise<{
+    format: "png" | "svg";
+    png?: string;
+    svg?: string;
+    transform: ReturnType<typeof renderSvg>["transform"];
+    legend: ReturnType<typeof renderSvg>["legend"];
+    width: number;
+    height: number;
+    sceneVersion: number;
+  }> {
+    await this.ensureConnected();
+    const ids = options.groupId
+      ? this.resolveTargets({ groupId: options.groupId }).map((element) => element.id)
+      : options.ids;
+    const rendered = renderSvg([...this.elements.values()], { ...options, ids });
+    const png =
+      options.format === "svg" ? null : svgToPngBase64(rendered.svg);
+    return {
+      format: png ? "png" : "svg",
+      ...(png ? { png } : { svg: rendered.svg }),
+      transform: rendered.transform,
+      legend: rendered.legend,
+      width: rendered.width,
+      height: rendered.height,
+      sceneVersion: this.currentSceneVersion(),
+    };
+  }
+
+  private async commitCreations(
+    created: ExcalidrawElement[],
+    containerUpdates: ExcalidrawElement[],
+    opts: { select: boolean },
+  ): Promise<void> {
+    const all = [...containerUpdates, ...created];
+    if (!all.length) {
+      return;
+    }
+    this.pushUndo([
+      ...containerUpdates.map((element) => ({
+        id: element.id,
+        prior: this.elements.get(element.id) ?? null,
+      })),
+      ...created.map((element) => ({ id: element.id, prior: null })),
+    ]);
+    for (const element of all) {
+      this.elements.set(element.id, element);
+    }
+    await this.commit(all, {
+      targets: created.length ? created : all,
+      select: opts.select,
+    });
+    this.recordWrites(all, "bot");
+  }
+
+  private withTextSizing(
+    current: ExcalidrawElement,
+    patch: Partial<ExcalidrawElement>,
+  ): Partial<ExcalidrawElement> {
+    if (current.type !== "text" || asText(current).containerId != null) {
+      return patch;
+    }
+    const touched = patch as {
+      text?: unknown;
+      fontSize?: unknown;
+      fontFamily?: unknown;
+      lineHeight?: number;
+    };
+    const touchesText =
+      touched.text !== undefined ||
+      touched.fontSize !== undefined ||
+      touched.fontFamily !== undefined;
+    if (!touchesText) {
+      return patch;
+    }
+    if (typeof patch.width === "number" && typeof patch.height === "number") {
+      return patch;
+    }
+    const raw = String(
+      patch.text !== undefined ? patch.text : asText(current).text ?? "",
+    );
+    const fontSize =
+      typeof patch.fontSize === "number"
+        ? patch.fontSize
+        : asText(current).fontSize ?? DEFAULT_FONT_SIZE;
+    const fontFamily =
+      typeof patch.fontFamily === "number"
+        ? patch.fontFamily
+        : asText(current).fontFamily ?? DEFAULT_FONT_FAMILY;
+    const fixedWidth =
+      typeof patch.width === "number"
+        ? patch.width
+        : asText(current).autoResize === false
+          ? current.width || undefined
+          : undefined;
+    const layout = layoutText(raw, fontSize, fontFamily, fixedWidth);
+    return {
+      ...patch,
+      width: patch.width ?? layout.width,
+      height: patch.height ?? layout.height,
+      text: layout.text,
+      lineHeight: touched.lineHeight ?? layout.lineHeight,
+    };
   }
 
   async connectElements(
@@ -857,18 +1158,27 @@ export class CollabBot {
     return [...this.elements.values()].filter((element) => !element.isDeleted);
   }
 
-  async queryElements(filter?: {
-    type?: string;
-    ids?: string[];
-  }): Promise<ExcalidrawElement[]> {
-    const all = await this.describeScene();
-    return all.filter((element) => {
-      if (filter?.type && element.type !== filter.type) {
-        return false;
+  private async patchMany(
+    items: Array<{ id: string; patch: Partial<ExcalidrawElement> }>,
+  ): Promise<ExcalidrawElement[]> {
+    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
+    const changed: ExcalidrawElement[] = [];
+    for (const { id, patch } of items) {
+      const current = this.elements.get(id);
+      if (!current || current.isDeleted) {
+        continue;
       }
-      return !(filter?.ids && !filter.ids.includes(element.id));
-
-    });
+      frame.push({ id, prior: current });
+      const updated = applyUpdate(current, patch);
+      this.elements.set(id, updated);
+      changed.push(updated);
+    }
+    if (changed.length) {
+      this.pushUndo(frame);
+      await this.commit(changed, { targets: changed, select: true });
+      this.recordWrites(changed, "bot");
+    }
+    return changed;
   }
 
   async undoLast(): Promise<{ undone: number; sceneVersion: number }> {
@@ -932,13 +1242,20 @@ export class CollabBot {
     return elementAtPoint([...this.elements.values()], x, y);
   }
 
-  async validateScene(options?: {
-    disabledRules?: string[];
-    viewBackgroundColor?: string;
-  }): Promise<ReturnType<typeof lintScene> & { sceneVersion: number }> {
-    await this.ensureConnected();
-    const result = lintScene(this.liveElements(), options);
-    return { ...result, sceneVersion: this.currentSceneVersion() };
+  private resolveTargets(selector: {
+    ids?: string[];
+    groupId?: string;
+  }): ExcalidrawElement[] {
+    const live = this.liveElements();
+    if (selector.groupId) {
+      const groupId = selector.groupId;
+      return live.filter((element) => (element.groupIds ?? []).includes(groupId));
+    }
+    if (selector.ids) {
+      const set = new Set(selector.ids);
+      return live.filter((element) => set.has(element.id));
+    }
+    return [];
   }
 
   async sceneDiff(sinceVersion?: number): Promise<{
@@ -1006,27 +1323,36 @@ export class CollabBot {
     };
   }
 
-  async render(options: RenderOptions & { format?: "png" | "svg" }): Promise<{
-    format: "png" | "svg";
-    png?: string;
-    svg?: string;
-    transform: ReturnType<typeof renderSvg>["transform"];
-    legend: ReturnType<typeof renderSvg>["legend"];
-    width: number;
-    height: number;
-    sceneVersion: number;
-  }> {
-    await this.ensureConnected();
-    const rendered = renderSvg([...this.elements.values()], options);
-    const png =
-      options.format === "svg" ? null : svgToPngBase64(rendered.svg);
+  // Deleting a container cascades to its bound text, matching the live editor.
+  private async deleteResolved(
+    targets: ExcalidrawElement[],
+  ): Promise<{ deleted: string[]; sceneVersion: number }> {
+    const ids = new Set(targets.map((element) => element.id));
+    for (const element of this.liveElements()) {
+      const container = asText(element).containerId;
+      if (typeof container === "string" && ids.has(container)) {
+        ids.add(element.id);
+      }
+    }
+    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
+    const changed: ExcalidrawElement[] = [];
+    for (const id of ids) {
+      const current = this.elements.get(id);
+      if (!current || current.isDeleted) {
+        continue;
+      }
+      frame.push({ id, prior: current });
+      const deleted = markDeleted(current);
+      this.elements.set(id, deleted);
+      changed.push(deleted);
+    }
+    if (changed.length) {
+      this.pushUndo(frame);
+      await this.commit(changed);
+      this.recordWrites(changed, "bot");
+    }
     return {
-      format: png ? "png" : "svg",
-      ...(png ? { png } : { svg: rendered.svg }),
-      transform: rendered.transform,
-      legend: rendered.legend,
-      width: rendered.width,
-      height: rendered.height,
+      deleted: changed.map((element) => element.id),
       sceneVersion: this.currentSceneVersion(),
     };
   }

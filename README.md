@@ -71,9 +71,16 @@ returns them verbatim.
 ### MCP tools
 
 - `describe_scene` — current non-deleted elements (viewer + editor).
-- `query_elements` — filter by `type` / `ids` (viewer + editor).
-- `create_element`, `update_element`, `delete_element`, `clear_canvas` —
-  editor only. A viewer token gets an MCP error `read-only access`.
+- `query_elements` — filter by `type` / `ids` / `groupId` (viewer + editor).
+- `create_element`, `update_element`, `delete_element` — editor only. A viewer
+  token gets an MCP error `read-only access`.
+- `batch_create`, `update_elements`, `delete_elements`, `delete_region` —
+  single-commit batch writes (editor only).
+- `group_elements`, `ungroup_elements`, `create_frame` — grouping/frames.
+- `clear_canvas` — editor only, safe by default (needs `confirm:true`).
+
+See `docs/verification-tools.md` for the read/measure/render/validate tools,
+bound text (`containerId`/`label`), line `points`, and the lint rules.
 
 Each mutating tool: applies the change (bumps `version`, fresh `versionNonce`,
 `updated`, fractional `index` after the last element), broadcasts a
