@@ -371,9 +371,8 @@ export class CollabBot {
     const element = buildNewElement(attrs, [...this.elements.values()]);
     this.pushUndo([{ id: element.id, prior: null }]);
     this.elements.set(element.id, element);
-    await this.commit([element]);
+    await this.commit([element], { targets: [element], select: true });
     this.recordWrites([element], "bot");
-    await this.showActivity([element], true);
     return {
       element,
       sceneVersion: this.currentSceneVersion(),
@@ -611,39 +610,6 @@ export class CollabBot {
     });
   }
 
-  private async commit(changed: ExcalidrawElement[]): Promise<void> {
-    const all = [...this.elements.values()];
-    await this.broadcastUpdate(changed);
-    await persistScene(this.boardId, this.roomKey, all);
-    // History is recorded independently: a history failure must not lose the
-    // user-visible change (already broadcast + persisted), but must be loud.
-    try {
-      await appendSceneHistory({
-        roomId: this.boardId,
-        roomKey: this.roomKey,
-        author: this.authorLabel,
-        elements: all,
-      });
-    } catch (error) {
-      logError("collab.commit.history_failed", error, {
-        boardId: this.boardId,
-        changedCount: changed.length,
-        totalCount: all.length,
-      });
-    }
-    logInfo("collab.commit.succeeded", {
-      boardId: this.boardId,
-      changedCount: changed.length,
-      totalCount: all.length,
-    });
-  }
-
-  private requireEditor(): void {
-    if (this.role !== "editor") {
-      throw new ReadOnlyError();
-    }
-  }
-
   async updateElement(
     id: string,
     patch: Partial<ExcalidrawElement>,
@@ -657,15 +623,49 @@ export class CollabBot {
     this.pushUndo([{ id, prior: current }]);
     const updated = applyUpdate(current, patch);
     this.elements.set(id, updated);
-    await this.commit([updated]);
+    await this.commit([updated], { targets: [updated], select: true });
     this.recordWrites([updated], "bot");
-    await this.showActivity([updated], true);
     return {
       element: updated,
       sceneVersion: this.currentSceneVersion(),
       readback: this.readback(id),
       warnings: lintElement(updated, this.liveElements()),
     };
+  }
+
+  private requireEditor(): void {
+    if (this.role !== "editor") {
+      throw new ReadOnlyError();
+    }
+  }
+
+  async createElements(
+    items: Array<Partial<ExcalidrawElement> & { type: string }>,
+  ): Promise<{
+    created: ExcalidrawElement[];
+    sceneVersion: number;
+    warnings: LintFinding[];
+  }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const working = [...this.elements.values()];
+    const created: ExcalidrawElement[] = [];
+    for (const attrs of items) {
+      const element = buildNewElement(attrs, working);
+      working.push(element);
+      created.push(element);
+    }
+    this.pushUndo(created.map((element) => ({ id: element.id, prior: null })));
+    for (const element of created) {
+      this.elements.set(element.id, element);
+    }
+    if (created.length) {
+      await this.commit(created, { targets: created, select: true });
+      this.recordWrites(created, "bot");
+    }
+    const live = this.liveElements();
+    const warnings = created.flatMap((element) => lintElement(element, live));
+    return { created, sceneVersion: this.currentSceneVersion(), warnings };
   }
 
   async deleteElement(
@@ -705,36 +705,6 @@ export class CollabBot {
       this.recordWrites(changed, "bot");
     }
     return changed.length;
-  }
-
-  async createElements(
-    items: Array<Partial<ExcalidrawElement> & { type: string }>,
-  ): Promise<{
-    created: ExcalidrawElement[];
-    sceneVersion: number;
-    warnings: LintFinding[];
-  }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const working = [...this.elements.values()];
-    const created: ExcalidrawElement[] = [];
-    for (const attrs of items) {
-      const element = buildNewElement(attrs, working);
-      working.push(element);
-      created.push(element);
-    }
-    this.pushUndo(created.map((element) => ({ id: element.id, prior: null })));
-    for (const element of created) {
-      this.elements.set(element.id, element);
-    }
-    if (created.length) {
-      await this.commit(created);
-      this.recordWrites(created, "bot");
-      await this.showActivity(created, true);
-    }
-    const live = this.liveElements();
-    const warnings = created.flatMap((element) => lintElement(element, live));
-    return { created, sceneVersion: this.currentSceneVersion(), warnings };
   }
 
   async connectElements(
@@ -800,9 +770,8 @@ export class CollabBot {
     this.elements.set(fromId, fromUpdated);
     this.elements.set(toId, toUpdated);
     const changed = [arrow, fromUpdated, toUpdated];
-    await this.commit(changed);
+    await this.commit(changed, { targets: [arrow], select: true });
     this.recordWrites(changed, "bot");
-    await this.showActivity([arrow], true);
 
     return {
       element: arrow,
@@ -843,11 +812,44 @@ export class CollabBot {
     }
     if (changed.length) {
       this.pushUndo(frame);
-      await this.commit(changed);
+      await this.commit(changed, { targets: changed, select: true });
       this.recordWrites(changed, "bot");
-      await this.showActivity(changed, true);
     }
     return { moved: changed, sceneVersion: this.currentSceneVersion() };
+  }
+
+  private async commit(
+    changed: ExcalidrawElement[],
+    activity?: { targets: ExcalidrawElement[]; select: boolean },
+  ): Promise<void> {
+    await this.broadcastUpdate(changed);
+    // Emit the cursor before the Firestore writes so presence doesn't trail the persist latency.
+    if (activity) {
+      await this.showActivity(activity.targets, activity.select);
+    }
+    const all = [...this.elements.values()];
+    await persistScene(this.boardId, this.roomKey, all);
+    // History is recorded independently: a history failure must not lose the
+    // user-visible change (already broadcast + persisted), but must be loud.
+    try {
+      await appendSceneHistory({
+        roomId: this.boardId,
+        roomKey: this.roomKey,
+        author: this.authorLabel,
+        elements: all,
+      });
+    } catch (error) {
+      logError("collab.commit.history_failed", error, {
+        boardId: this.boardId,
+        changedCount: changed.length,
+        totalCount: all.length,
+      });
+    }
+    logInfo("collab.commit.succeeded", {
+      boardId: this.boardId,
+      changedCount: changed.length,
+      totalCount: all.length,
+    });
   }
 
   async describeScene(): Promise<ExcalidrawElement[]> {
