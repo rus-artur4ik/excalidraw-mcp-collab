@@ -173,6 +173,19 @@ export const markDeleted = (
   updated: Date.now(),
 });
 
+// Revives a bot-owned element above an incoming deletion so the bot's live copy
+// wins the version race and propagates back to every client.
+export const reassertElement = (
+  element: ExcalidrawElement,
+  incomingVersion: number,
+): ExcalidrawElement => ({
+  ...element,
+  isDeleted: false,
+  version: Math.max(element.version, incomingVersion) + 1,
+  versionNonce: randomInteger(),
+  updated: Date.now(),
+});
+
 const addBackref = (
   element: ExcalidrawElement,
   refId: string,

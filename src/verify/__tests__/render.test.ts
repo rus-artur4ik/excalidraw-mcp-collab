@@ -49,6 +49,19 @@ describe("renderSvg", () => {
   });
 });
 
+describe("renderSvg linear fallback", () => {
+  it("draws a bbox-only line as a non-degenerate two-point segment", () => {
+    const result = renderSvg([
+      el({ type: "line", id: "rail", x: 10, y: 20, width: 150, height: 0 }),
+    ]);
+    const match = result.svg.match(/<polyline points="([^"]+)"/);
+    expect(match).toBeTruthy();
+    const coords = match![1].trim().split(" ");
+    expect(coords).toHaveLength(2);
+    expect(coords[0]).not.toBe(coords[1]);
+  });
+});
+
 describe("elementAtPoint", () => {
   it("returns the top-most element by z-order", () => {
     const bottom = el({ type: "rectangle", id: "bottom", x: 0, y: 0, width: 100, height: 100, index: "a1" });

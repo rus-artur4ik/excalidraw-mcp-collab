@@ -434,7 +434,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "create_element",
     {
       description:
-        "Create a new Excalidraw element on a board (bot write access required).",
+        "Create a new Excalidraw element on a board. The bot keeps ownership of what it creates: if a concurrent human session deletes the new element, the bot re-asserts it automatically — query scene_diff `conflicts` to see any contested ids. Bot write access required.",
       inputSchema: createShape,
     },
     async (args) =>
@@ -484,7 +484,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "update_elements",
     {
       description:
-        "Update many elements in a single commit. Each item is { id, ...fields }. Standalone text auto-resizes to its new content unless an explicit width+height is given. Use return:\"ids\" to keep the response small. Bot write access required.",
+        "Update many elements in a single commit. Each item is { id, ...fields }. Missing/already-deleted ids (e.g. an element a human removed concurrently) are skipped and listed in `missing` rather than aborting the batch — the valid patches still commit atomically. Standalone text auto-resizes to its new content unless an explicit width+height is given. Use return:\"ids\" to keep the response small. Bot write access required.",
       inputSchema: updateElementsShape,
     },
     async (args) =>
@@ -622,7 +622,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "scene_diff",
     {
       description:
-        "Return elements changed since a given sceneVersion, split by origin (bot vs incoming human edits). Omit sinceVersion to list everything the bot considers current.",
+        "Return elements changed since a given sceneVersion, split by stable ownership: `byOrigin.bot` are ids this bot created (it keeps owning them even after a human edits them), `byOrigin.incoming` are everyone else's. Also returns `owned` (all bot-created ids) and `conflicts` — bot-created elements a concurrent human session deleted or overwrote, including whether the bot re-asserted (resurrected) or yielded them. Omit sinceVersion to list everything the bot considers current.",
       inputSchema: sceneDiffShape,
     },
     async (args) =>
@@ -773,7 +773,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "batch_create",
     {
       description:
-        "Create multiple elements in a single commit (one broadcast/persist). Supports bound text (containerId / label) and line/arrow points. Returns the created elements (or just ids with return:\"ids\") plus inline lint warnings computed at commit time. Bot write access required.",
+        "Create multiple elements in a single commit (one broadcast/persist). Supports bound text (containerId / label) and line/arrow points. Returns the created elements (or just ids with return:\"ids\") plus inline lint warnings computed at commit time and any `conflicts`. The bot keeps ownership of the created ids and re-asserts them if a concurrent human session deletes them. Bot write access required.",
       inputSchema: batchCreateShape,
     },
     async (args) =>

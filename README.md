@@ -75,7 +75,8 @@ returns them verbatim.
 - `create_element`, `update_element`, `delete_element` — editor only. A viewer
   token gets an MCP error `read-only access`.
 - `batch_create`, `update_elements`, `delete_elements`, `delete_region` —
-  single-commit batch writes (editor only).
+  single-commit batch writes (editor only). `update_elements` skips ids that no
+  longer exist (returning them in `missing`) instead of aborting the batch.
 - `group_elements`, `ungroup_elements`, `create_frame` — grouping/frames.
 - `clear_canvas` — editor only, safe by default (needs `confirm:true`).
 
@@ -84,8 +85,17 @@ bound text (`containerId`/`label`), line `points`, and the lint rules.
 
 Each mutating tool: applies the change (bumps `version`, fresh `versionNonce`,
 `updated`, fractional `index` after the last element), broadcasts a
-`SCENE_UPDATE` over `server-broadcast`, persists the full scene, and appends a
-history entry attributed `Бот <name>`.
+`SCENE_UPDATE` over `server-broadcast`, merge-persists the scene into Firestore
+in a transaction (so a concurrent human session is never clobbered), and appends
+a history entry attributed `Бот <name>`.
+
+The bot keeps stable ownership of the ids it creates. If a concurrent human
+session deletes one of them (the live session can broadcast a fresh bot element
+back as a tombstone), the bot re-asserts its last good copy at a higher version
+so the element is not silently lost — up to a few times before it yields to a
+persistent deletion. `scene_diff` reports ownership (`byOrigin.bot`, `owned`)
+and any contested ids (`conflicts`); `create_element`/`batch_create` surface the
+same `conflicts`.
 
 ## Setup
 

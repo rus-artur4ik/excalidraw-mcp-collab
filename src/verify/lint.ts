@@ -571,6 +571,23 @@ const pairwiseChecks = (
   return findings;
 };
 
+const alignFinding = (
+  edge: string,
+  label: string,
+  diff: number,
+  ids: [string, string],
+): LintFinding => ({
+  code: "alignment_near_miss",
+  severity: "info",
+  elementIds: ids,
+  message: `${label} are ${diff.toFixed(1)}px apart — likely meant to align.`,
+  suggestion: { action: "align", edge, ids },
+});
+
+// Coords are [edge1, center, edge2]. Edges of differently-sized elements
+// diverge by the size difference, so flagging them when the pair is already
+// centred is noise: talk about the centre when centres align, edges only when
+// centres are far apart.
 const nearMissOnAxis = (
   aCoords: readonly number[],
   bCoords: readonly number[],
@@ -578,18 +595,20 @@ const nearMissOnAxis = (
   ids: [string, string],
 ): LintFinding | null => {
   const diffs = aCoords.map((v, i) => Math.abs(v - bCoords[i]));
-  if (diffs.some((d) => d < ALIGN_MIN)) {
+  const centerDiff = diffs[1];
+  if (centerDiff < ALIGN_MIN) {
     return null;
   }
-  for (let k = 0; k < diffs.length; k++) {
-    if (diffs[k] >= ALIGN_MIN && diffs[k] <= ALIGN_SNAP) {
-      return {
-        code: "alignment_near_miss",
-        severity: "info",
-        elementIds: ids,
-        message: `${edges[k]} edges are ${diffs[k].toFixed(1)}px apart — likely meant to align.`,
-        suggestion: { action: "align", edge: edges[k], ids },
-      };
+  if (centerDiff <= ALIGN_SNAP) {
+    return alignFinding(edges[1], edges[1], centerDiff, ids);
+  }
+  const edgeIndices = [0, 2];
+  if (edgeIndices.some((k) => diffs[k] < ALIGN_MIN)) {
+    return null;
+  }
+  for (const k of edgeIndices) {
+    if (diffs[k] <= ALIGN_SNAP) {
+      return alignFinding(edges[k], `${edges[k]} edges`, diffs[k], ids);
     }
   }
   return null;

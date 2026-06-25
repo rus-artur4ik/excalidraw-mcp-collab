@@ -7,6 +7,7 @@ import {auth, db} from "../firebase";
 import {decryptJSON, encryptJSON} from "../encryption";
 import {appendSceneHistory, getSceneVersion, loadScene, persistScene,} from "../scene";
 import {applyUpdate, buildNewElement, type CreateAttrs, markDeleted, planCreations,} from "../elements";
+import {type ConflictKind, decideIncoming} from "../reconcile";
 import {
   type ArrangeOptions,
   arrangePositions,
@@ -70,11 +71,20 @@ export type BotIdentity = {
   role: Role;
 };
 
+export type ConflictRecord = {
+  id: string;
+  kind: ConflictKind;
+  resurrections: number;
+  sceneVersion: number;
+};
+
 export type ElementWriteResult = {
   element: ExcalidrawElement;
   sceneVersion: number;
   readback: { found: boolean; version?: number };
   warnings: LintFinding[];
+  owned: boolean;
+  conflicts: ConflictRecord[];
   related?: ExcalidrawElement[];
 };
 
@@ -111,6 +121,7 @@ export class CollabBot {
 
   private static readonly MAX_WRITE_LOG = 1000;
   private static readonly MAX_UNDO = 50;
+  private static readonly MAX_RESURRECTIONS = 3;
   private writeLog: Array<{
     id: string;
     origin: "bot" | "incoming";
@@ -120,6 +131,15 @@ export class CollabBot {
   private writeLogEvicted = false;
   private undoStack: Array<Array<{ id: string; prior: ExcalidrawElement | null }>> = [];
   private undoing = false;
+
+  // Sticky ownership of bot-created ids (survives human echoes): snapshots feed
+  // re-assertion, botDeletedIds stops the bot resisting its own deletions.
+  private ownedIds = new Set<string>();
+  private ownedSnapshots = new Map<string, ExcalidrawElement>();
+  private botDeletedIds = new Set<string>();
+  private resurrections = new Map<string, number>();
+  private conflicts = new Map<string, ConflictRecord>();
+  private persistQueue: Promise<void> = Promise.resolve();
 
   constructor(identity: BotIdentity) {
     this.uid = identity.uid;
@@ -384,6 +404,8 @@ export class CollabBot {
       sceneVersion: this.currentSceneVersion(),
       readback: this.readback(primary.id),
       warnings: created.flatMap((element) => lintElement(element, live)),
+      owned: this.ownedIds.has(primary.id),
+      conflicts: this.conflictsFor(created.map((element) => element.id)),
       ...(created.length > 1 ? { related: created.slice(1) } : {}),
     };
   }
@@ -392,13 +414,18 @@ export class CollabBot {
     id: string,
     patch: Partial<ExcalidrawElement>,
   ): Promise<ElementWriteResult> {
-    const { updated } = await this.updateElements([{ id, ...patch }]);
+    const { updated, missing } = await this.updateElements([{ id, ...patch }]);
+    if (missing.includes(id)) {
+      throw new Error(`element not found: ${id}`);
+    }
     const element = (updated as ExcalidrawElement[])[0];
     return {
       element,
       sceneVersion: this.currentSceneVersion(),
       readback: this.readback(id),
       warnings: lintElement(element, this.liveElements()),
+      owned: this.ownedIds.has(id),
+      conflicts: this.conflictsFor([id]),
     };
   }
 
@@ -636,31 +663,47 @@ export class CollabBot {
     opts: { returnIds?: boolean } = {},
   ): Promise<{
     updated: ExcalidrawElement[] | string[];
+    missing: string[];
     sceneVersion: number;
     warnings: LintFinding[];
   }> {
     this.requireEditor();
     await this.ensureConnected();
-    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
-    const changed: ExcalidrawElement[] = [];
+    // Compute every patch before mutating so a missing id can't leave the batch
+    // half-applied; missing ids are reported, the valid ones still commit.
+    const staged: Array<{
+      id: string;
+      prior: ExcalidrawElement;
+      next: ExcalidrawElement;
+    }> = [];
+    const missing: string[] = [];
     for (const { id, ...patch } of patches) {
       const current = this.elements.get(id);
       if (!current || current.isDeleted) {
-        throw new Error(`element not found: ${id}`);
+        missing.push(id);
+        continue;
       }
-      frame.push({ id, prior: current });
-      const updated = applyUpdate(current, this.withTextSizing(current, patch));
-      this.elements.set(id, updated);
-      changed.push(updated);
+      staged.push({
+        id,
+        prior: current,
+        next: applyUpdate(current, this.withTextSizing(current, patch)),
+      });
     }
+    const changed = staged.map((entry) => entry.next);
     if (changed.length) {
-      this.pushUndo(frame);
+      for (const entry of staged) {
+        this.elements.set(entry.id, entry.next);
+      }
+      this.pushUndo(
+        staged.map((entry) => ({ id: entry.id, prior: entry.prior })),
+      );
       await this.commit(changed, { targets: changed, select: true });
       this.recordWrites(changed, "bot");
     }
     const live = this.liveElements();
     return {
       updated: opts.returnIds ? changed.map((element) => element.id) : changed,
+      missing,
       sceneVersion: this.currentSceneVersion(),
       warnings: changed.flatMap((element) => lintElement(element, live)),
     };
@@ -673,6 +716,7 @@ export class CollabBot {
     created: ExcalidrawElement[] | string[];
     sceneVersion: number;
     warnings: LintFinding[];
+    conflicts: ConflictRecord[];
   }> {
     this.requireEditor();
     await this.ensureConnected();
@@ -686,6 +730,7 @@ export class CollabBot {
       created: opts.returnIds ? created.map((element) => element.id) : created,
       sceneVersion: this.currentSceneVersion(),
       warnings,
+      conflicts: this.conflictsFor(created.map((element) => element.id)),
     };
   }
 
@@ -838,6 +883,7 @@ export class CollabBot {
       changed.push(updated);
     }
     this.elements.set(frame.id, frame);
+    this.claimOwnership([frame]);
     this.pushUndo(frameUndo);
     await this.commit(changed, { targets: [frame], select: true });
     this.recordWrites(changed, "bot");
@@ -932,82 +978,6 @@ export class CollabBot {
     };
   }
 
-  private async commitCreations(
-    created: ExcalidrawElement[],
-    containerUpdates: ExcalidrawElement[],
-    opts: { select: boolean },
-  ): Promise<void> {
-    const all = [...containerUpdates, ...created];
-    if (!all.length) {
-      return;
-    }
-    this.pushUndo([
-      ...containerUpdates.map((element) => ({
-        id: element.id,
-        prior: this.elements.get(element.id) ?? null,
-      })),
-      ...created.map((element) => ({ id: element.id, prior: null })),
-    ]);
-    for (const element of all) {
-      this.elements.set(element.id, element);
-    }
-    await this.commit(all, {
-      targets: created.length ? created : all,
-      select: opts.select,
-    });
-    this.recordWrites(all, "bot");
-  }
-
-  private withTextSizing(
-    current: ExcalidrawElement,
-    patch: Partial<ExcalidrawElement>,
-  ): Partial<ExcalidrawElement> {
-    if (current.type !== "text" || asText(current).containerId != null) {
-      return patch;
-    }
-    const touched = patch as {
-      text?: unknown;
-      fontSize?: unknown;
-      fontFamily?: unknown;
-      lineHeight?: number;
-    };
-    const touchesText =
-      touched.text !== undefined ||
-      touched.fontSize !== undefined ||
-      touched.fontFamily !== undefined;
-    if (!touchesText) {
-      return patch;
-    }
-    if (typeof patch.width === "number" && typeof patch.height === "number") {
-      return patch;
-    }
-    const raw = String(
-      patch.text !== undefined ? patch.text : asText(current).text ?? "",
-    );
-    const fontSize =
-      typeof patch.fontSize === "number"
-        ? patch.fontSize
-        : asText(current).fontSize ?? DEFAULT_FONT_SIZE;
-    const fontFamily =
-      typeof patch.fontFamily === "number"
-        ? patch.fontFamily
-        : asText(current).fontFamily ?? DEFAULT_FONT_FAMILY;
-    const fixedWidth =
-      typeof patch.width === "number"
-        ? patch.width
-        : asText(current).autoResize === false
-          ? current.width || undefined
-          : undefined;
-    const layout = layoutText(raw, fontSize, fontFamily, fixedWidth);
-    return {
-      ...patch,
-      width: patch.width ?? layout.width,
-      height: patch.height ?? layout.height,
-      text: layout.text,
-      lineHeight: touched.lineHeight ?? layout.lineHeight,
-    };
-  }
-
   async connectElements(
     fromId: string,
     toId: string,
@@ -1070,6 +1040,7 @@ export class CollabBot {
     this.elements.set(arrowId, arrow);
     this.elements.set(fromId, fromUpdated);
     this.elements.set(toId, toUpdated);
+    this.claimOwnership([arrow]);
     const changed = [arrow, fromUpdated, toUpdated];
     await this.commit(changed, { targets: [arrow], select: true });
     this.recordWrites(changed, "bot");
@@ -1079,6 +1050,133 @@ export class CollabBot {
       sceneVersion: this.currentSceneVersion(),
       readback: this.readback(arrowId),
       warnings: lintElement(arrow, this.liveElements()),
+      owned: this.ownedIds.has(arrowId),
+      conflicts: this.conflictsFor([arrowId]),
+    };
+  }
+
+  private withTextSizing(
+    current: ExcalidrawElement,
+    patch: Partial<ExcalidrawElement>,
+  ): Partial<ExcalidrawElement> {
+    if (current.type !== "text" || asText(current).containerId != null) {
+      return patch;
+    }
+    const touched = patch as {
+      text?: unknown;
+      fontSize?: unknown;
+      fontFamily?: unknown;
+      lineHeight?: number;
+    };
+    const touchesText =
+      touched.text !== undefined ||
+      touched.fontSize !== undefined ||
+      touched.fontFamily !== undefined;
+    if (!touchesText) {
+      return patch;
+    }
+    if (typeof patch.width === "number" && typeof patch.height === "number") {
+      return patch;
+    }
+    const raw = String(
+      patch.text !== undefined ? patch.text : asText(current).text ?? "",
+    );
+    const fontSize =
+      typeof patch.fontSize === "number"
+        ? patch.fontSize
+        : asText(current).fontSize ?? DEFAULT_FONT_SIZE;
+    const fontFamily =
+      typeof patch.fontFamily === "number"
+        ? patch.fontFamily
+        : asText(current).fontFamily ?? DEFAULT_FONT_FAMILY;
+    const fixedWidth =
+      typeof patch.width === "number"
+        ? patch.width
+        : asText(current).autoResize === false
+          ? current.width || undefined
+          : undefined;
+    const layout = layoutText(raw, fontSize, fontFamily, fixedWidth);
+    return {
+      ...patch,
+      width: patch.width ?? layout.width,
+      height: patch.height ?? layout.height,
+      text: layout.text,
+      lineHeight: touched.lineHeight ?? layout.lineHeight,
+    };
+  }
+
+  async sceneDiff(sinceVersion?: number): Promise<{
+    sceneVersion: number;
+    since: number | null;
+    truncated: boolean;
+    changes: Array<{
+      id: string;
+      type: string;
+      origin: "bot" | "incoming";
+      owned: boolean;
+      version: number;
+      status: "present" | "deleted";
+    }>;
+    byOrigin: { bot: string[]; incoming: string[] };
+    owned: string[];
+    conflicts: ConflictRecord[];
+  }> {
+    await this.ensureConnected();
+    const sceneVersion = this.currentSceneVersion();
+    const oldestLogged = this.writeLog.length
+      ? this.writeLog[0].sceneVersionAfter
+      : sceneVersion;
+    const truncated =
+      sinceVersion !== undefined &&
+      this.writeLogEvicted &&
+      sinceVersion < oldestLogged;
+    const latestById = new Map<string, "bot" | "incoming">();
+    if (sinceVersion === undefined || truncated) {
+      for (const element of this.liveElements()) {
+        latestById.set(element.id, this.lastOrigin(element.id));
+      }
+    } else {
+      for (const entry of this.writeLog) {
+        if (entry.sceneVersionAfter > sinceVersion) {
+          latestById.set(entry.id, entry.origin);
+        }
+      }
+    }
+    const changes: Array<{
+      id: string;
+      type: string;
+      origin: "bot" | "incoming";
+      owned: boolean;
+      version: number;
+      status: "present" | "deleted";
+    }> = [];
+    // Keyed on who created the element, not the last writer, so bot elements
+    // stay in `bot` after a human edits them.
+    const byOrigin = { bot: [] as string[], incoming: [] as string[] };
+    for (const [id, origin] of latestById) {
+      const element = this.elements.get(id);
+      if (!element) {
+        continue;
+      }
+      const owned = this.ownedIds.has(id);
+      changes.push({
+        id,
+        type: element.type,
+        origin,
+        owned,
+        version: element.version,
+        status: element.isDeleted ? "deleted" : "present",
+      });
+      (owned ? byOrigin.bot : byOrigin.incoming).push(id);
+    }
+    return {
+      sceneVersion,
+      since: sinceVersion ?? null,
+      truncated,
+      changes,
+      byOrigin,
+      owned: [...this.ownedIds],
+      conflicts: [...this.conflicts.values()],
     };
   }
 
@@ -1258,69 +1356,31 @@ export class CollabBot {
     return [];
   }
 
-  async sceneDiff(sinceVersion?: number): Promise<{
-    sceneVersion: number;
-    since: number | null;
-    truncated: boolean;
-    changes: Array<{
-      id: string;
-      type: string;
-      origin: "bot" | "incoming";
-      version: number;
-      status: "present" | "deleted";
-    }>;
-    byOrigin: { bot: string[]; incoming: string[] };
-  }> {
-    await this.ensureConnected();
-    const sceneVersion = this.currentSceneVersion();
-    const oldestLogged = this.writeLog.length
-      ? this.writeLog[0].sceneVersionAfter
-      : sceneVersion;
-    const truncated =
-      sinceVersion !== undefined &&
-      this.writeLogEvicted &&
-      sinceVersion < oldestLogged;
-    const latestById = new Map<string, "bot" | "incoming">();
-    if (sinceVersion === undefined || truncated) {
-      for (const element of this.liveElements()) {
-        latestById.set(element.id, this.lastOrigin(element.id));
-      }
-    } else {
-      for (const entry of this.writeLog) {
-        if (entry.sceneVersionAfter > sinceVersion) {
-          latestById.set(entry.id, entry.origin);
-        }
-      }
+  private async commitCreations(
+    created: ExcalidrawElement[],
+    containerUpdates: ExcalidrawElement[],
+    opts: { select: boolean },
+  ): Promise<void> {
+    const all = [...containerUpdates, ...created];
+    if (!all.length) {
+      return;
     }
-    const changes: Array<{
-      id: string;
-      type: string;
-      origin: "bot" | "incoming";
-      version: number;
-      status: "present" | "deleted";
-    }> = [];
-    const byOrigin = { bot: [] as string[], incoming: [] as string[] };
-    for (const [id, origin] of latestById) {
-      const element = this.elements.get(id);
-      if (!element) {
-        continue;
-      }
-      changes.push({
-        id,
-        type: element.type,
-        origin,
-        version: element.version,
-        status: element.isDeleted ? "deleted" : "present",
-      });
-      byOrigin[origin].push(id);
+    this.pushUndo([
+      ...containerUpdates.map((element) => ({
+        id: element.id,
+        prior: this.elements.get(element.id) ?? null,
+      })),
+      ...created.map((element) => ({ id: element.id, prior: null })),
+    ]);
+    for (const element of all) {
+      this.elements.set(element.id, element);
     }
-    return {
-      sceneVersion,
-      since: sinceVersion ?? null,
-      truncated,
-      changes,
-      byOrigin,
-    };
+    this.claimOwnership(created);
+    await this.commit(all, {
+      targets: created.length ? created : all,
+      select: opts.select,
+    });
+    this.recordWrites(all, "bot");
   }
 
   // Deleting a container cascades to its bound text, matching the live editor.
@@ -1359,16 +1419,112 @@ export class CollabBot {
 
   private reconcileIncoming(elements: ExcalidrawElement[]): void {
     const accepted: ExcalidrawElement[] = [];
+    const resurrected: ExcalidrawElement[] = [];
     for (const incoming of elements) {
-      const current = this.elements.get(incoming.id);
-      if (!current || incoming.version > current.version) {
-        this.elements.set(incoming.id, incoming);
-        accepted.push(incoming);
+      const id = incoming.id;
+      const decision = decideIncoming({
+        incoming,
+        current: this.elements.get(id),
+        isOwned: this.ownedIds.has(id),
+        botDeleted: this.botDeletedIds.has(id),
+        resurrectCount: this.resurrections.get(id) ?? 0,
+        maxResurrections: CollabBot.MAX_RESURRECTIONS,
+        snapshot: this.ownedSnapshots.get(id),
+      });
+      switch (decision.action) {
+        case "ignore":
+          break;
+        case "accept":
+          this.elements.set(id, incoming);
+          accepted.push(incoming);
+          break;
+        case "accept_conflict":
+          this.elements.set(id, incoming);
+          // A human edit means the element is alive again: refresh the
+          // re-assert snapshot to their geometry and reset the fight budget so
+          // a *later* deletion gets a fresh round of resistance.
+          this.ownedSnapshots.set(id, incoming);
+          this.resurrections.delete(id);
+          accepted.push(incoming);
+          this.recordConflict(id, decision.kind);
+          break;
+        case "resurrect":
+          this.elements.set(id, decision.element);
+          this.ownedSnapshots.set(id, decision.element);
+          this.resurrections.set(id, (this.resurrections.get(id) ?? 0) + 1);
+          this.recordConflict(id, "resurrected");
+          resurrected.push(decision.element);
+          break;
+        case "yield":
+          this.elements.set(id, incoming);
+          accepted.push(incoming);
+          this.ownedIds.delete(id);
+          this.recordConflict(id, "yielded");
+          break;
       }
     }
     if (accepted.length) {
       this.recordWrites(accepted, "incoming");
     }
+    if (resurrected.length) {
+      // Record synchronously, while `resurrected` still matches in-memory state:
+      // the async flush could otherwise roll snapshots back behind a concurrent
+      // tool commit.
+      this.recordWrites(resurrected, "bot");
+      logWarn("collab.reconcile.resurrected_owned_elements", {
+        boardId: this.boardId,
+        ids: resurrected.map((element) => element.id),
+      });
+      this.scheduleResurrectionFlush(resurrected);
+    }
+  }
+
+  private claimOwnership(elements: ExcalidrawElement[]): void {
+    for (const element of elements) {
+      this.ownedIds.add(element.id);
+      this.botDeletedIds.delete(element.id);
+      this.resurrections.delete(element.id);
+      if (!element.isDeleted) {
+        this.ownedSnapshots.set(element.id, element);
+      }
+    }
+  }
+
+  private recordConflict(id: string, kind: ConflictKind): void {
+    this.conflicts.set(id, {
+      id,
+      kind,
+      resurrections: this.resurrections.get(id) ?? 0,
+      sceneVersion: this.currentSceneVersion(),
+    });
+  }
+
+  private conflictsFor(ids: string[]): ConflictRecord[] {
+    const wanted = new Set(ids);
+    return [...this.conflicts.values()].filter((conflict) =>
+      wanted.has(conflict.id),
+    );
+  }
+
+  private scheduleResurrectionFlush(resurrected: ExcalidrawElement[]): void {
+    this.persistQueue = this.persistQueue
+      .then(() => this.flushResurrection(resurrected))
+      .catch((error) =>
+        logError("collab.reconcile.resurrection_flush_failed", error, {
+          boardId: this.boardId,
+        }),
+      );
+  }
+
+  private async flushResurrection(
+    resurrected: ExcalidrawElement[],
+  ): Promise<void> {
+    await this.broadcastUpdate(resurrected);
+    await persistScene(this.boardId, this.roomKey, [...this.elements.values()]);
+    logInfo("collab.reconcile.resurrection_flushed", {
+      boardId: this.boardId,
+      count: resurrected.length,
+    });
   }
 
   private currentSceneVersion(): number {
@@ -1391,6 +1547,15 @@ export class CollabBot {
         sceneVersionAfter,
         updated: element.updated,
       });
+      if (origin === "bot" && this.ownedIds.has(element.id)) {
+        if (element.isDeleted) {
+          this.ownedIds.delete(element.id);
+          this.ownedSnapshots.delete(element.id);
+          this.botDeletedIds.add(element.id);
+        } else {
+          this.ownedSnapshots.set(element.id, element);
+        }
+      }
     }
     const overflow = this.writeLog.length - CollabBot.MAX_WRITE_LOG;
     if (overflow > 0) {

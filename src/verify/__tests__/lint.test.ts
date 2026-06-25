@@ -263,6 +263,30 @@ describe("alignment near-miss noise reduction", () => {
     const { findings } = lintScene([a, b]);
     expect(codes(findings)).toContain("alignment_near_miss");
   });
+
+  it("stays quiet for a row of different-radius circles sharing centerY", () => {
+    const a = el({ type: "ellipse", x: 0, y: 100, width: 100, height: 100 });
+    const b = el({ type: "ellipse", x: 200, y: 102, width: 96, height: 96 });
+    const { findings } = lintScene([a, b]);
+    expect(codes(findings)).not.toContain("alignment_near_miss");
+  });
+
+  it("points at the center, not the edges, when near-centered with unequal sizes", () => {
+    const a = el({ type: "ellipse", x: 0, y: 100, width: 100, height: 100 });
+    const b = el({ type: "ellipse", x: 200, y: 105, width: 96, height: 96 });
+    const { findings } = lintScene([a, b]);
+    const near = findings.find((finding) => finding.code === "alignment_near_miss");
+    expect(near?.message).toContain("centerY");
+    expect(near?.suggestion).toMatchObject({ action: "align", edge: "centerY" });
+  });
+
+  it("still flags an edge alignment when centers are far apart", () => {
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
+    const b = el({ type: "rectangle", x: 2, y: 300, width: 200, height: 100 });
+    const { findings } = lintScene([a, b]);
+    const near = findings.find((finding) => finding.code === "alignment_near_miss");
+    expect(near?.suggestion).toMatchObject({ action: "align", edge: "left" });
+  });
 });
 
 describe("scoped validate", () => {

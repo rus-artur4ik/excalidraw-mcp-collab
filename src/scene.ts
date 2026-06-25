@@ -3,6 +3,7 @@ import {randomUUID} from "crypto";
 import {db} from "./firebase";
 import {decryptJSON, encryptJSON} from "./encryption";
 import {logError, logInfo} from "./logger";
+import {mergeByVersion} from "./reconcile";
 
 import type {ExcalidrawElement} from "./types";
 
@@ -148,31 +149,49 @@ export async function loadScene(
   }
 }
 
+// Merge-on-write in a transaction, never a blind set: a concurrent human
+// session writes the same doc, so overwriting would clobber elements the bot
+// never saw (and vice-versa). Higher element `version` wins per id.
 export async function persistScene(
   roomId: string,
   roomKey: string,
   elements: readonly ExcalidrawElement[],
 ): Promise<void> {
-  const syncable = getSyncableElements(elements);
-  const sceneVersion = getSceneVersion(syncable);
-  const { ciphertext, iv } = await encryptJSON(roomKey, syncable);
-  const stored: StoredScene = {
-    sceneVersion,
-    ciphertext: Buffer.from(ciphertext),
-    iv: Buffer.from(iv),
-  };
+  const mine = getSyncableElements(elements);
   try {
-    await sceneRef(roomId).set(stored);
+    const sceneVersion = await db().runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(sceneRef(roomId));
+      let merged = mine;
+      if (snapshot.exists) {
+        const stored = snapshot.data() as StoredScene;
+        // If the stored scene can't be read, abort rather than fall back to a
+        // bot-only write — overwriting a doc we couldn't merge is the clobber
+        // this transaction exists to prevent.
+        const storedElements = await decryptJSON<ExcalidrawElement[]>(
+          roomKey,
+          toUint8(stored.ciphertext),
+          toUint8(stored.iv),
+        );
+        merged = mergeByVersion(mine, getSyncableElements(storedElements));
+      }
+      const version = getSceneVersion(merged);
+      const { ciphertext, iv } = await encryptJSON(roomKey, merged);
+      transaction.set(sceneRef(roomId), {
+        sceneVersion: version,
+        ciphertext: Buffer.from(ciphertext),
+        iv: Buffer.from(iv),
+      });
+      return version;
+    });
     logInfo("firestore.scene.persisted", {
       boardId: roomId,
-      elementCount: syncable.length,
+      elementCount: mine.length,
       sceneVersion,
     });
   } catch (error) {
     logError("firestore.scene.persist_failed", error, {
       boardId: roomId,
-      elementCount: syncable.length,
-      sceneVersion,
+      elementCount: mine.length,
     });
     throw error;
   }
