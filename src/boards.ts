@@ -1,8 +1,10 @@
-import { db } from "./firebase";
-import { authorize } from "./acl";
-import { logError, logInfo, opaqueRef } from "./logger";
+import {db} from "./firebase";
+import {loadTeam} from "./acl";
+import {evaluateAccess} from "./policy";
+import {logError, logInfo, opaqueRef} from "./logger";
 
-import type { BoardDoc, Identity } from "./types";
+import type {BoardDoc, Identity, TeamDoc} from "./types";
+import {TEAM_ID} from "./types";
 
 export type AccessibleBoard = {
   boardId: string;
@@ -10,54 +12,55 @@ export type AccessibleBoard = {
   botAccess: "read" | "write";
 };
 
+type BoardQuerySnapshot = {
+  docs: { id: string; data: () => unknown }[];
+};
+
+const mergeInto = (target: Map<string, BoardDoc>, snap: BoardQuerySnapshot) => {
+  for (const docSnap of snap.docs) {
+    target.set(docSnap.id, docSnap.data() as BoardDoc);
+  }
+};
+
 const collectOwned = async (uid: string): Promise<Map<string, BoardDoc>> => {
   const result = new Map<string, BoardDoc>();
-  const snap = await db().collection("boards").where("ownerUid", "==", uid).get();
-  for (const docSnap of snap.docs) {
-    result.set(docSnap.id, docSnap.data() as BoardDoc);
-  }
+  mergeInto(
+    result,
+    await db().collection("boards").where("ownerUid", "==", uid).get(),
+  );
   return result;
 };
 
-const collectWhitelisted = async (
+const collectInvited = async (
   email: string,
 ): Promise<Map<string, BoardDoc>> => {
   const result = new Map<string, BoardDoc>();
-  const snap = await db()
-    .collection("boards")
-    .where("editors", "array-contains", email)
-    .get();
-  for (const docSnap of snap.docs) {
-    result.set(docSnap.id, docSnap.data() as BoardDoc);
-  }
+  const [asEditor, asViewer] = await Promise.all([
+    db().collection("boards").where("editors", "array-contains", email).get(),
+    db().collection("boards").where("viewers", "array-contains", email).get(),
+  ]);
+  mergeInto(result, asEditor);
+  mergeInto(result, asViewer);
   return result;
 };
 
-const collectTeamBoards = async (
-  email: string,
-): Promise<Map<string, BoardDoc>> => {
+const collectTeamBoards = async (): Promise<Map<string, BoardDoc>> => {
   const result = new Map<string, BoardDoc>();
-  const teamIds = new Set<string>();
-  for (const field of ["admins", "editorEmails", "viewerEmails"]) {
-    const snap = await db()
-      .collection("teams")
-      .where(field, "array-contains", email)
-      .get();
-    for (const docSnap of snap.docs) {
-      teamIds.add(docSnap.id);
-    }
-  }
-  for (const teamId of teamIds) {
-    const snap = await db()
-      .collection("boards")
-      .where("teamId", "==", teamId)
-      .get();
-    for (const docSnap of snap.docs) {
-      result.set(docSnap.id, docSnap.data() as BoardDoc);
-    }
-  }
+  const [byVisibility, legacyByTeamId] = await Promise.all([
+    db().collection("boards").where("visibility", "==", "team").get(),
+    db().collection("boards").where("teamId", "==", TEAM_ID).get(),
+  ]);
+  mergeInto(result, byVisibility);
+  mergeInto(result, legacyByTeamId);
   return result;
 };
+
+const isTeamMember = (team: TeamDoc | null, email: string | null): boolean =>
+  !!email &&
+  !!team &&
+  ((team.admins ?? []).includes(email) ||
+    (team.editorEmails ?? []).includes(email) ||
+    (team.viewerEmails ?? []).includes(email));
 
 export async function listAccessibleBoards(
   identity: Identity,
@@ -67,13 +70,15 @@ export async function listAccessibleBoards(
     return [];
   }
   try {
+    const team = await loadTeam().catch(() => null);
     const empty = new Map<string, BoardDoc>();
-    const candidates = new Map<string, BoardDoc>();
     const groups = await Promise.all([
       collectOwned(uid),
-      email ? collectWhitelisted(email) : Promise.resolve(empty),
-      email ? collectTeamBoards(email) : Promise.resolve(empty),
+      email ? collectInvited(email) : Promise.resolve(empty),
+      isTeamMember(team, email) ? collectTeamBoards() : Promise.resolve(empty),
     ]);
+
+    const candidates = new Map<string, BoardDoc>();
     for (const group of groups) {
       for (const [id, board] of group) {
         candidates.set(id, board);
@@ -82,7 +87,7 @@ export async function listAccessibleBoards(
 
     const accessible: AccessibleBoard[] = [];
     for (const [boardId, board] of candidates) {
-      const access = await authorize(boardId, identity, { asBot: true });
+      const access = evaluateAccess(identity, board, team, true);
       if (!access.canRead) {
         continue;
       }

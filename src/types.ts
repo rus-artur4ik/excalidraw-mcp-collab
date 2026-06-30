@@ -34,19 +34,27 @@ export type BotPolicy = "none" | "read" | "write";
 
 export const DEFAULT_BOT_POLICY: BotPolicy = "write";
 
+export type Visibility = "private" | "team" | "link";
+export type TeamRole = "admin" | "editor" | "viewer";
+
+export const TEAM_ID = "chats-team";
+
 export type BoardDoc = {
   ownerUid?: string;
   ownerEmail?: string;
+  title?: string;
+  visibility?: Visibility;
+  editors?: string[];
+  viewers?: string[];
+  botPolicy?: BotPolicy;
   type?: "personal" | "team";
   teamId?: string;
-  title?: string;
   readPolicy?: "public" | "members";
   writePolicy?: "everyone" | "whitelist" | "owner";
-  editors?: string[];
-  botPolicy?: BotPolicy;
 };
 
 export type TeamDoc = {
+  name?: string;
   admins?: string[];
   editorEmails?: string[];
   viewerEmails?: string[];
