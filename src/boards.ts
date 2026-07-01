@@ -87,6 +87,9 @@ export async function listAccessibleBoards(
 
     const accessible: AccessibleBoard[] = [];
     for (const [boardId, board] of candidates) {
+      if (board.archived) {
+        continue;
+      }
       const access = evaluateAccess(identity, board, team, true);
       if (!access.canRead) {
         continue;

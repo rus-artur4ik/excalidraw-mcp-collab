@@ -1,10 +1,10 @@
-import { promises as fs } from "fs";
+import {promises as fs} from "fs";
 import path from "path";
 
-import { config } from "./config";
-import { authorize, resolveIdentity } from "./acl";
+import {config} from "./config";
+import {authorize, loadBoard, loadTeam, resolveIdentity} from "./acl";
 
-import type { Request, Response } from "express";
+import type {Request, Response} from "express";
 
 const dataRoot = path.resolve(config.dataDir);
 
@@ -91,4 +91,49 @@ export async function getFile(req: Request, res: Response): Promise<void> {
   } catch {
     res.sendStatus(404);
   }
+}
+
+const canPurgeRoom = async (
+  req: Request,
+  roomId: string,
+): Promise<boolean> => {
+  const identity = await resolveIdentity(bearer(req));
+  if (!identity.uid) {
+    return false;
+  }
+  const board = await loadBoard(roomId);
+  if (!board) {
+    return false;
+  }
+  if (board.ownerUid === identity.uid) {
+    return true;
+  }
+  const isTeamBoard = board.visibility === "team" || board.teamId != null;
+  if (!isTeamBoard || !identity.email) {
+    return false;
+  }
+  const team = await loadTeam();
+  return (team?.admins ?? []).includes(identity.email);
+};
+
+export async function deleteRoomFiles(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  const { roomId } = req.params as { roomId?: string };
+  if (!roomId || /[/~]|\.\./.test(roomId)) {
+    res.sendStatus(400);
+    return;
+  }
+  if (!(await canPurgeRoom(req, roomId))) {
+    res.sendStatus(403);
+    return;
+  }
+  const absolute = sanitize(`files/rooms/${roomId}`);
+  if (!absolute) {
+    res.sendStatus(400);
+    return;
+  }
+  await fs.rm(absolute, { recursive: true, force: true });
+  res.sendStatus(204);
 }

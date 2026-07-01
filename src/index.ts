@@ -1,29 +1,14 @@
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express, {
-  type NextFunction,
-  type Request,
-  type RequestHandler,
-  type Response,
-} from "express";
+import {StreamableHTTPServerTransport} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express, {type NextFunction, type Request, type RequestHandler, type Response,} from "express";
 
-import { config, getMcpUrl } from "./config";
-import { authorize } from "./acl";
-import { listAccessibleBoards } from "./boards";
-import { auth } from "./firebase";
-import {
-  createToken,
-  getToken,
-  listTokens,
-  revokeToken,
-} from "./tokens";
-import {
-  BotAccessDeniedError,
-  disposeBotsForToken,
-  getOrCreateBot,
-  type CollabBot,
-} from "./bot/CollabBot";
-import { buildMcpServer } from "./mcp";
-import { getFile, putFile } from "./files";
+import {config, getMcpUrl} from "./config";
+import {authorize} from "./acl";
+import {listAccessibleBoards} from "./boards";
+import {auth} from "./firebase";
+import {createToken, getToken, listTokens, revokeToken,} from "./tokens";
+import {BotAccessDeniedError, type CollabBot, disposeBotsForToken, getOrCreateBot,} from "./bot/CollabBot";
+import {buildMcpServer} from "./mcp";
+import {deleteRoomFiles, getFile, putFile} from "./files";
 import {
   logError,
   logInfo,
@@ -304,6 +289,13 @@ app.get(
   "/files/*",
   asyncRoute(async (req, res) => {
     await getFile(req, res);
+  }),
+);
+
+app.delete(
+  "/files/rooms/:roomId",
+  asyncRoute(async (req, res) => {
+    await deleteRoomFiles(req, res);
   }),
 );
 
