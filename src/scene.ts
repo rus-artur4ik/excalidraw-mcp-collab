@@ -20,6 +20,7 @@ const toUint8 = (value: unknown): Uint8Array => {
 const SCENE_HISTORY_VERSION = 1;
 const MAX_SCENE_HISTORY_ENTRIES = 120;
 const SCENE_HISTORY_ID_SUFFIX = "~history";
+const BOT_OWNED_ID_SUFFIX = "~botowned~";
 const SESSION_ID = `bot:${randomUUID()}`;
 
 type StoredScene = {
@@ -80,6 +81,48 @@ const historyEntryRef = (roomId: string, entryId: string) => {
     .collection("scenes")
     .doc(`${roomId}${SCENE_HISTORY_ID_SUFFIX}~${entryId}`);
 };
+
+const botOwnedRef = (roomId: string, botId: string) => {
+  assertHistoryRoomId(roomId);
+  return db()
+    .collection("scenes")
+    .doc(`${roomId}${BOT_OWNED_ID_SUFFIX}${botId}`);
+};
+
+export async function loadBotOwnership(
+  roomId: string,
+  botId: string,
+): Promise<string[]> {
+  try {
+    const snap = await botOwnedRef(roomId, botId).get();
+    if (!snap.exists) {
+      return [];
+    }
+    const ids = (snap.data() as { ownedIds?: unknown }).ownedIds;
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+  } catch (error) {
+    logError("firestore.bot_ownership.load_failed", error, {
+      boardId: roomId,
+      botId,
+    });
+    return [];
+  }
+}
+
+export async function saveBotOwnership(
+  roomId: string,
+  botId: string,
+  ownedIds: string[],
+): Promise<void> {
+  try {
+    await botOwnedRef(roomId, botId).set({ ownedIds, updatedAt: Date.now() });
+  } catch (error) {
+    logError("firestore.bot_ownership.save_failed", error, {
+      boardId: roomId,
+      botId,
+    });
+  }
+}
 
 export const getSceneVersion = (
   elements: readonly ExcalidrawElement[],

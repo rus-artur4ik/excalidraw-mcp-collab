@@ -61,12 +61,31 @@ export type TeamDoc = {
   viewerEmails?: string[];
 };
 
+export type BotAvatar = { kind: "emoji"; value: string };
+
+export type BotBoardBinding = { boardId: string; role: "read" | "write" };
+
+export type BotDoc = {
+  ownerUid: string;
+  name: string;
+  avatar: BotAvatar;
+  color: string;
+  boards: BotBoardBinding[];
+  disabled?: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export const DEFAULT_BOT_COLOR = "#6965db";
+
 export type McpTokenDoc = {
   uid: string;
   email: string | null;
   createdAt: number;
   revoked: boolean;
-  // Legacy single-board tokens still carry these; account-scoped tokens omit them.
+  botId?: string;
+  name?: string;
+  lastUsedAt?: number;
   boardId?: string;
   role?: Role;
 };

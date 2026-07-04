@@ -1,9 +1,9 @@
 import {db} from "./firebase";
-import {loadTeam} from "./acl";
-import {evaluateAccess} from "./policy";
+import {loadBoard, loadTeam} from "./acl";
+import {evaluateAccess, needsTeam} from "./policy";
 import {logError, logInfo, opaqueRef} from "./logger";
 
-import type {BoardDoc, Identity, TeamDoc} from "./types";
+import type {BoardDoc, BotBoardBinding, Identity, TeamDoc} from "./types";
 import {TEAM_ID} from "./types";
 
 export type AccessibleBoard = {
@@ -111,4 +111,38 @@ export async function listAccessibleBoards(
     logError("mcp.list_boards.failed", error, { subjectRef: opaqueRef(uid) });
     throw error;
   }
+}
+
+export async function listBotBoards(
+  identity: Identity,
+  bindings: BotBoardBinding[],
+): Promise<AccessibleBoard[]> {
+  const { uid } = identity;
+  if (!uid) {
+    return [];
+  }
+  const accessible: AccessibleBoard[] = [];
+  for (const binding of bindings) {
+    const board = await loadBoard(binding.boardId);
+    if (!board || board.archived) {
+      continue;
+    }
+    const team = needsTeam(board) ? await loadTeam().catch(() => null) : null;
+    const access = evaluateAccess(identity, board, team, true);
+    if (!access.canRead) {
+      continue;
+    }
+    const canWrite = access.canWrite && binding.role === "write";
+    accessible.push({
+      boardId: binding.boardId,
+      title: board.title ?? "Untitled",
+      botAccess: canWrite ? "write" : "read",
+    });
+  }
+  logInfo("mcp.list_bot_boards.resolved", {
+    subjectRef: opaqueRef(uid),
+    bindingCount: bindings.length,
+    accessibleCount: accessible.length,
+  });
+  return accessible;
 }

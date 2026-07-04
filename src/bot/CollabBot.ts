@@ -5,7 +5,15 @@ import {io, type Socket} from "socket.io-client";
 import {config} from "../config";
 import {auth, db} from "../firebase";
 import {decryptJSON, encryptJSON} from "../encryption";
-import {appendSceneHistory, getSceneVersion, loadScene, persistScene,} from "../scene";
+import {getBot} from "../bots";
+import {
+  appendSceneHistory,
+  getSceneVersion,
+  loadBotOwnership,
+  loadScene,
+  persistScene,
+  saveBotOwnership,
+} from "../scene";
 import {applyUpdate, buildNewElement, type CreateAttrs, markDeleted, planCreations,} from "../elements";
 import {type ConflictKind, decideIncoming} from "../reconcile";
 import {
@@ -54,6 +62,7 @@ type CursorFrame = {
     selectedElementIds: Record<string, true>;
     username: string;
     avatarUrl: string | null;
+    color: string;
   };
 };
 
@@ -66,9 +75,18 @@ const elementCenter = (element: ExcalidrawElement): { x: number; y: number } => 
 });
 
 export type BotIdentity = {
-  uid: string;
+  botId: string;
+  ownerUid: string;
   boardId: string;
   role: Role;
+  name: string;
+  avatar: string;
+  color: string;
+};
+
+export type BotRuntimeStatus = {
+  online: boolean;
+  boards: { boardId: string; connected: boolean; lastActiveAt: number | null }[];
 };
 
 export type ConflictRecord = {
@@ -103,14 +121,19 @@ export class BotAccessDeniedError extends Error {
 }
 
 export class CollabBot {
-  private readonly uid: string;
+  private readonly botId: string;
+  private readonly ownerUid: string;
   private readonly boardId: string;
-  private readonly role: Role;
+  private role: Role;
+  private name: string;
+  private avatar: string;
+  private color: string;
 
   private roomKey = "";
   private idToken = "";
   private idTokenExpiresAt = 0;
-  private displayName = "";
+  private lastActiveAt: number | null = null;
+  private connectGen = 0;
 
   private socket: Socket | null = null;
   private accessDenied = false;
@@ -142,63 +165,76 @@ export class CollabBot {
   private persistQueue: Promise<void> = Promise.resolve();
 
   constructor(identity: BotIdentity) {
-    this.uid = identity.uid;
+    this.botId = identity.botId;
+    this.ownerUid = identity.ownerUid;
     this.boardId = identity.boardId;
     this.role = identity.role;
-  }
-
-  matches(identity: BotIdentity): boolean {
-    return (
-      this.uid === identity.uid &&
-      this.boardId === identity.boardId &&
-      this.role === identity.role
-    );
+    this.name = identity.name;
+    this.avatar = identity.avatar;
+    this.color = identity.color;
   }
 
   private get authorLabel(): string {
-    return `Бот ${this.displayName || this.uid}`;
+    return `${this.avatar} ${this.name}`.trim();
   }
 
   private get presenceName(): string {
-    return `🤖 ${this.displayName || "Bot"}`;
+    return `${this.avatar} ${this.name}`.trim();
   }
 
-  private async emitCursor(
-    pointer: { x: number; y: number },
-    selectedElementIds: Record<string, true>,
-  ): Promise<void> {
-    const socket = this.socket;
-    if (!socket?.connected || !socket.id) {
+  applyProfile(identity: BotIdentity): void {
+    this.name = identity.name;
+    this.avatar = identity.avatar;
+    this.color = identity.color;
+    if (this.role !== identity.role) {
+      this.role = identity.role;
+      this.accessDenied = false;
+      this.connectGen++;
+      this.idToken = "";
+      this.idTokenExpiresAt = 0;
+      this.connecting = null;
+      this.socket?.close();
+      this.socket = null;
+    }
+  }
+
+  idleMs(now: number): number {
+    return this.lastActiveAt === null ? Infinity : now - this.lastActiveAt;
+  }
+
+  getRuntimeBoard(): { boardId: string; connected: boolean; lastActiveAt: number | null } {
+    return {
+      boardId: this.boardId,
+      connected: !!this.socket?.connected,
+      lastActiveAt: this.lastActiveAt,
+    };
+  }
+
+  async ensureConnected(): Promise<void> {
+    this.lastActiveAt = Date.now();
+    if (this.accessDenied) {
+      logWarn("collab.connection.previously_denied", {
+        boardId: this.boardId,
+      });
+      throw new BotAccessDeniedError(this.boardId);
+    }
+    if (this.socket?.connected) {
+      logInfo("collab.connection.reused", {
+        boardId: this.boardId,
+        socketId: this.socket.id,
+      });
       return;
     }
-    const frame: CursorFrame = {
-      type: WS_SUBTYPE_MOUSE_LOCATION,
-      payload: {
-        socketId: socket.id,
-        pointer: { x: pointer.x, y: pointer.y, tool: "pointer" },
-        button: "up",
-        selectedElementIds,
-        username: this.presenceName,
-        avatarUrl: null,
-      },
-    };
-    try {
-      const { ciphertext, iv } = await encryptJSON(this.roomKey, frame);
-      socket.emit(
-        "server-volatile-broadcast",
-        this.boardId,
-        ciphertext.buffer.slice(
-          ciphertext.byteOffset,
-          ciphertext.byteOffset + ciphertext.byteLength,
-        ),
-        iv,
-      );
-    } catch (error) {
-      logWarn("collab.presence.emit_failed", {
+    if (this.connecting) {
+      logInfo("collab.connection.awaiting_inflight", {
         boardId: this.boardId,
-        error: error instanceof Error ? error.message : String(error),
       });
+      return this.connecting;
     }
+    this.connecting = this.connect().finally(() => {
+      this.connecting = null;
+    });
+    return this.connecting;
   }
 
   private async showActivity(
@@ -230,15 +266,81 @@ export class CollabBot {
     this.lastPointer = focus;
   }
 
-  // The room socket server authenticates with a Firebase ID token. The Admin
-  // SDK can only mint a *custom* token for a uid, so we exchange it for an ID
-  // token via Identity Toolkit so the room server resolves the bot AS the user
-  // and its own ACL enforces read-only.
+  // The room server only verifies Firebase ID tokens, but the Admin SDK can mint
+  // only custom tokens, so we exchange one for an ID token via Identity Toolkit.
+
+  private async emitCursor(
+    pointer: { x: number; y: number },
+    selectedElementIds: Record<string, true>,
+  ): Promise<void> {
+    const socket = this.socket;
+    if (!socket?.connected || !socket.id) {
+      return;
+    }
+    const frame: CursorFrame = {
+      type: WS_SUBTYPE_MOUSE_LOCATION,
+      payload: {
+        socketId: socket.id,
+        pointer: { x: pointer.x, y: pointer.y, tool: "pointer" },
+        button: "up",
+        selectedElementIds,
+        username: this.presenceName,
+        avatarUrl: null,
+        color: this.color,
+      },
+    };
+    try {
+      const { ciphertext, iv } = await encryptJSON(this.roomKey, frame);
+      socket.emit(
+        "server-volatile-broadcast",
+        this.boardId,
+        ciphertext.buffer.slice(
+          ciphertext.byteOffset,
+          ciphertext.byteOffset + ciphertext.byteLength,
+        ),
+        iv,
+      );
+    } catch (error) {
+      logWarn("collab.presence.emit_failed", {
+        boardId: this.boardId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async loadBoardContext(): Promise<void> {
+    const keySnap = await (async () => {
+      try {
+        logInfo("firestore.board_key.load_started", { boardId: this.boardId });
+        return await db().collection("boardKeys").doc(this.boardId).get();
+      } catch (error) {
+        logError("firestore.board_key.load_failed", error, {
+          boardId: this.boardId,
+        });
+        throw error;
+      }
+    })();
+    const roomKey = keySnap.exists
+      ? (keySnap.data() as { roomKey?: string }).roomKey
+      : undefined;
+    if (!roomKey) {
+      const error = new Error(`missing roomKey for board ${this.boardId}`);
+      logError("firestore.board_key.missing", error, {
+        boardId: this.boardId,
+        documentExists: keySnap.exists,
+      });
+      throw error;
+    }
+    this.roomKey = roomKey;
+    logInfo("firestore.board_key.loaded", { boardId: this.boardId });
+  }
+
+  // The custom token carries a verified `bot` claim the room server authorizes on.
   private async mintIdToken(): Promise<string> {
     if (this.idToken && Date.now() < this.idTokenExpiresAt) {
       logInfo("firebase.bot_id_token.cache_hit", {
         boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
+        subjectRef: opaqueRef(this.ownerUid),
       });
       return this.idToken;
     }
@@ -246,17 +348,23 @@ export class CollabBot {
     try {
       logInfo("firebase.custom_token.create_started", {
         boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
+        subjectRef: opaqueRef(this.ownerUid),
       });
-      customToken = await auth().createCustomToken(this.uid);
+      customToken = await auth().createCustomToken(this.ownerUid, {
+        bot: true,
+        botId: this.botId,
+        ownerUid: this.ownerUid,
+        boardId: this.boardId,
+        role: this.role,
+      });
       logInfo("firebase.custom_token.created", {
         boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
+        subjectRef: opaqueRef(this.ownerUid),
       });
     } catch (error) {
       logError("firebase.custom_token.create_failed", error, {
         boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
+        subjectRef: opaqueRef(this.ownerUid),
       });
       throw error;
     }
@@ -321,52 +429,6 @@ export class CollabBot {
     return this.idToken;
   }
 
-  private async loadBoardContext(): Promise<void> {
-    const keySnap = await (async () => {
-      try {
-        logInfo("firestore.board_key.load_started", { boardId: this.boardId });
-        return await db().collection("boardKeys").doc(this.boardId).get();
-      } catch (error) {
-        logError("firestore.board_key.load_failed", error, {
-          boardId: this.boardId,
-        });
-        throw error;
-      }
-    })();
-    const roomKey = keySnap.exists
-      ? (keySnap.data() as { roomKey?: string }).roomKey
-      : undefined;
-    if (!roomKey) {
-      const error = new Error(`missing roomKey for board ${this.boardId}`);
-      logError("firestore.board_key.missing", error, {
-        boardId: this.boardId,
-        documentExists: keySnap.exists,
-      });
-      throw error;
-    }
-    this.roomKey = roomKey;
-    logInfo("firestore.board_key.loaded", { boardId: this.boardId });
-
-    try {
-      const user = await auth().getUser(this.uid);
-      this.displayName = user.displayName ?? user.email ?? this.uid;
-      logInfo("firebase.bot_user.loaded", {
-        boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
-      });
-    } catch (error) {
-      logWarn("firebase.bot_user.load_failed_using_uid", {
-        boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
-        error:
-          error instanceof Error
-            ? { name: error.name, message: error.message }
-            : String(error),
-      });
-      this.displayName = this.uid;
-    }
-  }
-
   private async initElements(): Promise<void> {
     try {
       logInfo("collab.scene_initialization.started", {
@@ -377,15 +439,28 @@ export class CollabBot {
       for (const element of stored ?? []) {
         this.elements.set(element.id, element);
       }
+      await this.restoreOwnership();
       logInfo("collab.scene_initialization.succeeded", {
         boardId: this.boardId,
         elementCount: this.elements.size,
+        ownedCount: this.ownedIds.size,
       });
     } catch (error) {
       logError("collab.scene_initialization.failed", error, {
         boardId: this.boardId,
       });
       throw error;
+    }
+  }
+
+  private async restoreOwnership(): Promise<void> {
+    const persisted = await loadBotOwnership(this.boardId, this.botId);
+    for (const id of persisted) {
+      const element = this.elements.get(id);
+      if (element && !element.isDeleted) {
+        this.ownedIds.add(id);
+        this.ownedSnapshots.set(id, element);
+      }
     }
   }
 
@@ -450,37 +525,23 @@ export class CollabBot {
     }
   }
 
-  async ensureConnected(): Promise<void> {
-    if (this.accessDenied) {
-      logWarn("collab.connection.previously_denied", {
-        boardId: this.boardId,
-      });
-      throw new BotAccessDeniedError(this.boardId);
-    }
-    if (this.socket?.connected) {
-      logInfo("collab.connection.reused", {
-        boardId: this.boardId,
-        socketId: this.socket.id,
-      });
-      return;
-    }
-    if (this.connecting) {
-      logInfo("collab.connection.awaiting_inflight", {
-        boardId: this.boardId,
-      });
-      return this.connecting;
-    }
-    this.connecting = this.connect().finally(() => {
-      this.connecting = null;
-    });
-    return this.connecting;
+  private saveOwnership(): void {
+    this.persistQueue = this.persistQueue
+      .then(() => saveBotOwnership(this.boardId, this.botId, [...this.ownedIds]))
+      .catch((error) =>
+        logError("collab.commit.save_ownership_failed", error, {
+          boardId: this.boardId,
+          botId: this.botId,
+        }),
+      );
   }
 
   private async connect(): Promise<void> {
     const startedAt = Date.now();
+    const gen = this.connectGen;
     logInfo("collab.connection.started", {
       boardId: this.boardId,
-      subjectRef: opaqueRef(this.uid),
+      subjectRef: opaqueRef(this.ownerUid),
       role: this.role,
       wsServerUrl: safeUrl(config.wsServerUrl),
     });
@@ -489,6 +550,9 @@ export class CollabBot {
       await this.initElements();
     }
     const token = await this.mintIdToken();
+    if (gen !== this.connectGen) {
+      throw new Error("bot role changed during connect");
+    }
 
     await new Promise<void>((resolve, reject) => {
       const socket = io(config.wsServerUrl, {
@@ -608,6 +672,12 @@ export class CollabBot {
         );
       }, 4000);
     });
+
+    if (gen !== this.connectGen) {
+      this.socket?.close();
+      this.socket = null;
+      throw new Error("bot role changed during connect");
+    }
 
     this.lastPointer = this.sceneCentroid();
     await this.emitCursor(this.lastPointer, {});
@@ -1244,6 +1314,7 @@ export class CollabBot {
         totalCount: all.length,
       });
     }
+    this.saveOwnership();
     logInfo("collab.commit.succeeded", {
       boardId: this.boardId,
       changedCount: changed.length,
@@ -1519,12 +1590,28 @@ export class CollabBot {
   private async flushResurrection(
     resurrected: ExcalidrawElement[],
   ): Promise<void> {
+    if (await this.isRevoked()) {
+      logWarn("collab.reconcile.resurrection_skipped_revoked", {
+        boardId: this.boardId,
+        botId: this.botId,
+      });
+      stopBot(this.botId);
+      return;
+    }
     await this.broadcastUpdate(resurrected);
     await persistScene(this.boardId, this.roomKey, [...this.elements.values()]);
     logInfo("collab.reconcile.resurrection_flushed", {
       boardId: this.boardId,
       count: resurrected.length,
     });
+  }
+
+  private async isRevoked(): Promise<boolean> {
+    if (this.botId.startsWith("legacy:")) {
+      return false;
+    }
+    const doc = await getBot(this.botId).catch(() => null);
+    return !doc || doc.disabled === true;
   }
 
   private currentSceneVersion(): number {
@@ -1606,34 +1693,29 @@ export class CollabBot {
 
 const bots = new Map<string, CollabBot>();
 
-const botKey = (token: string, boardId: string): string => `${token}:${boardId}`;
-const tokenPrefix = (token: string): string => `${token}:`;
+const botKey = (botId: string, boardId: string): string => `${botId}::${boardId}`;
+const botPrefix = (botId: string): string => `${botId}::`;
 
-export function getOrCreateBot(
-  token: string,
-  identity: BotIdentity,
-): CollabBot {
-  const key = botKey(token, identity.boardId);
+export function getOrCreateBot(identity: BotIdentity): CollabBot {
+  const key = botKey(identity.botId, identity.boardId);
   const existing = bots.get(key);
-  if (existing && existing.matches(identity)) {
+  if (existing) {
+    existing.applyProfile(identity);
     logInfo("collab.bot.reused", { boardId: identity.boardId });
     return existing;
-  }
-  if (existing) {
-    existing.dispose();
   }
   const bot = new CollabBot(identity);
   bots.set(key, bot);
   logInfo("collab.bot.created", {
     boardId: identity.boardId,
     role: identity.role,
-    subjectRef: opaqueRef(identity.uid),
+    subjectRef: opaqueRef(identity.ownerUid),
   });
   return bot;
 }
 
-export function disposeBotsForToken(token: string): void {
-  const prefix = tokenPrefix(token);
+export function stopBot(botId: string): void {
+  const prefix = botPrefix(botId);
   for (const [key, bot] of bots) {
     if (key.startsWith(prefix)) {
       bot.dispose();
@@ -1641,3 +1723,28 @@ export function disposeBotsForToken(token: string): void {
     }
   }
 }
+
+export function botRuntimeStatus(botId: string): BotRuntimeStatus {
+  const prefix = botPrefix(botId);
+  const boards: BotRuntimeStatus["boards"] = [];
+  for (const [key, bot] of bots) {
+    if (key.startsWith(prefix)) {
+      boards.push(bot.getRuntimeBoard());
+    }
+  }
+  return { online: boards.some((board) => board.connected), boards };
+}
+
+const BOT_IDLE_TTL_MS = 15 * 60 * 1000;
+
+const idleSweeper = setInterval(() => {
+  const now = Date.now();
+  for (const [key, bot] of bots) {
+    if (bot.idleMs(now) >= BOT_IDLE_TTL_MS) {
+      bot.dispose();
+      bots.delete(key);
+      logInfo("collab.bot.reaped_idle", { key });
+    }
+  }
+}, 60 * 1000);
+idleSweeper.unref?.();
