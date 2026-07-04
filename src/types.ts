@@ -65,6 +65,9 @@ export type McpTokenDoc = {
   email: string | null;
   createdAt: number;
   revoked: boolean;
+  botId?: string;
+  name?: string | null;
+  lastUsedAt?: number | null;
   // Legacy single-board tokens still carry these; account-scoped tokens omit them.
   boardId?: string;
   role?: Role;

@@ -1,29 +1,21 @@
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express, {
-  type NextFunction,
-  type Request,
-  type RequestHandler,
-  type Response,
-} from "express";
+import {StreamableHTTPServerTransport} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express, {type NextFunction, type Request, type RequestHandler, type Response,} from "express";
 
-import { config, getMcpUrl } from "./config";
-import { authorize } from "./acl";
-import { listAccessibleBoards } from "./boards";
-import { auth } from "./firebase";
-import {
-  createToken,
-  getToken,
-  listTokens,
-  revokeToken,
-} from "./tokens";
+import {config, getMcpUrl} from "./config";
+import {authorize} from "./acl";
+import {listAccessibleBoards} from "./boards";
+import {auth} from "./firebase";
+import {createToken, getToken, listTokens, revokeToken, touchToken,} from "./tokens";
+import {bindingFor, decideBotBoardAccess, getBot, getOwnedBot} from "./bots";
 import {
   BotAccessDeniedError,
+  type CollabBot,
   disposeBotsForToken,
   getOrCreateBot,
-  type CollabBot,
+  statusForTokens,
 } from "./bot/CollabBot";
-import { buildMcpServer } from "./mcp";
-import { getFile, putFile } from "./files";
+import {buildMcpServer} from "./mcp";
+import {getFile, putFile} from "./files";
 import {
   logError,
   logInfo,
@@ -154,9 +146,27 @@ app.post("/mcp/tokens", express.json(), asyncRoute(async (req, res) => {
     return;
   }
 
+  const body = (req.body ?? {}) as { botId?: unknown; name?: unknown };
+  const botId = typeof body.botId === "string" ? body.botId : undefined;
+  if (!botId) {
+    res.status(400).json({ error: "botId is required" });
+    return;
+  }
+  const bot = await getOwnedBot(botId, user.uid);
+  if (!bot) {
+    res.sendStatus(404);
+    return;
+  }
+  const name =
+    typeof body.name === "string" && body.name.trim()
+      ? body.name.trim()
+      : null;
+
   const { token } = await createToken({
     uid: user.uid,
     email: user.email,
+    botId,
+    name,
   });
 
   const mcpUrl = getMcpUrl(config.port);
@@ -182,12 +192,16 @@ app.get("/mcp/tokens", asyncRoute(async (req, res) => {
   if (!user) {
     return;
   }
-  const tokens = await listTokens({ uid: user.uid });
+  const botId =
+    typeof req.query.botId === "string" ? req.query.botId : undefined;
+  const tokens = await listTokens({ uid: user.uid, botId });
   res.json({
     tokens: tokens.map(({ token, doc }) => ({
       token,
+      name: doc.name ?? null,
       createdAt: doc.createdAt,
       revoked: doc.revoked,
+      lastUsedAt: doc.lastUsedAt ?? null,
     })),
   });
   logInfo("mcp_token.list.succeeded", { count: tokens.length });
@@ -213,6 +227,47 @@ app.delete("/mcp/tokens/:token", asyncRoute(async (req, res) => {
   disposeBotsForToken(req.params.token);
   res.sendStatus(204);
   logInfo("mcp_token.revoke.succeeded");
+}));
+
+app.get("/mcp/bots/status", asyncRoute(async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) {
+    return;
+  }
+  const botId =
+    typeof req.query.botId === "string" ? req.query.botId : undefined;
+  if (!botId) {
+    res.status(400).json({ error: "botId is required" });
+    return;
+  }
+  const bot = await getOwnedBot(botId, user.uid);
+  if (!bot) {
+    res.sendStatus(404);
+    return;
+  }
+  const tokens = (await listTokens({ uid: user.uid, botId })).map(
+    ({ token }) => token,
+  );
+  const boards = statusForTokens(tokens);
+  res.json({ online: boards.some((board) => board.connected), boards });
+}));
+
+app.post("/mcp/bots/:botId/stop", asyncRoute(async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) {
+    return;
+  }
+  const bot = await getOwnedBot(req.params.botId, user.uid);
+  if (!bot) {
+    res.sendStatus(404);
+    return;
+  }
+  const tokens = await listTokens({ uid: user.uid, botId: req.params.botId });
+  for (const { token } of tokens) {
+    disposeBotsForToken(token);
+  }
+  res.sendStatus(204);
+  logInfo("mcp_bot.stop.succeeded", { count: tokens.length });
 }));
 
 const resolveConnectToken = (req: Request): string | undefined => {
@@ -251,19 +306,40 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
   setLogContext({ subjectRef: opaqueRef(account.uid) });
   logInfo("mcp.connect.token_resolved");
 
-  // An account token attaches a bot per board on demand; each board is
-  // authorized (and bot-policy capped) when a tool first targets it.
+  // botId-scoped tokens are capped by the bot's board allow-list; legacy tokens
+  // (no botId) stay account-wide.
+  const botDoc = doc.botId ? await getBot(doc.botId) : null;
+  if (doc.botId && (!botDoc || botDoc.disabled)) {
+    logWarn("mcp.connect.bot_unavailable", {
+      botMissing: !botDoc,
+      disabled: botDoc?.disabled ?? false,
+    });
+    res.status(403).json({ error: "bot is disabled or no longer exists" });
+    return;
+  }
+
+  if (!doc.lastUsedAt || Date.now() - doc.lastUsedAt > 60_000) {
+    void touchToken(connectToken);
+  }
+
   const resolveBot = async (boardId: string): Promise<CollabBot> => {
     setLogContext({ boardId });
+    const binding = doc.botId ? bindingFor(botDoc, boardId) : undefined;
     const access = await authorize(boardId, account, { asBot: true });
-    if (!access.canRead) {
-      logWarn("mcp.board.access_denied", { boardId });
+    const decision = decideBotBoardAccess(!!doc.botId, binding, access);
+    if (!decision.allowed) {
+      logWarn("mcp.board.access_denied", {
+        boardId,
+        inAllowlist: !doc.botId || !!binding,
+        canRead: access.canRead,
+      });
       throw new BotAccessDeniedError(boardId);
     }
     const bot = getOrCreateBot(connectToken, {
       uid: account.uid,
       boardId,
-      role: access.canWrite ? "editor" : "viewer",
+      role: decision.role,
+      botId: doc.botId,
     });
     await bot.ensureConnected();
     return bot;

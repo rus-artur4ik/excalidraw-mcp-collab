@@ -69,6 +69,7 @@ export type BotIdentity = {
   uid: string;
   boardId: string;
   role: Role;
+  botId?: string;
 };
 
 export type ConflictRecord = {
@@ -106,11 +107,13 @@ export class CollabBot {
   private readonly uid: string;
   private readonly boardId: string;
   private readonly role: Role;
+  private readonly botId?: string;
 
   private roomKey = "";
   private idToken = "";
   private idTokenExpiresAt = 0;
   private displayName = "";
+  private lastActiveAt = 0;
 
   private socket: Socket | null = null;
   private accessDenied = false;
@@ -145,6 +148,7 @@ export class CollabBot {
     this.uid = identity.uid;
     this.boardId = identity.boardId;
     this.role = identity.role;
+    this.botId = identity.botId;
   }
 
   matches(identity: BotIdentity): boolean {
@@ -233,92 +237,32 @@ export class CollabBot {
   // The room socket server authenticates with a Firebase ID token. The Admin
   // SDK can only mint a *custom* token for a uid, so we exchange it for an ID
   // token via Identity Toolkit so the room server resolves the bot AS the user
-  // and its own ACL enforces read-only.
-  private async mintIdToken(): Promise<string> {
-    if (this.idToken && Date.now() < this.idTokenExpiresAt) {
-      logInfo("firebase.bot_id_token.cache_hit", {
-        boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
-      });
-      return this.idToken;
-    }
-    let customToken: string;
-    try {
-      logInfo("firebase.custom_token.create_started", {
-        boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
-      });
-      customToken = await auth().createCustomToken(this.uid);
-      logInfo("firebase.custom_token.created", {
-        boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
-      });
-    } catch (error) {
-      logError("firebase.custom_token.create_failed", error, {
-        boardId: this.boardId,
-        subjectRef: opaqueRef(this.uid),
-      });
-      throw error;
-    }
 
-    const exchangeUrl =
-      "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken";
-    let response: Response;
-    try {
-      logInfo("firebase.id_token.exchange_started", {
+  async ensureConnected(): Promise<void> {
+    this.lastActiveAt = Date.now();
+    if (this.accessDenied) {
+      logWarn("collab.connection.previously_denied", {
         boardId: this.boardId,
-        endpoint: exchangeUrl,
       });
-      response = await fetch(`${exchangeUrl}?key=${config.firebaseWebApiKey}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: customToken, returnSecureToken: true }),
-      });
-    } catch (error) {
-      logError("firebase.id_token.exchange_network_failed", error, {
-        boardId: this.boardId,
-        endpoint: exchangeUrl,
-      });
-      throw error;
+      throw new BotAccessDeniedError(this.boardId);
     }
-    if (!response.ok) {
-      const responseText = await response.text().catch(() => "");
-      const error = new Error(
-        `custom token exchange failed: ${response.status} ${response.statusText}`,
-      );
-      logError("firebase.id_token.exchange_rejected", error, {
+    if (this.socket?.connected) {
+      logInfo("collab.connection.reused", {
         boardId: this.boardId,
-        endpoint: exchangeUrl,
-        responseStatus: response.status,
-        responseBody: responseText.slice(0, 1000),
+        socketId: this.socket.id,
       });
-      throw error;
+      return;
     }
-    let data: { idToken?: string };
-    try {
-      data = (await response.json()) as { idToken?: string };
-    } catch (error) {
-      logError("firebase.id_token.exchange_invalid_json", error, {
+    if (this.connecting) {
+      logInfo("collab.connection.awaiting_inflight", {
         boardId: this.boardId,
-        endpoint: exchangeUrl,
       });
-      throw error;
+      return this.connecting;
     }
-    if (!data.idToken) {
-      const error = new Error("custom token exchange returned no idToken");
-      logError("firebase.id_token.exchange_missing_token", error, {
-        boardId: this.boardId,
-        endpoint: exchangeUrl,
-      });
-      throw error;
-    }
-    this.idToken = data.idToken;
-    this.idTokenExpiresAt = Date.now() + ID_TOKEN_TTL_MS;
-    logInfo("firebase.id_token.exchange_succeeded", {
-      boardId: this.boardId,
-      expiresInMs: ID_TOKEN_TTL_MS,
+    this.connecting = this.connect().finally(() => {
+      this.connecting = null;
     });
-    return this.idToken;
+    return this.connecting;
   }
 
   private async loadBoardContext(): Promise<void> {
@@ -450,167 +394,103 @@ export class CollabBot {
     }
   }
 
-  async ensureConnected(): Promise<void> {
-    if (this.accessDenied) {
-      logWarn("collab.connection.previously_denied", {
-        boardId: this.boardId,
-      });
-      throw new BotAccessDeniedError(this.boardId);
-    }
-    if (this.socket?.connected) {
-      logInfo("collab.connection.reused", {
-        boardId: this.boardId,
-        socketId: this.socket.id,
-      });
-      return;
-    }
-    if (this.connecting) {
-      logInfo("collab.connection.awaiting_inflight", {
-        boardId: this.boardId,
-      });
-      return this.connecting;
-    }
-    this.connecting = this.connect().finally(() => {
-      this.connecting = null;
-    });
-    return this.connecting;
+  runtimeStatus(): BotBoardRuntimeStatus {
+    return {
+      boardId: this.boardId,
+      connected: this.socket?.connected === true,
+      lastActiveAt: this.lastActiveAt || null,
+    };
   }
 
-  private async connect(): Promise<void> {
-    const startedAt = Date.now();
-    logInfo("collab.connection.started", {
-      boardId: this.boardId,
-      subjectRef: opaqueRef(this.uid),
-      role: this.role,
-      wsServerUrl: safeUrl(config.wsServerUrl),
-    });
-    if (!this.roomKey) {
-      await this.loadBoardContext();
-      await this.initElements();
+  // and its own ACL enforces read-only.
+  private async mintIdToken(): Promise<string> {
+    if (this.idToken && Date.now() < this.idTokenExpiresAt) {
+      logInfo("firebase.bot_id_token.cache_hit", {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
+      });
+      return this.idToken;
     }
-    const token = await this.mintIdToken();
-
-    await new Promise<void>((resolve, reject) => {
-      const socket = io(config.wsServerUrl, {
-        transports: ["websocket", "polling"],
-        auth: { token, traceId: currentRequestId(), asBot: true },
+    let customToken: string;
+    try {
+      logInfo("firebase.custom_token.create_started", {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
       });
-      this.socket = socket;
-
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let settled = false;
-      const settle = (event: string, action: () => void) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        logInfo("collab.connection.settled", {
-          boardId: this.boardId,
-          event,
-          socketId: socket.id,
-          connected: socket.connected,
-          durationMs: Date.now() - startedAt,
-        });
-        action();
-      };
-      const detach = () => {
-        socket.removeAllListeners();
-        socket.close();
-        if (this.socket === socket) {
-          this.socket = null;
-        }
-      };
-
-      const onError = (error: unknown) => {
-        logError("collab.connection.failed", error, {
-          boardId: this.boardId,
-          socketId: socket.id,
-          connected: socket.connected,
-          durationMs: Date.now() - startedAt,
-          wsServerUrl: safeUrl(config.wsServerUrl),
-        });
-        detach();
-        settle("error", () =>
-          reject(error instanceof Error ? error : new Error(String(error))),
-        );
-      };
-
-      socket.on("connect", () => {
-        logInfo("collab.socket.connected", {
-          boardId: this.boardId,
-          socketId: socket.id,
-          transport: socket.io.engine.transport.name,
-        });
+      customToken = await auth().createCustomToken(this.uid, {
+        bot: true,
+        ...(this.botId ? { botId: this.botId } : {}),
       });
-      socket.on("init-room", () => {
-        logInfo("collab.socket.init_room_received", {
-          boardId: this.boardId,
-          socketId: socket.id,
-        });
-        socket.emit("join-room", this.boardId);
-        logInfo("collab.socket.join_room_sent", {
-          boardId: this.boardId,
-          socketId: socket.id,
-        });
+      logInfo("firebase.custom_token.created", {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
       });
-      socket.on("first-in-room", () => settle("first-in-room", resolve));
-      socket.on("room-user-change", () =>
-        settle("room-user-change", resolve),
+    } catch (error) {
+      logError("firebase.custom_token.create_failed", error, {
+        boardId: this.boardId,
+        subjectRef: opaqueRef(this.uid),
+      });
+      throw error;
+    }
+
+    const exchangeUrl =
+      "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken";
+    let response: Response;
+    try {
+      logInfo("firebase.id_token.exchange_started", {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
+      });
+      response = await fetch(`${exchangeUrl}?key=${config.firebaseWebApiKey}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: customToken, returnSecureToken: true }),
+      });
+    } catch (error) {
+      logError("firebase.id_token.exchange_network_failed", error, {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
+      });
+      throw error;
+    }
+    if (!response.ok) {
+      const responseText = await response.text().catch(() => "");
+      const error = new Error(
+        `custom token exchange failed: ${response.status} ${response.statusText}`,
       );
-      socket.on("new-user", () => settle("new-user", resolve));
-      socket.on("access-denied", (payload: unknown) => {
-        logWarn("collab.socket.access_denied", {
-          boardId: this.boardId,
-          socketId: socket.id,
-          payload,
-        });
-        this.accessDenied = true;
-        detach();
-        settle("access-denied", () =>
-          reject(new BotAccessDeniedError(this.boardId)),
-        );
+      logError("firebase.id_token.exchange_rejected", error, {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
+        responseStatus: response.status,
+        responseBody: responseText.slice(0, 1000),
       });
-      socket.on("client-broadcast", (data: ArrayBuffer, iv: Uint8Array) => {
-        void this.handleClientBroadcast(data, iv);
+      throw error;
+    }
+    let data: { idToken?: string };
+    try {
+      data = (await response.json()) as { idToken?: string };
+    } catch (error) {
+      logError("firebase.id_token.exchange_invalid_json", error, {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
       });
-      socket.on("connect_error", onError);
-      socket.on("disconnect", (reason, description) => {
-        logWarn("collab.socket.disconnected", {
-          boardId: this.boardId,
-          socketId: socket.id,
-          reason,
-          description:
-            description instanceof Error
-              ? description.message
-              : description === undefined
-                ? undefined
-                : String(description),
-          settled,
-        });
-        if (!settled) {
-          onError(new Error(`collab socket disconnected before join: ${reason}`));
-        }
+      throw error;
+    }
+    if (!data.idToken) {
+      const error = new Error("custom token exchange returned no idToken");
+      logError("firebase.id_token.exchange_missing_token", error, {
+        boardId: this.boardId,
+        endpoint: exchangeUrl,
       });
-
-      timer = setTimeout(() => {
-        if (socket.connected) {
-          logWarn("collab.connection.join_ack_timeout_connected", {
-            boardId: this.boardId,
-            socketId: socket.id,
-            durationMs: Date.now() - startedAt,
-          });
-          settle("connected-without-room-ack", resolve);
-          return;
-        }
-        onError(
-          new Error(`collab connection timed out for board ${this.boardId}`),
-        );
-      }, 4000);
+      throw error;
+    }
+    this.idToken = data.idToken;
+    this.idTokenExpiresAt = Date.now() + ID_TOKEN_TTL_MS;
+    logInfo("firebase.id_token.exchange_succeeded", {
+      boardId: this.boardId,
+      expiresInMs: ID_TOKEN_TTL_MS,
     });
-
-    this.lastPointer = this.sceneCentroid();
-    await this.emitCursor(this.lastPointer, {});
+    return this.idToken;
   }
 
   private sceneCentroid(): { x: number; y: number } {
@@ -1594,6 +1474,143 @@ export class CollabBot {
       : { found: false };
   }
 
+  private async connect(): Promise<void> {
+    const startedAt = Date.now();
+    logInfo("collab.connection.started", {
+      boardId: this.boardId,
+      subjectRef: opaqueRef(this.uid),
+      role: this.role,
+      wsServerUrl: safeUrl(config.wsServerUrl),
+    });
+    if (!this.roomKey) {
+      await this.loadBoardContext();
+      await this.initElements();
+    }
+    const token = await this.mintIdToken();
+
+    await new Promise<void>((resolve, reject) => {
+      const socket = io(config.wsServerUrl, {
+        transports: ["websocket", "polling"],
+        auth: { token, traceId: currentRequestId() },
+      });
+      this.socket = socket;
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const settle = (event: string, action: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        logInfo("collab.connection.settled", {
+          boardId: this.boardId,
+          event,
+          socketId: socket.id,
+          connected: socket.connected,
+          durationMs: Date.now() - startedAt,
+        });
+        action();
+      };
+      const detach = () => {
+        socket.removeAllListeners();
+        socket.close();
+        if (this.socket === socket) {
+          this.socket = null;
+        }
+      };
+
+      const onError = (error: unknown) => {
+        logError("collab.connection.failed", error, {
+          boardId: this.boardId,
+          socketId: socket.id,
+          connected: socket.connected,
+          durationMs: Date.now() - startedAt,
+          wsServerUrl: safeUrl(config.wsServerUrl),
+        });
+        detach();
+        settle("error", () =>
+          reject(error instanceof Error ? error : new Error(String(error))),
+        );
+      };
+
+      socket.on("connect", () => {
+        logInfo("collab.socket.connected", {
+          boardId: this.boardId,
+          socketId: socket.id,
+          transport: socket.io.engine.transport.name,
+        });
+      });
+      socket.on("init-room", () => {
+        logInfo("collab.socket.init_room_received", {
+          boardId: this.boardId,
+          socketId: socket.id,
+        });
+        socket.emit("join-room", this.boardId);
+        logInfo("collab.socket.join_room_sent", {
+          boardId: this.boardId,
+          socketId: socket.id,
+        });
+      });
+      socket.on("first-in-room", () => settle("first-in-room", resolve));
+      socket.on("room-user-change", () =>
+        settle("room-user-change", resolve),
+      );
+      socket.on("new-user", () => settle("new-user", resolve));
+      socket.on("access-denied", (payload: unknown) => {
+        logWarn("collab.socket.access_denied", {
+          boardId: this.boardId,
+          socketId: socket.id,
+          payload,
+        });
+        this.accessDenied = true;
+        detach();
+        settle("access-denied", () =>
+          reject(new BotAccessDeniedError(this.boardId)),
+        );
+      });
+      socket.on("client-broadcast", (data: ArrayBuffer, iv: Uint8Array) => {
+        void this.handleClientBroadcast(data, iv);
+      });
+      socket.on("connect_error", onError);
+      socket.on("disconnect", (reason, description) => {
+        logWarn("collab.socket.disconnected", {
+          boardId: this.boardId,
+          socketId: socket.id,
+          reason,
+          description:
+            description instanceof Error
+              ? description.message
+              : description === undefined
+                ? undefined
+                : String(description),
+          settled,
+        });
+        if (!settled) {
+          onError(new Error(`collab socket disconnected before join: ${reason}`));
+        }
+      });
+
+      timer = setTimeout(() => {
+        if (socket.connected) {
+          logWarn("collab.connection.join_ack_timeout_connected", {
+            boardId: this.boardId,
+            socketId: socket.id,
+            durationMs: Date.now() - startedAt,
+          });
+          settle("connected-without-room-ack", resolve);
+          return;
+        }
+        onError(
+          new Error(`collab connection timed out for board ${this.boardId}`),
+        );
+      }, 4000);
+    });
+
+    this.lastPointer = this.sceneCentroid();
+    await this.emitCursor(this.lastPointer, {});
+  }
+
   dispose(): void {
     logInfo("collab.bot.disposed", {
       boardId: this.boardId,
@@ -1640,4 +1657,21 @@ export function disposeBotsForToken(token: string): void {
       bots.delete(key);
     }
   }
+}
+
+export type BotBoardRuntimeStatus = {
+  boardId: string;
+  connected: boolean;
+  lastActiveAt: number | null;
+};
+
+export function statusForTokens(tokens: string[]): BotBoardRuntimeStatus[] {
+  const prefixes = tokens.map(tokenPrefix);
+  const result: BotBoardRuntimeStatus[] = [];
+  for (const [key, bot] of bots) {
+    if (prefixes.some((prefix) => key.startsWith(prefix))) {
+      result.push(bot.runtimeStatus());
+    }
+  }
+  return result;
 }
