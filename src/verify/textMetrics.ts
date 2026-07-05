@@ -1,12 +1,12 @@
 import {
-  ARROW_LABEL_FONT_SIZE_TO_MIN_WIDTH_RATIO,
-  ARROW_LABEL_HEIGHT_PADDING_MULTIPLIER,
-  ARROW_LABEL_WIDTH_FRACTION,
-  BOUND_TEXT_PADDING,
-  DEFAULT_FONT_FAMILY,
-  DEFAULT_FONT_SIZE,
-  lineHeightForFamily,
-  MONOSPACE_FAMILIES,
+    ARROW_LABEL_FONT_SIZE_TO_MIN_WIDTH_RATIO,
+    ARROW_LABEL_HEIGHT_PADDING_MULTIPLIER,
+    ARROW_LABEL_WIDTH_FRACTION,
+    BOUND_TEXT_PADDING,
+    DEFAULT_FONT_FAMILY,
+    DEFAULT_FONT_SIZE,
+    lineHeightForFamily,
+    MONOSPACE_FAMILIES,
 } from "./model";
 import type {ExcalidrawElement} from "../types";
 
@@ -298,6 +298,7 @@ export const layoutBoundText = (
   text: string,
   fontSize: number = DEFAULT_FONT_SIZE,
   fontFamily: number = DEFAULT_FONT_FAMILY,
+  verticalAlign: "top" | "middle" | "bottom" = "middle",
 ): BoundTextLayout => {
   const maxWidth = getBoundTextMaxWidth(container, fontSize);
   const wrapped = wrapText(text, fontSize, fontFamily, maxWidth);
@@ -308,13 +309,20 @@ export const layoutBoundText = (
     container.height || 0,
     height + BOUND_TEXT_PADDING * 2,
   );
+  const top = container.y || 0;
+  const y =
+    verticalAlign === "top"
+      ? top + BOUND_TEXT_PADDING
+      : verticalAlign === "bottom"
+        ? top + containerHeight - height - BOUND_TEXT_PADDING
+        : top + (containerHeight - height) / 2;
   return {
     width,
     height,
     lineHeight: lineHeightForFamily(fontFamily),
     text: wrapped,
     x: (container.x || 0) + ((container.width || 0) - width) / 2,
-    y: (container.y || 0) + (containerHeight - height) / 2,
+    y,
     containerHeight,
   };
 };

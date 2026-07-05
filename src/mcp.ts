@@ -58,43 +58,85 @@ const elementFields = {
     .string()
     .optional()
     .describe("Stroke color for the bound text created via `label`."),
+  frameId: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "Put this element inside an existing frame (the frame's id) as it is created, so it moves and clips with the frame.",
+    ),
+  fromId: z
+    .string()
+    .optional()
+    .describe(
+      "On an arrow: bind its start to this shape id. With `toId`, the arrow is created already bound (FixedPointBinding + back-references) so it stays attached when either shape moves — no follow-up connect call. Batch-friendly.",
+    ),
+  toId: z
+    .string()
+    .optional()
+    .describe("On an arrow: bind its end to this shape id (pairs with `fromId`)."),
+  bindMode: z
+    .enum(["inside", "orbit", "skip"])
+    .optional()
+    .describe("Binding mode for a fromId/toId arrow (default orbit)."),
+  startArrowhead: z.string().nullable().optional(),
+  endArrowhead: z.string().nullable().optional(),
 };
 
-const createShape = {
-  ...boardIdShape,
-  ...elementFields,
+const projectionShape = {
+  fields: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Return only these fields per element (`id` is always included). Trims a huge scene dump to what you need, e.g. ["type","x","y","index","containerId"].',
+    ),
+  limit: z
+    .number()
+    .optional()
+    .describe("Return at most this many elements (paginate with offset)."),
+  offset: z
+    .number()
+    .optional()
+    .describe("Skip this many elements first. Elements are ordered by z-order (bottom→top)."),
 };
 
-const updateShape = {
+const describeSceneShape = {
   ...boardIdShape,
-  id: z.string(),
-  x: z.number().optional(),
-  y: z.number().optional(),
-  width: z.number().optional(),
-  height: z.number().optional(),
-  angle: z.number().optional(),
-  strokeColor: z.string().optional(),
-  backgroundColor: z.string().optional(),
-  fillStyle: z.string().optional(),
-  strokeWidth: z.number().optional(),
-  strokeStyle: z.string().optional(),
-  roughness: z.number().optional(),
-  opacity: z.number().optional(),
-  text: z.string().optional(),
-  fontSize: z.number().optional(),
-  textAlign: z.string().optional(),
+  ...projectionShape,
 };
 
 const queryShape = {
   ...boardIdShape,
+  ...projectionShape,
   type: z.string().optional(),
   ids: z.array(z.string()).optional(),
   groupId: z.string().optional(),
 };
 
-const deleteShape = {
+const zOrderShape = {
   ...boardIdShape,
-  id: z.string(),
+  ids: z
+    .array(z.string())
+    .describe("Element ids to move. A container's bound-text label moves with it."),
+};
+
+const reorderShape = {
+  ...zOrderShape,
+  anchorId: z
+    .string()
+    .describe("Reference element to move the ids next to (must not be one of `ids`)."),
+  position: z
+    .enum(["above", "below"])
+    .optional()
+    .describe("Place the ids just above (default) or just below the anchor in z-order."),
+};
+
+const frameAddChildrenShape = {
+  ...boardIdShape,
+  frameId: z.string(),
+  childIds: z
+    .array(z.string())
+    .describe("Elements to move into the frame; their bound-text labels follow."),
 };
 
 const returnFieldShape = {
@@ -268,16 +310,6 @@ const batchCreateShape = {
   elements: z.array(z.object(elementFields)),
 };
 
-const clearShape = {
-  ...boardIdShape,
-  confirm: z
-    .boolean()
-    .optional()
-    .describe(
-      "Must be true to actually wipe the board. Without it, returns a dry-run count so a shared board is never cleared by accident.",
-    ),
-};
-
 const arrangeShape = {
   ...boardIdShape,
   ids: z.array(z.string()),
@@ -293,6 +325,46 @@ const arrangeShape = {
   axis: z.enum(["horizontal", "vertical"]).optional(),
   originX: z.number().optional(),
   originY: z.number().optional(),
+};
+
+const pickFields = (
+  element: ExcalidrawElement,
+  fields: string[],
+): Record<string, unknown> => {
+  const projected: Record<string, unknown> = { id: element.id };
+  for (const field of fields) {
+    if (field in element) {
+      projected[field] = element[field];
+    }
+  }
+  return projected;
+};
+
+const applyProjection = (
+  elements: ExcalidrawElement[],
+  opts: { fields?: string[]; limit?: number; offset?: number },
+): unknown => {
+  const paginated = opts.limit !== undefined || opts.offset !== undefined;
+  if (!opts.fields && !paginated) {
+    return elements;
+  }
+  const ordered = [...elements].sort((a, b) => {
+    const ai = typeof a.index === "string" ? a.index : "";
+    const bi = typeof b.index === "string" ? b.index : "";
+    return ai < bi ? -1 : ai > bi ? 1 : 0;
+  });
+  const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+  const end =
+    opts.limit !== undefined
+      ? offset + Math.max(0, Math.floor(opts.limit))
+      : undefined;
+  const page = paginated ? ordered.slice(offset, end) : ordered;
+  const projected = opts.fields
+    ? page.map((element) => pickFields(element, opts.fields as string[]))
+    : page;
+  return paginated
+    ? { total: ordered.length, offset, count: projected.length, elements: projected }
+    : projected;
 };
 
 const textResult = (value: unknown) => ({
@@ -401,82 +473,39 @@ export function buildMcpServer(ctx: McpContext): McpServer {
   server.registerTool(
     "describe_scene",
     {
-      description: "Return the current non-deleted elements of a board as JSON.",
-      inputSchema: boardIdShape,
+      description:
+        "Return the current non-deleted elements of a board as JSON. Use `fields` to project only the columns you need and `limit`/`offset` to page — a full dump can be 100k+ characters. Paginated results come back z-ordered (bottom→top) as { total, offset, count, elements }.",
+      inputSchema: describeSceneShape,
     },
     async (args) =>
       runTool("describe_scene", async () => {
         const bot = await ctx.resolveBot(args.boardId);
-        return bot.describeScene();
+        const elements = await bot.describeScene();
+        return applyProjection(elements, args);
       }),
   );
 
   server.registerTool(
     "query_elements",
     {
-      description: "Return elements of a board optionally filtered by type and/or ids.",
+      description:
+        "Return elements of a board optionally filtered by type and/or ids, with the same `fields`/`limit`/`offset` projection as describe_scene.",
       inputSchema: queryShape,
     },
     async (args) =>
       runTool("query_elements", async () => {
-        const { boardId, ...filter } = args as {
+        const { boardId, fields, limit, offset, ...filter } = args as {
           boardId: string;
+          fields?: string[];
+          limit?: number;
+          offset?: number;
           type?: string;
           ids?: string[];
           groupId?: string;
         };
         const bot = await ctx.resolveBot(boardId);
-        return bot.queryElements(filter);
-      }),
-  );
-
-  server.registerTool(
-    "create_element",
-    {
-      description:
-        "Create a new Excalidraw element on a board. The bot keeps ownership of what it creates: if a concurrent human session deletes the new element, the bot re-asserts it automatically — query scene_diff `conflicts` to see any contested ids. Bot write access required.",
-      inputSchema: createShape,
-    },
-    async (args) =>
-      runTool("create_element", async () => {
-        const { boardId, ...attrs } = args as {
-          boardId: string;
-        } & Partial<ExcalidrawElement> & { type: string };
-        const bot = await ctx.resolveBot(boardId);
-        return bot.createElement(attrs);
-      }),
-  );
-
-  server.registerTool(
-    "update_element",
-    {
-      description:
-        "Update properties of an existing element by id (bot write access required).",
-      inputSchema: updateShape,
-    },
-    async (args) =>
-      runTool("update_element", async () => {
-        const { boardId, id, ...patch } = args as {
-          boardId: string;
-          id: string;
-        } & Partial<ExcalidrawElement>;
-        const bot = await ctx.resolveBot(boardId);
-        return bot.updateElement(id, patch);
-      }),
-  );
-
-  server.registerTool(
-    "delete_element",
-    {
-      description: "Delete an element by id (bot write access required).",
-      inputSchema: deleteShape,
-    },
-    async (args) =>
-      runTool("delete_element", async () => {
-        const { boardId, id } = args as { boardId: string; id: string };
-        const bot = await ctx.resolveBot(boardId);
-        await bot.deleteElement(id);
-        return { deleted: id };
+        const elements = await bot.queryElements(filter);
+        return applyProjection(elements, { fields, limit, offset });
       }),
   );
 
@@ -484,7 +513,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "update_elements",
     {
       description:
-        "Update many elements in a single commit. Each item is { id, ...fields }. Missing/already-deleted ids (e.g. an element a human removed concurrently) are skipped and listed in `missing` rather than aborting the batch — the valid patches still commit atomically. Standalone text auto-resizes to its new content unless an explicit width+height is given. Use return:\"ids\" to keep the response small. Bot write access required.",
+        "Update many elements in a single commit. Each item is { id, ...fields }. Patch a container with { id, label:\"...\" } to edit (or add) its bound-text label without knowing the text's id — the label is re-laid out inside the box. An explicit `index` (fractional key) is honored, so this also re-stacks elements. Missing/already-deleted ids are skipped and listed in `missing` rather than aborting the batch — the valid patches still commit atomically. Standalone text auto-resizes to its new content unless an explicit width+height is given. Use return:\"ids\" to keep the response small. Bot write access required.",
       inputSchema: updateElementsShape,
     },
     async (args) =>
@@ -525,20 +554,6 @@ export function buildMcpServer(ctx: McpContext): McpServer {
           [args.x, args.y, args.x + args.width, args.y + args.height],
           { mode: args.mode, type: args.type },
         );
-      }),
-  );
-
-  server.registerTool(
-    "clear_canvas",
-    {
-      description:
-        "Delete all elements on a board. Safe by default: without confirm:true it only reports how many elements would be removed. Prefer delete_elements/delete_region on shared boards. Bot write access required.",
-      inputSchema: clearShape,
-    },
-    async (args) =>
-      runTool("clear_canvas", async () => {
-        const bot = await ctx.resolveBot(args.boardId);
-        return bot.clearCanvas(args.confirm === true);
       }),
   );
 
@@ -702,6 +717,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
         format: result.format,
         transform: result.transform,
         legend: result.legend,
+        legendOrder: result.legendOrder,
         width: result.width,
         height: result.height,
         sceneVersion: result.sceneVersion,
@@ -718,7 +734,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "render_scene",
     {
       description:
-        "Render the whole board to PNG (when the rasterizer is available) or SVG, with Set-of-Mark id labels, an optional grid, a scene→pixel transform and an element legend. Use the legend + transform to map anything you see back to an element id.",
+        "Render the whole board to PNG (when the rasterizer is available) or SVG, with Set-of-Mark id labels, an optional grid, a scene→pixel transform and an element legend. The legend is sorted by z-order (legendOrder: \"z-ascending\", bottom→top) and each entry carries its `z` rank and fractional `index`, so the legend doubles as an occlusion/stacking map. Use the legend + transform to map anything you see back to an element id.",
       inputSchema: renderShape,
     },
     async (args) => renderHandler("render_scene", args, {}),
@@ -773,7 +789,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "batch_create",
     {
       description:
-        "Create multiple elements in a single commit (one broadcast/persist). Supports bound text (containerId / label) and line/arrow points. Returns the created elements (or just ids with return:\"ids\") plus inline lint warnings computed at commit time and any `conflicts`. The bot keeps ownership of the created ids and re-asserts them if a concurrent human session deletes them. Bot write access required.",
+        "Create multiple elements in a single commit (one broadcast/persist). Supports bound text (containerId / label), line/arrow points, `frameId` to drop an element straight into an existing frame, and arrows bound to shapes via `fromId`/`toId` (bound at creation — no per-arrow connect round-trips, and the shapes stay attached when moved). Returns the created elements (or just ids with return:\"ids\") plus inline lint warnings computed at commit time and any `conflicts`. The bot keeps ownership of the created ids and re-asserts them if a concurrent human session deletes them. Bot write access required.",
       inputSchema: batchCreateShape,
     },
     async (args) =>
@@ -832,7 +848,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "create_frame",
     {
       description:
-        "Create a frame (named container region) either with explicit x/y/width/height or sized to fit childIds. Listed children get frameId set so they move with the frame. Bot write access required.",
+        "Create a frame (named container region) either with explicit x/y/width/height or sized to fit childIds. The frame is inserted at the BOTTOM of the z-order so its region never covers existing content, and listed children keep their own stacking (labels stay above their shapes) while getting frameId set so they move with the frame. Use frame_add_children to add more later. Bot write access required.",
       inputSchema: createFrameShape,
     },
     async (args) =>
@@ -850,16 +866,61 @@ export function buildMcpServer(ctx: McpContext): McpServer {
   );
 
   server.registerTool(
-    "undo_last",
+    "bring_to_front",
     {
       description:
-        "Revert the bot's last mutation on a board (session-scoped). Bot write access required.",
-      inputSchema: boardIdShape,
+        "Raise elements to the top of the z-order (re-indexing only — ids, frame membership and bindings are preserved). A container's bound-text label is raised with it so it stays visible. Use to fix a label hidden under its shape's fill without delete-and-recreate. Bot write access required.",
+      inputSchema: zOrderShape,
     },
     async (args) =>
-      runTool("undo_last", async () => {
+      runTool("bring_to_front", async () => {
         const bot = await ctx.resolveBot(args.boardId);
-        return bot.undoLast();
+        return bot.bringToFront(args.ids);
+      }),
+  );
+
+  server.registerTool(
+    "send_to_back",
+    {
+      description:
+        "Lower elements to the bottom of the z-order (re-indexing only — ids, frame membership and bindings are preserved). A container's bound-text label moves with it. Bot write access required.",
+      inputSchema: zOrderShape,
+    },
+    async (args) =>
+      runTool("send_to_back", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.sendToBack(args.ids);
+      }),
+  );
+
+  server.registerTool(
+    "reorder",
+    {
+      description:
+        "Move elements to sit just above (default) or just below an anchor element in the z-order — re-indexing only, so ids/bindings/frame membership are stable. A container's bound-text label travels with it. Bot write access required.",
+      inputSchema: reorderShape,
+    },
+    async (args) =>
+      runTool("reorder", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.reorder(args.ids, {
+          to: args.position ?? "above",
+          anchorId: args.anchorId,
+        });
+      }),
+  );
+
+  server.registerTool(
+    "frame_add_children",
+    {
+      description:
+        "Add existing elements to an existing frame (sets their frameId; bound-text labels follow their containers). Avoids a separate update_elements call and elements 'forgotten' outside the frame. Bot write access required.",
+      inputSchema: frameAddChildrenShape,
+    },
+    async (args) =>
+      runTool("frame_add_children", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.frameAddChildren(args.frameId, args.childIds);
       }),
   );
 

@@ -35,11 +35,9 @@ export type IncomingDecision =
   | { action: "resurrect"; element: ExcalidrawElement }
   | { action: "yield" };
 
-// Decides what to do with one incoming (human-broadcast) element given what the
-// bot owns. The bot only ever accepts strictly-newer versions; the new rule is
-// that an incoming *deletion* of an element the bot created — and did not itself
-// delete — is treated as a concurrent-edit clobber and resisted by re-asserting
-// the bot's last good version, up to a bounded number of times.
+// Strictly-newer incoming versions win. A deletion of a just-created owned
+// element (still `resurrectable`) is resisted as a stale-tombstone clobber from
+// an out-of-sync live session; past the window it is the human's edit and wins.
 export const decideIncoming = (params: {
   incoming: ExcalidrawElement;
   current: ExcalidrawElement | undefined;
@@ -47,6 +45,7 @@ export const decideIncoming = (params: {
   botDeleted: boolean;
   resurrectCount: number;
   maxResurrections: number;
+  resurrectable: boolean;
   snapshot: ExcalidrawElement | undefined;
 }): IncomingDecision => {
   const {
@@ -56,6 +55,7 @@ export const decideIncoming = (params: {
     botDeleted,
     resurrectCount,
     maxResurrections,
+    resurrectable,
     snapshot,
   } = params;
 
@@ -64,7 +64,12 @@ export const decideIncoming = (params: {
   }
 
   if (isOwned && incoming.isDeleted && !botDeleted) {
-    if (resurrectCount < maxResurrections && snapshot && !snapshot.isDeleted) {
+    if (
+      resurrectable &&
+      resurrectCount < maxResurrections &&
+      snapshot &&
+      !snapshot.isDeleted
+    ) {
       return {
         action: "resurrect",
         element: reassertElement(snapshot, incoming.version),

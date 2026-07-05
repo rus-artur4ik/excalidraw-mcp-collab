@@ -50,6 +50,42 @@ describe("overlap + duplicate", () => {
   });
 });
 
+describe("bound text stacking", () => {
+  const container = (index: string) =>
+    el({
+      type: "rectangle",
+      id: "box",
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 100,
+      index,
+      boundElements: [{ id: "label", type: "text" }],
+    });
+  const label = (index: string) =>
+    el({
+      type: "text",
+      id: "label",
+      x: 20,
+      y: 40,
+      width: 100,
+      height: 20,
+      text: "hi",
+      containerId: "box",
+      index,
+    });
+
+  it("flags a bound text stacked below (hidden behind) its container", () => {
+    const { findings } = lintScene([container("a5"), label("a1")]);
+    expect(codes(findings)).toContain("bound_text_below_container");
+  });
+
+  it("does not flag a bound text stacked above its container", () => {
+    const { findings } = lintScene([container("a1"), label("a5")]);
+    expect(codes(findings)).not.toContain("bound_text_below_container");
+  });
+});
+
 describe("text overflow", () => {
   it("flags text that does not fit its container", () => {
     const container = el({ type: "rectangle", id: "c", x: 0, y: 0, width: 40, height: 24 });

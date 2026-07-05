@@ -36,6 +36,17 @@ describe("renderSvg", () => {
     expect(result.svg).toContain("a &lt; b &amp; c");
   });
 
+  it("orders the legend by z-order and exposes each z rank and index", () => {
+    const result = renderSvg([
+      el({ type: "rectangle", id: "top", x: 0, y: 0, width: 50, height: 50, index: "a5" }),
+      el({ type: "rectangle", id: "bottom", x: 60, y: 0, width: 50, height: 50, index: "a1" }),
+    ]);
+    expect(result.legendOrder).toBe("z-ascending");
+    expect(result.legend.map((entry) => entry.id)).toEqual(["bottom", "top"]);
+    expect(result.legend[0]).toMatchObject({ z: 1, index: "a1" });
+    expect(result.legend[1]).toMatchObject({ z: 2, index: "a5" });
+  });
+
   it("can restrict to a subset of ids", () => {
     const result = renderSvg(
       [

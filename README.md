@@ -70,15 +70,19 @@ returns them verbatim.
 
 ### MCP tools
 
-- `describe_scene` — current non-deleted elements (viewer + editor).
-- `query_elements` — filter by `type` / `ids` / `groupId` (viewer + editor).
-- `create_element`, `update_element`, `delete_element` — editor only. A viewer
-  token gets an MCP error `read-only access`.
+- `describe_scene`, `query_elements` — current elements (viewer + editor).
+  `fields` projects the columns you need and `limit`/`offset` page a large scene.
 - `batch_create`, `update_elements`, `delete_elements`, `delete_region` —
-  single-commit batch writes (editor only). `update_elements` skips ids that no
-  longer exist (returning them in `missing`) instead of aborting the batch.
-- `group_elements`, `ungroup_elements`, `create_frame` — grouping/frames.
-- `clear_canvas` — editor only, safe by default (needs `confirm:true`).
+  single-commit batch writes (editor only; a viewer token gets `read-only
+  access`). Batch covers N=1, so there are no singular create/update/delete tools.
+  `batch_create` also binds arrows to shapes inline (`fromId`/`toId`) and drops
+  elements into a frame (`frameId`); `update_elements` edits a container's label
+  (`{ id, label }`) and honors an explicit `index`, and skips ids that no longer
+  exist (returning them in `missing`) instead of aborting the batch.
+- `bring_to_front`, `send_to_back`, `reorder` — z-order by re-indexing only, so
+  ids/bindings/frame membership stay stable and a container's label rides along.
+- `group_elements`, `ungroup_elements`, `create_frame`, `frame_add_children` —
+  grouping/frames. New frames sink to the bottom of the z-order.
 
 See `docs/verification-tools.md` for the read/measure/render/validate tools,
 bound text (`containerId`/`label`), line `points`, and the lint rules.
@@ -89,13 +93,14 @@ Each mutating tool: applies the change (bumps `version`, fresh `versionNonce`,
 in a transaction (so a concurrent human session is never clobbered), and appends
 a history entry attributed `Бот <name>`.
 
-The bot keeps stable ownership of the ids it creates. If a concurrent human
-session deletes one of them (the live session can broadcast a fresh bot element
-back as a tombstone), the bot re-asserts its last good copy at a higher version
-so the element is not silently lost — up to a few times before it yields to a
-persistent deletion. `scene_diff` reports ownership (`byOrigin.bot`, `owned`)
-and any contested ids (`conflicts`); `create_element`/`batch_create` surface the
-same `conflicts`.
+The bot keeps stable ownership of the ids it creates. Only for a short grace
+window after it last wrote an element (`RESURRECTION_WINDOW_MS`) does it resist
+an incoming deletion — that window covers the stale-tombstone race where an
+out-of-sync live session drops a just-created element. Once the window passes,
+a human deleting or editing a bot element is respected and wins immediately, so
+edits made after the bot is done are never rolled back. `scene_diff` reports
+ownership (`byOrigin.bot`, `owned`) and any contested ids (`conflicts`);
+`batch_create` surfaces the same `conflicts`.
 
 ## Setup
 

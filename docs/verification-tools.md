@@ -14,25 +14,24 @@ as pure functions over the in-memory element model; `CollabBot` exposes them and
 | `get_bounds` | read | Rotation-aware bounding box of the whole board or a set of ids. |
 | `element_at` | read | Top-most element under a scene point (z-order aware hit-test). |
 | `scene_diff` | read | Elements changed since a given `sceneVersion`, split by origin (bot vs incoming human edits). |
-| `render_scene` | read | SVG (always) + PNG (when `@resvg/resvg-js` is present) of the board, with Set-of-Mark id labels, an optional grid, a coordinate transform and an element legend. |
+| `render_scene` | read | SVG (always) + PNG (when `@resvg/resvg-js` is present) of the board, with Set-of-Mark id labels, an optional grid, a coordinate transform and an element legend sorted by z-order (`legendOrder: "z-ascending"`; each entry carries its `z` rank and fractional `index`). |
 | `render_region` | read | Same, clipped to a scene rectangle. |
 | `render_element` | read | Same, cropped to one or more elements by `ids` or `groupId` (focus render). |
-| `create_element` | write | Create one element. Text auto-sizes to its content; `containerId`/`label` make bound text; `points` make a real line/arrow. |
-| `update_element` | write | Patch one element; standalone text re-measures when its content/font changes. |
-| `batch_create` | write | Create N elements in a single broadcast/persist/history commit (bound text + points supported). `return:"ids"` keeps the response small. |
-| `update_elements` | write | Patch N elements in a single commit. `return:"ids"` supported. |
-| `delete_elements` | write | Delete N elements by `ids` or by `groupId` in a single commit (bound text cascades with its container). |
+| `batch_create` | write | Create N elements in a single broadcast/persist/history commit. Supports bound text (`containerId`/`label`), line/arrow `points`, `frameId` (drop into a frame) and arrows bound to shapes inline via `fromId`/`toId`. Covers N=1, so there is no singular `create_element`. `return:"ids"` keeps the response small. |
+| `update_elements` | write | Patch N elements in a single commit. Patch a container with `{ id, label }` to edit/add its bound-text label without knowing the text id; an explicit `index` is honored (re-stacks). Covers N=1. `return:"ids"` supported. |
+| `delete_elements` | write | Delete N elements by `ids` or by `groupId` in a single commit (bound text cascades with its container). Covers N=1. |
 | `delete_region` | write | Delete everything inside a scene rectangle (`mode` intersect/contain, optional `type` filter). |
+| `bring_to_front` / `send_to_back` | write | Raise/lower elements in the z-order by re-indexing only (ids, bindings, frame membership preserved; a container's label rides along). |
+| `reorder` | write | Move elements just above/below an `anchorId` in the z-order (re-indexing only). |
 | `group_elements` / `ungroup_elements` | write | Assign / remove a shared `groupId` so a set moves, renders and deletes as one unit. |
-| `create_frame` | write | Create a frame from explicit bounds or sized to fit `childIds` (children get `frameId`). |
-| `connect` | write | Create a properly bound arrow between two shapes (`FixedPointBinding` + back-references). |
+| `create_frame` | write | Create a frame from explicit bounds or sized to fit `childIds`; the frame sinks to the bottom of the z-order so it never covers content, and children keep their stacking. |
+| `frame_add_children` | write | Add existing elements (and their labels) to an existing frame by setting `frameId`. |
+| `connect` | write | Create a properly bound arrow between two shapes (`FixedPointBinding` + back-references). For many arrows, prefer `fromId`/`toId` in `batch_create`. |
 | `arrange` | write | Re-layout a set of elements (grid / row / column / align / distribute). |
-| `clear_canvas` | write | Wipe the board. Safe by default: needs `confirm:true`, otherwise returns a dry-run count. |
-| `undo_last` | write | Revert the bot's last mutation (session-scoped, version-safe). |
 
-`create_element` / `update_element` / `update_elements` / `batch_create` /
-`connect` additionally return inline `warnings` (a focused lint pass on the
-affected element) so the agent gets self-review feedback without a separate call.
+`update_elements` / `batch_create` / `connect` additionally return inline
+`warnings` (a focused lint pass on the affected element) so the agent gets
+self-review feedback without a separate call.
 Inline warnings are computed at commit time: when several writes race in parallel,
 a warning may reflect state a sibling write has not applied yet — re-run
 `validate_scene` for the authoritative picture.
@@ -102,6 +101,7 @@ Each finding: `{ code, severity, elementIds, message, suggestion? }`.
 | `arrow_dangling_binding` | `startBinding`/`endBinding.elementId` not present (or deleted) — dropped on load. |
 | `binding_backref_missing` | arrow bound to S but `S.boundElements` lacks `{id:arrow,type:"arrow"}`, or S lists an arrow that has no matching binding — breaks move-tracking. |
 | `binding_invalid` | binding present but missing `mode` or `fixedPoint` — dropped by `restore.ts`. |
+| `bound_text_below_container` | bound text has `index <= container.index`, so the container fill paints over the label and hides it. Fix with `bring_to_front` on the text. |
 
 ### Visual defects (warning)
 | code | trigger | threshold |
@@ -142,7 +142,8 @@ given severity, and `summaryOnly` returns the counts/graph with an empty
 - `sceneVersion` = sum of element `version`s (`scene.ts:getSceneVersion`); it is
   monotonic because versions only increase, so `scene_diff(since)` thresholds on
   the per-write `sceneVersionAfter` recorded in a capped write-log.
-- `undo_last` restores prior element state with `version = current+1` so the
-  revert propagates through other clients' `reconcileIncoming` (`version >` check).
-- Session-scoped (in-memory): undo stack and write-log live with the bot and are
-  lost on `dispose`.
+- Every mutating tool bumps `version` (`= prior+1`) with a fresh `versionNonce`
+  so the change propagates through other clients' `reconcileIncoming`
+  (`version >` check).
+- Session-scoped (in-memory): the write-log lives with the bot and is lost on
+  `dispose`.

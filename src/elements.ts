@@ -1,8 +1,9 @@
 import {randomBytes, randomUUID} from "crypto";
 
-import {generateKeyBetween} from "fractional-indexing";
+import {generateKeyBetween, generateNKeysBetween} from "fractional-indexing";
 
-import {CONTAINER_TYPES, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE} from "./verify/model";
+import {CONTAINER_TYPES, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, isBindable,} from "./verify/model";
+import {planConnection} from "./verify/bindings";
 import {layoutBoundText, layoutText} from "./verify/textMetrics";
 import type {ExcalidrawElement} from "./types";
 
@@ -12,9 +13,20 @@ export type CreateAttrs = Partial<ExcalidrawElement> & {
   labelColor?: string;
   points?: [number, number][];
   containerId?: string;
+  frameId?: string | null;
+  fromId?: string;
+  toId?: string;
+  bindMode?: "inside" | "orbit" | "skip";
+  startArrowhead?: string | null;
+  endArrowhead?: string | null;
 };
 
 const randomInteger = (): number => randomBytes(4).readUInt32BE(0);
+
+const boundVerticalAlign = (
+  value: unknown,
+): "top" | "middle" | "bottom" =>
+  value === "top" || value === "bottom" ? value : "middle";
 
 const elementDefaults = (): Omit<
   ExcalidrawElement,
@@ -52,9 +64,23 @@ const lastIndex = (elements: readonly ExcalidrawElement[]): string | null => {
   return max;
 };
 
+const firstIndex = (elements: readonly ExcalidrawElement[]): string | null => {
+  let min: string | null = null;
+  for (const element of elements) {
+    if (element.index != null && (min === null || element.index < min)) {
+      min = element.index;
+    }
+  }
+  return min;
+};
+
 export const nextFractionalIndex = (
   elements: readonly ExcalidrawElement[],
 ): string => generateKeyBetween(lastIndex(elements), null);
+
+export const bottomFractionalIndex = (
+  elements: readonly ExcalidrawElement[],
+): string => generateKeyBetween(null, firstIndex(elements));
 
 type Pt = [number, number];
 
@@ -153,7 +179,7 @@ export const applyUpdate = (
   element: ExcalidrawElement,
   patch: Partial<ExcalidrawElement>,
 ): ExcalidrawElement => {
-  const { id, type, version, versionNonce, index, updated, ...mutable } = patch;
+  const { id, type, version, versionNonce, updated, ...mutable } = patch;
   return {
     ...element,
     ...mutable,
@@ -209,7 +235,8 @@ const buildBoundText = (
   const fontFamily =
     typeof attrs.fontFamily === "number" ? attrs.fontFamily : DEFAULT_FONT_FAMILY;
   const raw = String(attrs.text ?? attrs.label ?? "");
-  const layout = layoutBoundText(container, raw, fontSize, fontFamily);
+  const verticalAlign = boundVerticalAlign(attrs.verticalAlign);
+  const layout = layoutBoundText(container, raw, fontSize, fontFamily, verticalAlign);
   const { label, labelColor, ...textAttrs } = attrs;
   const text = buildNewElement(
     {
@@ -227,7 +254,7 @@ const buildBoundText = (
       lineHeight: layout.lineHeight,
       strokeColor: attrs.strokeColor ?? labelColor ?? "#1e1e1e",
       textAlign: attrs.textAlign ?? "center",
-      verticalAlign: attrs.verticalAlign ?? "middle",
+      verticalAlign,
       autoResize: false,
     },
     existing,
@@ -274,7 +301,63 @@ export const planCreations = (
   const find = (id: string): ExcalidrawElement | undefined =>
     working.find((w) => w.id === id);
 
-  for (const raw of items) {
+  const isBindingArrow = (raw: CreateAttrs): boolean =>
+    raw.type === "arrow" &&
+    typeof raw.fromId === "string" &&
+    typeof raw.toId === "string";
+
+  const endpointsPresent = (raw: CreateAttrs): boolean => {
+    const from = raw.fromId ? find(raw.fromId) : undefined;
+    const to = raw.toId ? find(raw.toId) : undefined;
+    return !!from && !from.isDeleted && !!to && !to.isDeleted;
+  };
+
+  const processItem = (raw: CreateAttrs) => {
+    if (isBindingArrow(raw)) {
+      if (raw.fromId === raw.toId) {
+        throw new Error("cannot connect an element to itself");
+      }
+      const from = find(raw.fromId as string);
+      const to = find(raw.toId as string);
+      if (!from || from.isDeleted) {
+        throw new Error(`connect source not found: ${raw.fromId}`);
+      }
+      if (!to || to.isDeleted) {
+        throw new Error(`connect target not found: ${raw.toId}`);
+      }
+      if (!isBindable(from) || !isBindable(to)) {
+        throw new Error("both endpoints must be bindable shapes to connect");
+      }
+      const arrowId = typeof raw.id === "string" ? raw.id : randomUUID();
+      const plan = planConnection(from, to, {
+        arrowId,
+        mode: raw.bindMode,
+        startArrowhead: raw.startArrowhead,
+        endArrowhead: raw.endArrowhead,
+      });
+      const {
+        fromId,
+        toId,
+        bindMode,
+        startArrowhead,
+        endArrowhead,
+        label,
+        labelColor,
+        ...arrowAttrs
+      } = raw;
+      const arrow = buildNewElement(
+        { ...arrowAttrs, ...plan.arrow, id: arrowId },
+        working,
+      );
+      pushCreated(arrow);
+      recordContainerUpdate(
+        applyUpdate(from, { boundElements: plan.fromBoundElements }),
+      );
+      recordContainerUpdate(
+        applyUpdate(to, { boundElements: plan.toBoundElements }),
+      );
+      return;
+    }
     if (raw.type === "text" && typeof raw.containerId === "string") {
       const container = find(raw.containerId);
       if (!container || container.isDeleted) {
@@ -286,23 +369,139 @@ export const planCreations = (
       const bound = buildBoundText(container, raw, working);
       pushCreated(bound.text);
       recordContainerUpdate(bound.container);
-      continue;
+      return;
     }
     if (typeof raw.label === "string" && CONTAINER_TYPES.has(raw.type)) {
-      const { label, labelColor, ...containerAttrs } = raw;
+      const { label, labelColor, verticalAlign, ...containerAttrs } = raw;
       const container = buildNewElement(containerAttrs, working);
       pushCreated(container);
       const bound = buildBoundText(
         container,
-        { type: "text", text: label, labelColor },
+        { type: "text", text: label, labelColor, verticalAlign },
         working,
       );
       recordContainerUpdate(bound.container);
       pushCreated(bound.text);
-      continue;
+      return;
     }
     pushCreated(buildNewElement(raw, working));
+  };
+
+  // Bind arrows whose endpoints are created later in the same batch in a second
+  // pass, so `[arrow, shapeA, shapeB]` ordering binds instead of aborting.
+  const deferredArrows: CreateAttrs[] = [];
+  for (const raw of items) {
+    if (isBindingArrow(raw) && !endpointsPresent(raw)) {
+      deferredArrows.push(raw);
+      continue;
+    }
+    processItem(raw);
+  }
+  for (const raw of deferredArrows) {
+    processItem(raw);
   }
 
   return { created, containerUpdates: [...containerUpdates.values()] };
+};
+
+export type ReorderPlacement =
+  | { to: "front" }
+  | { to: "back" }
+  | { to: "above"; anchorId: string }
+  | { to: "below"; anchorId: string };
+
+const indexKey = (element: ExcalidrawElement): string =>
+  typeof element.index === "string" ? element.index : "";
+
+const byIndexAsc = (a: ExcalidrawElement, b: ExcalidrawElement): number => {
+  const ai = indexKey(a);
+  const bi = indexKey(b);
+  return ai < bi ? -1 : ai > bi ? 1 : 0;
+};
+
+const boundContainerId = (element: ExcalidrawElement): string | undefined => {
+  if (element.type !== "text") {
+    return undefined;
+  }
+  const containerId = element.containerId;
+  return typeof containerId === "string" ? containerId : undefined;
+};
+
+export const planReorder = (
+  elements: readonly ExcalidrawElement[],
+  ids: string[],
+  placement: ReorderPlacement,
+): ExcalidrawElement[] => {
+  const byId = new Map(elements.map((element) => [element.id, element] as const));
+  const moved = ids
+    .map((id) => byId.get(id))
+    .filter((element): element is ExcalidrawElement => !!element && !element.isDeleted);
+  if (!moved.length) {
+    return [];
+  }
+  const movedIds = new Set(moved.map((element) => element.id));
+  for (const element of elements) {
+    if (element.isDeleted) {
+      continue;
+    }
+    const containerId = boundContainerId(element);
+    if (containerId && movedIds.has(containerId) && !movedIds.has(element.id)) {
+      movedIds.add(element.id);
+      moved.push(element);
+    }
+  }
+
+  const textsByContainer = new Map<string, ExcalidrawElement[]>();
+  const movedBoundText = new Set<string>();
+  for (const element of moved) {
+    const containerId = boundContainerId(element);
+    if (containerId && movedIds.has(containerId)) {
+      movedBoundText.add(element.id);
+      const list = textsByContainer.get(containerId) ?? [];
+      list.push(element);
+      textsByContainer.set(containerId, list);
+    }
+  }
+  const sequence: ExcalidrawElement[] = [];
+  for (const element of [...moved].sort(byIndexAsc)) {
+    if (movedBoundText.has(element.id)) {
+      continue;
+    }
+    sequence.push(element);
+    const texts = textsByContainer.get(element.id);
+    if (texts) {
+      for (const text of [...texts].sort(byIndexAsc)) {
+        sequence.push(text);
+      }
+    }
+  }
+
+  const rest = elements
+    .filter((element) => !movedIds.has(element.id) && typeof element.index === "string")
+    .sort(byIndexAsc);
+  let lower: string | null = null;
+  let upper: string | null = null;
+  if (placement.to === "front") {
+    lower = rest.length ? indexKey(rest[rest.length - 1]) : null;
+  } else if (placement.to === "back") {
+    upper = rest.length ? indexKey(rest[0]) : null;
+  } else {
+    if (movedIds.has(placement.anchorId)) {
+      throw new Error("anchor cannot be one of the reordered elements");
+    }
+    const anchorPos = rest.findIndex((element) => element.id === placement.anchorId);
+    if (anchorPos < 0) {
+      throw new Error(`anchor not found: ${placement.anchorId}`);
+    }
+    if (placement.to === "above") {
+      lower = indexKey(rest[anchorPos]);
+      upper = anchorPos + 1 < rest.length ? indexKey(rest[anchorPos + 1]) : null;
+    } else {
+      upper = indexKey(rest[anchorPos]);
+      lower = anchorPos > 0 ? indexKey(rest[anchorPos - 1]) : null;
+    }
+  }
+
+  const keys = generateNKeysBetween(lower, upper, sequence.length);
+  return sequence.map((element, i) => applyUpdate(element, { index: keys[i] }));
 };

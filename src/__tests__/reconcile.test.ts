@@ -35,7 +35,12 @@ describe("mergeByVersion", () => {
 });
 
 describe("decideIncoming", () => {
-  const base = { botDeleted: false, resurrectCount: 0, maxResurrections: 3 };
+  const base = {
+    botDeleted: false,
+    resurrectCount: 0,
+    maxResurrections: 3,
+    resurrectable: true,
+  };
 
   it("ignores an incoming element that is not strictly newer", () => {
     const current = el({ type: "rectangle", id: "a", version: 5 });
@@ -70,6 +75,22 @@ describe("decideIncoming", () => {
       expect(decision.element.isDeleted).toBe(false);
       expect(decision.element.version).toBe(5);
     }
+  });
+
+  it("yields to a deletion once the grace window has passed (human edit wins)", () => {
+    const snapshot = el({ type: "rectangle", id: "a", version: 1 });
+    const incoming = el({ type: "rectangle", id: "a", version: 4, isDeleted: true });
+
+    expect(
+      decideIncoming({
+        ...base,
+        incoming,
+        current: snapshot,
+        isOwned: true,
+        snapshot,
+        resurrectable: false,
+      }).action,
+    ).toBe("yield");
   });
 
   it("yields once the resurrection budget is spent", () => {

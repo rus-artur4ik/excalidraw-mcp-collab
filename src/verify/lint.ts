@@ -1,28 +1,28 @@
 import type {ExcalidrawElement} from "../types";
 import {
-  ARROWHEADS,
-  asLinear,
-  asText,
-  BOUND_TEXT_PADDING,
-  type Bounds,
-  FILL_STYLES,
-  FONT_LINE_HEIGHTS,
-  isBindable,
-  isLinear,
-  isTransparent,
-  MAX_BINDING_DISTANCE,
-  type Point,
-  ROUGHNESS_VALUES,
-  STROKE_STYLES,
+    ARROWHEADS,
+    asLinear,
+    asText,
+    BOUND_TEXT_PADDING,
+    type Bounds,
+    FILL_STYLES,
+    FONT_LINE_HEIGHTS,
+    isBindable,
+    isLinear,
+    isTransparent,
+    MAX_BINDING_DISTANCE,
+    type Point,
+    ROUGHNESS_VALUES,
+    STROKE_STYLES,
 } from "./model";
 import {
-  boundsArea,
-  boundsContain,
-  distanceToElement,
-  getCommonBounds,
-  getElementBounds,
-  intersectionArea,
-  pointInElement,
+    boundsArea,
+    boundsContain,
+    distanceToElement,
+    getCommonBounds,
+    getElementBounds,
+    intersectionArea,
+    pointInElement,
 } from "./geometry";
 import {bindingGap} from "./bindings";
 import {contrastRatio, parseColor} from "./colors";
@@ -198,6 +198,39 @@ const overflowChecks = (
   return [];
 };
 
+const stackingChecks = (
+  element: ExcalidrawElement,
+  byId: Map<string, ExcalidrawElement>,
+): LintFinding[] => {
+  if (element.type !== "text") {
+    return [];
+  }
+  const containerId = asText(element).containerId;
+  if (typeof containerId !== "string") {
+    return [];
+  }
+  const container = byId.get(containerId);
+  if (!container) {
+    return [];
+  }
+  if (
+    typeof element.index === "string" &&
+    typeof container.index === "string" &&
+    element.index <= container.index
+  ) {
+    return [
+      {
+        code: "bound_text_below_container",
+        severity: "error",
+        elementIds: [element.id, container.id],
+        message: `Bound text is stacked below its ${container.type} container, so the fill hides the label. Raise the text above the container in z-order (bring_to_front the text).`,
+        suggestion: { action: "bring_to_front", ids: [element.id] },
+      },
+    ];
+  }
+  return [];
+};
+
 const structuralChecks = (
   element: ExcalidrawElement,
   byId: Map<string, ExcalidrawElement>,
@@ -308,6 +341,7 @@ const structuralChecks = (
   }
 
   findings.push(...overflowChecks(element, byId));
+  findings.push(...stackingChecks(element, byId));
   return findings;
 };
 

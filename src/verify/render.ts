@@ -192,6 +192,8 @@ export type LegendEntry = {
   label: string;
   id: string;
   type: string;
+  z: number;
+  index: string | null;
   bbox: [number, number, number, number];
   textPreview?: string;
 };
@@ -211,6 +213,7 @@ export type RenderResult = {
   svg: string;
   transform: Transform;
   legend: LegendEntry[];
+  legendOrder: "z-ascending";
   width: number;
   height: number;
 };
@@ -288,6 +291,8 @@ export const renderSvg = (
       label,
       id: element.id,
       type: element.type,
+      z: i + 1,
+      index: typeof element.index === "string" ? element.index : null,
       bbox: [
         Math.round(topLeft[0]),
         Math.round(topLeft[1]),
@@ -319,6 +324,7 @@ export const renderSvg = (
     svg,
     transform,
     legend,
+    legendOrder: "z-ascending",
     width: transform.pixelWidth,
     height: transform.pixelHeight,
   };

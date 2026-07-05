@@ -73,4 +73,18 @@ describe("layoutBoundText", () => {
     const layout = layoutBoundText(container, "wraps onto several lines here", 20, 5);
     expect(layout.containerHeight).toBeGreaterThan(10);
   });
+
+  it("pins the text to the top when verticalAlign is top", () => {
+    const container = el({ type: "rectangle", x: 0, y: 0, width: 200, height: 100 });
+    const middle = layoutBoundText(container, "hi", 20, 5);
+    const top = layoutBoundText(container, "hi", 20, 5, "top");
+    expect(top.y).toBe(5);
+    expect(top.y).toBeLessThan(middle.y);
+  });
+
+  it("pins the text to the bottom when verticalAlign is bottom", () => {
+    const container = el({ type: "rectangle", x: 0, y: 0, width: 200, height: 100 });
+    const bottom = layoutBoundText(container, "hi", 20, 5, "bottom");
+    expect(bottom.y).toBeCloseTo(100 - bottom.height - 5, 5);
+  });
 });

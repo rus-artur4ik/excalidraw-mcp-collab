@@ -6,19 +6,30 @@ import {config} from "../config";
 import {auth, db} from "../firebase";
 import {decryptJSON, encryptJSON} from "../encryption";
 import {appendSceneHistory, getSceneVersion, loadScene, persistScene,} from "../scene";
-import {applyUpdate, buildNewElement, type CreateAttrs, markDeleted, planCreations,} from "../elements";
+import {
+  applyUpdate,
+  bottomFractionalIndex,
+  buildNewElement,
+  type CreateAttrs,
+  markDeleted,
+  planCreations,
+  planReorder,
+  type ReorderPlacement,
+} from "../elements";
 import {type ConflictKind, decideIncoming} from "../reconcile";
 import {
   type ArrangeOptions,
   arrangePositions,
   asText,
   type Bounds,
+  CONTAINER_TYPES,
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE,
   elementAtPoint,
   getCommonBounds,
   getElementBounds,
   isBindable,
+  layoutBoundText,
   layoutText,
   lintElement,
   type LintFinding,
@@ -123,8 +134,10 @@ export class CollabBot {
   private lastPointer = { x: 0, y: 0 };
 
   private static readonly MAX_WRITE_LOG = 1000;
-  private static readonly MAX_UNDO = 50;
   private static readonly MAX_RESURRECTIONS = 3;
+  // Re-assertion only defends a freshly bot-written element for this long. After
+  // it, an incoming deletion/overwrite is the human's deliberate edit and wins.
+  private static readonly RESURRECTION_WINDOW_MS = 12_000;
   private writeLog: Array<{
     id: string;
     origin: "bot" | "incoming";
@@ -132,13 +145,13 @@ export class CollabBot {
     updated: number;
   }> = [];
   private writeLogEvicted = false;
-  private undoStack: Array<Array<{ id: string; prior: ExcalidrawElement | null }>> = [];
-  private undoing = false;
 
   // Sticky ownership of bot-created ids (survives human echoes): snapshots feed
-  // re-assertion, botDeletedIds stops the bot resisting its own deletions.
+  // re-assertion, botDeletedIds stops the bot resisting its own deletions,
+  // ownedAssertedAt bounds re-assertion to a grace window after the last write.
   private ownedIds = new Set<string>();
   private ownedSnapshots = new Map<string, ExcalidrawElement>();
+  private ownedAssertedAt = new Map<string, number>();
   private botDeletedIds = new Set<string>();
   private resurrections = new Map<string, number>();
   private conflicts = new Map<string, ConflictRecord>();
@@ -333,46 +346,6 @@ export class CollabBot {
     }
   }
 
-  async createElement(attrs: CreateAttrs): Promise<ElementWriteResult> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const { created, containerUpdates } = planCreations(
-      [attrs],
-      [...this.elements.values()],
-    );
-    await this.commitCreations(created, containerUpdates, { select: true });
-    const live = this.liveElements();
-    const primary = created[0];
-    return {
-      element: primary,
-      sceneVersion: this.currentSceneVersion(),
-      readback: this.readback(primary.id),
-      warnings: created.flatMap((element) => lintElement(element, live)),
-      owned: this.ownedIds.has(primary.id),
-      conflicts: this.conflictsFor(created.map((element) => element.id)),
-      ...(created.length > 1 ? { related: created.slice(1) } : {}),
-    };
-  }
-
-  async updateElement(
-    id: string,
-    patch: Partial<ExcalidrawElement>,
-  ): Promise<ElementWriteResult> {
-    const { updated, missing } = await this.updateElements([{ id, ...patch }]);
-    if (missing.includes(id)) {
-      throw new Error(`element not found: ${id}`);
-    }
-    const element = (updated as ExcalidrawElement[])[0];
-    return {
-      element,
-      sceneVersion: this.currentSceneVersion(),
-      readback: this.readback(id),
-      warnings: lintElement(element, this.liveElements()),
-      owned: this.ownedIds.has(id),
-      conflicts: this.conflictsFor([id]),
-    };
-  }
-
   private async handleClientBroadcast(
     encryptedData: ArrayBuffer | Uint8Array,
     iv: Uint8Array,
@@ -549,34 +522,38 @@ export class CollabBot {
   }> {
     this.requireEditor();
     await this.ensureConnected();
-    // Compute every patch before mutating so a missing id can't leave the batch
-    // half-applied; missing ids are reported, the valid ones still commit.
-    const staged: Array<{
-      id: string;
-      prior: ExcalidrawElement;
-      next: ExcalidrawElement;
-    }> = [];
+    const { updates, creations } = this.splitLabelPatches(patches);
+
+    const finalById = new Map<string, ExcalidrawElement>();
+    // Apply plain patches first so a container resized in the same call is at its
+    // final size before a new bound label is laid out inside it.
     const missing: string[] = [];
-    for (const { id, ...patch } of patches) {
+    for (const { id, ...patch } of updates) {
       const current = this.elements.get(id);
       if (!current || current.isDeleted) {
         missing.push(id);
         continue;
       }
-      staged.push({
-        id,
-        prior: current,
-        next: applyUpdate(current, this.withTextSizing(current, patch)),
-      });
+      const next = applyUpdate(current, this.withTextSizing(current, patch));
+      this.elements.set(id, next);
+      finalById.set(id, next);
     }
-    const changed = staged.map((entry) => entry.next);
-    if (changed.length) {
-      for (const entry of staged) {
-        this.elements.set(entry.id, entry.next);
+
+    if (creations.length) {
+      const plan = planCreations(creations, [...this.elements.values()]);
+      for (const container of plan.containerUpdates) {
+        this.elements.set(container.id, container);
+        finalById.set(container.id, container);
       }
-      this.pushUndo(
-        staged.map((entry) => ({ id: entry.id, prior: entry.prior })),
-      );
+      for (const element of plan.created) {
+        this.elements.set(element.id, element);
+        finalById.set(element.id, element);
+      }
+      this.claimOwnership(plan.created);
+    }
+
+    const changed = [...finalById.values()];
+    if (changed.length) {
       await this.commit(changed, { targets: changed, select: true });
       this.recordWrites(changed, "bot");
     }
@@ -586,6 +563,87 @@ export class CollabBot {
       missing,
       sceneVersion: this.currentSceneVersion(),
       warnings: changed.flatMap((element) => lintElement(element, live)),
+    };
+  }
+
+  async createFrame(opts: {
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+    name?: string;
+    childIds?: string[];
+  }): Promise<{ frame: ExcalidrawElement; children: string[]; sceneVersion: number }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const children = opts.childIds
+      ? this.resolveTargets({ ids: opts.childIds })
+      : [];
+    let bounds: Bounds;
+    if (
+      typeof opts.x === "number" &&
+      typeof opts.y === "number" &&
+      typeof opts.width === "number" &&
+      typeof opts.height === "number"
+    ) {
+      bounds = [opts.x, opts.y, opts.x + opts.width, opts.y + opts.height];
+    } else if (children.length) {
+      const [x1, y1, x2, y2] = getCommonBounds(children);
+      const pad = 24;
+      bounds = [x1 - pad, y1 - pad, x2 + pad, y2 + pad];
+    } else {
+      throw new Error("createFrame needs explicit x/y/width/height or childIds");
+    }
+    const allElements = [...this.elements.values()];
+    const frame: ExcalidrawElement = {
+      ...buildNewElement(
+        {
+          type: "frame",
+          x: bounds[0],
+          y: bounds[1],
+          width: bounds[2] - bounds[0],
+          height: bounds[3] - bounds[1],
+          name: opts.name ?? null,
+          backgroundColor: "transparent",
+        },
+        allElements,
+      ),
+      index: bottomFractionalIndex(allElements),
+    };
+    const changed: ExcalidrawElement[] = [frame];
+    for (const child of children) {
+      const updated = applyUpdate(child, { frameId: frame.id });
+      this.elements.set(child.id, updated);
+      changed.push(updated);
+    }
+    this.elements.set(frame.id, frame);
+    this.claimOwnership([frame]);
+    await this.commit(changed, { targets: [frame], select: true });
+    this.recordWrites(changed, "bot");
+    return {
+      frame,
+      children: children.map((child) => child.id),
+      sceneVersion: this.currentSceneVersion(),
+    };
+  }
+
+  async reorder(
+    ids: string[],
+    placement: ReorderPlacement,
+  ): Promise<{ reordered: string[]; sceneVersion: number }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const changed = planReorder([...this.elements.values()], ids, placement);
+    if (changed.length) {
+      for (const element of changed) {
+        this.elements.set(element.id, element);
+      }
+      await this.commit(changed, { targets: changed, select: true });
+      this.recordWrites(changed, "bot");
+    }
+    return {
+      reordered: changed.map((element) => element.id),
+      sceneVersion: this.currentSceneVersion(),
     };
   }
 
@@ -694,111 +752,112 @@ export class CollabBot {
     };
   }
 
-  async deleteElement(
-    id: string,
-  ): Promise<{ deleted: string; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const current = this.elements.get(id);
-    if (!current || current.isDeleted) {
-      throw new Error(`element not found: ${id}`);
-    }
-    this.pushUndo([{ id, prior: current }]);
-    const deleted = markDeleted(current);
-    this.elements.set(id, deleted);
-    await this.showActivity([current], false);
-    await this.commit([deleted]);
-    this.recordWrites([deleted], "bot");
-    return { deleted: id, sceneVersion: this.currentSceneVersion() };
+  async bringToFront(
+    ids: string[],
+  ): Promise<{ reordered: string[]; sceneVersion: number }> {
+    return this.reorder(ids, { to: "front" });
   }
 
-  async createFrame(opts: {
-    x?: number;
-    y?: number;
-    width?: number;
-    height?: number;
-    name?: string;
-    childIds?: string[];
-  }): Promise<{ frame: ExcalidrawElement; children: string[]; sceneVersion: number }> {
+  async sendToBack(
+    ids: string[],
+  ): Promise<{ reordered: string[]; sceneVersion: number }> {
+    return this.reorder(ids, { to: "back" });
+  }
+
+  async frameAddChildren(
+    frameId: string,
+    childIds: string[],
+  ): Promise<{ frame: string; children: string[]; sceneVersion: number }> {
     this.requireEditor();
     await this.ensureConnected();
-    const children = opts.childIds
-      ? this.resolveTargets({ ids: opts.childIds })
-      : [];
-    let bounds: Bounds;
-    if (
-      typeof opts.x === "number" &&
-      typeof opts.y === "number" &&
-      typeof opts.width === "number" &&
-      typeof opts.height === "number"
-    ) {
-      bounds = [opts.x, opts.y, opts.x + opts.width, opts.y + opts.height];
-    } else if (children.length) {
-      const [x1, y1, x2, y2] = getCommonBounds(children);
-      const pad = 24;
-      bounds = [x1 - pad, y1 - pad, x2 + pad, y2 + pad];
-    } else {
-      throw new Error("createFrame needs explicit x/y/width/height or childIds");
+    const frameElement = this.elements.get(frameId);
+    if (!frameElement || frameElement.isDeleted || frameElement.type !== "frame") {
+      throw new Error(`frame not found: ${frameId}`);
     }
-    const frame = buildNewElement(
-      {
-        type: "frame",
-        x: bounds[0],
-        y: bounds[1],
-        width: bounds[2] - bounds[0],
-        height: bounds[3] - bounds[1],
-        name: opts.name ?? null,
-        backgroundColor: "transparent",
-      },
-      [...this.elements.values()],
-    );
-    const frameUndo: Array<{ id: string; prior: ExcalidrawElement | null }> = [
-      { id: frame.id, prior: null },
-    ];
-    const changed: ExcalidrawElement[] = [frame];
-    for (const child of children) {
-      frameUndo.push({ id: child.id, prior: child });
-      const updated = applyUpdate(child, { frameId: frame.id });
-      this.elements.set(child.id, updated);
+    const ids = new Set(this.resolveTargets({ ids: childIds }).map((t) => t.id));
+    for (const element of this.liveElements()) {
+      const containerId = asText(element).containerId;
+      if (typeof containerId === "string" && ids.has(containerId)) {
+        ids.add(element.id);
+      }
+    }
+    const changed: ExcalidrawElement[] = [];
+    for (const id of ids) {
+      const current = this.elements.get(id);
+      if (!current || current.isDeleted) {
+        continue;
+      }
+      const updated = applyUpdate(current, { frameId });
+      this.elements.set(id, updated);
       changed.push(updated);
     }
-    this.elements.set(frame.id, frame);
-    this.claimOwnership([frame]);
-    this.pushUndo(frameUndo);
-    await this.commit(changed, { targets: [frame], select: true });
-    this.recordWrites(changed, "bot");
+    if (changed.length) {
+      await this.commit(changed, { targets: changed, select: true });
+      this.recordWrites(changed, "bot");
+    }
     return {
-      frame,
-      children: children.map((child) => child.id),
+      frame: frameId,
+      children: changed.map((element) => element.id),
       sceneVersion: this.currentSceneVersion(),
     };
   }
 
-  async clearCanvas(
-    confirm: boolean,
-  ): Promise<{ deletedCount: number; requiresConfirm: boolean; wouldDelete?: number }> {
-    this.requireEditor();
+  async render(
+    options: RenderOptions & { format?: "png" | "svg"; groupId?: string },
+  ): Promise<{
+    format: "png" | "svg";
+    png?: string;
+    svg?: string;
+    transform: ReturnType<typeof renderSvg>["transform"];
+    legend: ReturnType<typeof renderSvg>["legend"];
+    legendOrder: ReturnType<typeof renderSvg>["legendOrder"];
+    width: number;
+    height: number;
+    sceneVersion: number;
+  }> {
     await this.ensureConnected();
-    const live = this.liveElements();
-    if (!confirm) {
-      return { deletedCount: 0, requiresConfirm: true, wouldDelete: live.length };
-    }
-    const changed: ExcalidrawElement[] = [];
-    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
-    for (const element of this.elements.values()) {
-      if (!element.isDeleted) {
-        frame.push({ id: element.id, prior: element });
-        const deleted = markDeleted(element);
-        this.elements.set(deleted.id, deleted);
-        changed.push(deleted);
+    const ids = options.groupId
+      ? this.resolveTargets({ groupId: options.groupId }).map((element) => element.id)
+      : options.ids;
+    const rendered = renderSvg([...this.elements.values()], { ...options, ids });
+    const png =
+      options.format === "svg" ? null : svgToPngBase64(rendered.svg);
+    return {
+      format: png ? "png" : "svg",
+      ...(png ? { png } : { svg: rendered.svg }),
+      transform: rendered.transform,
+      legend: rendered.legend,
+      legendOrder: rendered.legendOrder,
+      width: rendered.width,
+      height: rendered.height,
+      sceneVersion: this.currentSceneVersion(),
+    };
+  }
+
+  private boundTextOf(
+    container: ExcalidrawElement,
+  ): ExcalidrawElement | undefined {
+    const refs = Array.isArray(container.boundElements)
+      ? container.boundElements
+      : [];
+    for (const ref of refs) {
+      if (ref.type === "text") {
+        const text = this.elements.get(ref.id);
+        if (text && !text.isDeleted) {
+          return text;
+        }
       }
     }
-    if (changed.length) {
-      this.pushUndo(frame);
-      await this.commit(changed);
-      this.recordWrites(changed, "bot");
+    for (const element of this.elements.values()) {
+      if (
+        !element.isDeleted &&
+        element.type === "text" &&
+        asText(element).containerId === container.id
+      ) {
+        return element;
+      }
     }
-    return { deletedCount: changed.length, requiresConfirm: false };
+    return undefined;
   }
 
   async queryElements(filter?: {
@@ -828,34 +887,120 @@ export class CollabBot {
     return { ...result, sceneVersion: this.currentSceneVersion() };
   }
 
-  async render(
-    options: RenderOptions & { format?: "png" | "svg"; groupId?: string },
-  ): Promise<{
-    format: "png" | "svg";
-    png?: string;
-    svg?: string;
-    transform: ReturnType<typeof renderSvg>["transform"];
-    legend: ReturnType<typeof renderSvg>["legend"];
-    width: number;
-    height: number;
-    sceneVersion: number;
-  }> {
-    await this.ensureConnected();
-    const ids = options.groupId
-      ? this.resolveTargets({ groupId: options.groupId }).map((element) => element.id)
-      : options.ids;
-    const rendered = renderSvg([...this.elements.values()], { ...options, ids });
-    const png =
-      options.format === "svg" ? null : svgToPngBase64(rendered.svg);
-    return {
-      format: png ? "png" : "svg",
-      ...(png ? { png } : { svg: rendered.svg }),
-      transform: rendered.transform,
-      legend: rendered.legend,
-      width: rendered.width,
-      height: rendered.height,
-      sceneVersion: this.currentSceneVersion(),
-    };
+  private splitLabelPatches(
+    patches: Array<{ id: string } & Partial<ExcalidrawElement>>,
+  ): {
+    updates: Array<{ id: string } & Partial<ExcalidrawElement>>;
+    creations: CreateAttrs[];
+  } {
+    const updates: Array<{ id: string } & Partial<ExcalidrawElement>> = [];
+    const creations: CreateAttrs[] = [];
+    const textStyleKeys = new Set([
+      "fontSize",
+      "fontFamily",
+      "textAlign",
+      "verticalAlign",
+    ]);
+    for (const patch of patches) {
+      const label = (patch as { label?: unknown }).label;
+      if (typeof label !== "string") {
+        updates.push(patch);
+        continue;
+      }
+      const { label: _label, labelColor, ...rest } = patch as {
+        id: string;
+        label?: string;
+        labelColor?: string;
+      } & Partial<ExcalidrawElement>;
+      const container = this.elements.get(patch.id);
+      if (!container || container.isDeleted || !CONTAINER_TYPES.has(container.type)) {
+        // Not a text container: a label has nowhere to go. Forward the rest so
+        // the real fields still apply, but drop the stray `label`/`labelColor`.
+        if (Object.keys(rest).some((key) => key !== "id")) {
+          updates.push({ ...rest, id: patch.id });
+        }
+        continue;
+      }
+      // Text styling rides with the label; box geometry/style stays on the container.
+      const textStyle: Partial<ExcalidrawElement> = {};
+      const containerRest: { id: string } & Partial<ExcalidrawElement> = {
+        ...rest,
+        id: patch.id,
+      };
+      for (const key of textStyleKeys) {
+        if (key in containerRest) {
+          (textStyle as Record<string, unknown>)[key] = (
+            containerRest as Record<string, unknown>
+          )[key];
+          delete (containerRest as Record<string, unknown>)[key];
+        }
+      }
+      const existing = this.boundTextOf(container);
+      const view = existing ? asText(existing) : undefined;
+      const fontSize =
+        typeof textStyle.fontSize === "number"
+          ? textStyle.fontSize
+          : typeof view?.fontSize === "number"
+            ? view.fontSize
+            : DEFAULT_FONT_SIZE;
+      const fontFamily =
+        typeof textStyle.fontFamily === "number"
+          ? textStyle.fontFamily
+          : typeof view?.fontFamily === "number"
+            ? view.fontFamily
+            : DEFAULT_FONT_FAMILY;
+      const rawAlign = textStyle.verticalAlign ?? view?.verticalAlign;
+      const verticalAlign =
+        rawAlign === "top" || rawAlign === "bottom" ? rawAlign : "middle";
+      const strokeColor =
+        typeof labelColor === "string" ? { strokeColor: labelColor } : {};
+
+      if (existing) {
+        // Lay the label out against the container's *final* geometry so a
+        // combined label + resize edit does not leave it mis-wrapped/off-center.
+        const laidContainer = { ...container, ...containerRest } as ExcalidrawElement;
+        const layout = layoutBoundText(
+          laidContainer,
+          label,
+          fontSize,
+          fontFamily,
+          verticalAlign,
+        );
+        updates.push({
+          id: existing.id,
+          text: layout.text,
+          originalText: label,
+          width: layout.width,
+          height: layout.height,
+          x: layout.x,
+          y: layout.y,
+          lineHeight: layout.lineHeight,
+          ...textStyle,
+          ...strokeColor,
+        });
+        const growsHeight =
+          containerRest.height === undefined &&
+          layout.containerHeight !== (laidContainer.height || 0);
+        if (Object.keys(containerRest).length > 1 || growsHeight) {
+          updates.push({
+            ...containerRest,
+            ...(growsHeight ? { height: layout.containerHeight } : {}),
+          });
+        }
+      } else {
+        creations.push({
+          type: "text",
+          containerId: patch.id,
+          text: label,
+          ...textStyle,
+          ...strokeColor,
+        });
+        if (Object.keys(containerRest).length > 1) {
+          updates.push(containerRest);
+        }
+      }
+    }
+    return { updates, creations };
   }
 
   async connectElements(
@@ -912,11 +1057,6 @@ export class CollabBot {
       boundElements: pruneBackrefs(plan.toBoundElements),
     });
 
-    this.pushUndo([
-      { id: arrowId, prior: null },
-      { id: fromId, prior: from },
-      { id: toId, prior: to },
-    ]);
     this.elements.set(arrowId, arrow);
     this.elements.set(fromId, fromUpdated);
     this.elements.set(toId, toUpdated);
@@ -1073,14 +1213,12 @@ export class CollabBot {
       throw new Error("no matching elements to arrange");
     }
     const positions = arrangePositions(targets, options);
-    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
     const changed: ExcalidrawElement[] = [];
     for (const target of targets) {
       const next = positions.get(target.id);
       if (!next) {
         continue;
       }
-      frame.push({ id: target.id, prior: target });
       const [minX, minY] = getElementBounds(target);
       const updated = applyUpdate(target, {
         x: target.x + (next[0] - minX),
@@ -1090,7 +1228,6 @@ export class CollabBot {
       changed.push(updated);
     }
     if (changed.length) {
-      this.pushUndo(frame);
       await this.commit(changed, { targets: changed, select: true });
       this.recordWrites(changed, "bot");
     }
@@ -1139,59 +1276,21 @@ export class CollabBot {
   private async patchMany(
     items: Array<{ id: string; patch: Partial<ExcalidrawElement> }>,
   ): Promise<ExcalidrawElement[]> {
-    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
     const changed: ExcalidrawElement[] = [];
     for (const { id, patch } of items) {
       const current = this.elements.get(id);
       if (!current || current.isDeleted) {
         continue;
       }
-      frame.push({ id, prior: current });
       const updated = applyUpdate(current, patch);
       this.elements.set(id, updated);
       changed.push(updated);
     }
     if (changed.length) {
-      this.pushUndo(frame);
       await this.commit(changed, { targets: changed, select: true });
       this.recordWrites(changed, "bot");
     }
     return changed;
-  }
-
-  async undoLast(): Promise<{ undone: number; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const frame = this.undoStack.pop();
-    if (!frame) {
-      return { undone: 0, sceneVersion: this.currentSceneVersion() };
-    }
-    const changed: ExcalidrawElement[] = [];
-    for (const { id, prior } of frame) {
-      const current = this.elements.get(id);
-      if (prior === null) {
-        if (current && !current.isDeleted) {
-          const deleted = markDeleted(current);
-          this.elements.set(id, deleted);
-          changed.push(deleted);
-        }
-        continue;
-      }
-      const base = current ?? prior;
-      const restored = applyUpdate(base, prior);
-      this.elements.set(id, restored);
-      changed.push(restored);
-    }
-    if (changed.length) {
-      this.undoing = true;
-      try {
-        await this.commit(changed);
-      } finally {
-        this.undoing = false;
-      }
-      this.recordWrites(changed, "bot");
-    }
-    return { undone: changed.length, sceneVersion: this.currentSceneVersion() };
   }
 
   async getBounds(ids?: string[]): Promise<{
@@ -1245,13 +1344,6 @@ export class CollabBot {
     if (!all.length) {
       return;
     }
-    this.pushUndo([
-      ...containerUpdates.map((element) => ({
-        id: element.id,
-        prior: this.elements.get(element.id) ?? null,
-      })),
-      ...created.map((element) => ({ id: element.id, prior: null })),
-    ]);
     for (const element of all) {
       this.elements.set(element.id, element);
     }
@@ -1274,20 +1366,17 @@ export class CollabBot {
         ids.add(element.id);
       }
     }
-    const frame: Array<{ id: string; prior: ExcalidrawElement | null }> = [];
     const changed: ExcalidrawElement[] = [];
     for (const id of ids) {
       const current = this.elements.get(id);
       if (!current || current.isDeleted) {
         continue;
       }
-      frame.push({ id, prior: current });
       const deleted = markDeleted(current);
       this.elements.set(id, deleted);
       changed.push(deleted);
     }
     if (changed.length) {
-      this.pushUndo(frame);
       await this.commit(changed);
       this.recordWrites(changed, "bot");
     }
@@ -1302,6 +1391,7 @@ export class CollabBot {
     const resurrected: ExcalidrawElement[] = [];
     for (const incoming of elements) {
       const id = incoming.id;
+      const assertedAt = this.ownedAssertedAt.get(id) ?? 0;
       const decision = decideIncoming({
         incoming,
         current: this.elements.get(id),
@@ -1309,6 +1399,7 @@ export class CollabBot {
         botDeleted: this.botDeletedIds.has(id),
         resurrectCount: this.resurrections.get(id) ?? 0,
         maxResurrections: CollabBot.MAX_RESURRECTIONS,
+        resurrectable: Date.now() - assertedAt < CollabBot.RESURRECTION_WINDOW_MS,
         snapshot: this.ownedSnapshots.get(id),
       });
       switch (decision.action) {
@@ -1320,9 +1411,9 @@ export class CollabBot {
           break;
         case "accept_conflict":
           this.elements.set(id, incoming);
-          // A human edit means the element is alive again: refresh the
-          // re-assert snapshot to their geometry and reset the fight budget so
-          // a *later* deletion gets a fresh round of resistance.
+          // A human edit means the element is alive again: track their geometry
+          // as the snapshot and reset the fight count. The grace window is not
+          // re-armed, so a deletion made after it still yields to the human.
           this.ownedSnapshots.set(id, incoming);
           this.resurrections.delete(id);
           accepted.push(incoming);
@@ -1339,6 +1430,7 @@ export class CollabBot {
           this.elements.set(id, incoming);
           accepted.push(incoming);
           this.ownedIds.delete(id);
+          this.ownedAssertedAt.delete(id);
           this.recordConflict(id, "yielded");
           break;
       }
@@ -1349,8 +1441,9 @@ export class CollabBot {
     if (resurrected.length) {
       // Record synchronously, while `resurrected` still matches in-memory state:
       // the async flush could otherwise roll snapshots back behind a concurrent
-      // tool commit.
-      this.recordWrites(resurrected, "bot");
+      // tool commit. A re-assertion is not a genuine write, so it must not push
+      // the grace window forward (that is measured from the last real bot write).
+      this.recordWrites(resurrected, "bot", { touchAssertedAt: false });
       logWarn("collab.reconcile.resurrected_owned_elements", {
         boardId: this.boardId,
         ids: resurrected.map((element) => element.id),
@@ -1360,12 +1453,14 @@ export class CollabBot {
   }
 
   private claimOwnership(elements: ExcalidrawElement[]): void {
+    const now = Date.now();
     for (const element of elements) {
       this.ownedIds.add(element.id);
       this.botDeletedIds.delete(element.id);
       this.resurrections.delete(element.id);
       if (!element.isDeleted) {
         this.ownedSnapshots.set(element.id, element);
+        this.ownedAssertedAt.set(element.id, now);
       }
     }
   }
@@ -1418,7 +1513,9 @@ export class CollabBot {
   private recordWrites(
     changed: ExcalidrawElement[],
     origin: "bot" | "incoming",
+    opts: { touchAssertedAt?: boolean } = {},
   ): void {
+    const touchAssertedAt = opts.touchAssertedAt !== false;
     const sceneVersionAfter = this.currentSceneVersion();
     for (const element of changed) {
       this.writeLog.push({
@@ -1431,9 +1528,13 @@ export class CollabBot {
         if (element.isDeleted) {
           this.ownedIds.delete(element.id);
           this.ownedSnapshots.delete(element.id);
+          this.ownedAssertedAt.delete(element.id);
           this.botDeletedIds.add(element.id);
         } else {
           this.ownedSnapshots.set(element.id, element);
+          if (touchAssertedAt) {
+            this.ownedAssertedAt.set(element.id, Date.now());
+          }
         }
       }
     }
@@ -1451,18 +1552,6 @@ export class CollabBot {
       }
     }
     return "bot";
-  }
-
-  private pushUndo(
-    frame: Array<{ id: string; prior: ExcalidrawElement | null }>,
-  ): void {
-    if (this.undoing) {
-      return;
-    }
-    this.undoStack.push(frame);
-    if (this.undoStack.length > CollabBot.MAX_UNDO) {
-      this.undoStack.shift();
-    }
   }
 
   private readback(
