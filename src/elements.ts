@@ -5,10 +5,12 @@ import {generateKeyBetween, generateNKeysBetween} from "fractional-indexing";
 import {CONTAINER_TYPES, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, isBindable,} from "./verify/model";
 import {planConnection} from "./verify/bindings";
 import {layoutBoundText, layoutText} from "./verify/textMetrics";
+import {applyRole} from "./verify/styles";
 import type {ExcalidrawElement} from "./types";
 
 export type CreateAttrs = Partial<ExcalidrawElement> & {
   type: string;
+  role?: string;
   label?: string;
   labelColor?: string;
   points?: [number, number][];
@@ -269,9 +271,10 @@ const buildBoundText = (
 };
 
 export const planCreations = (
-  items: CreateAttrs[],
+  rawItems: CreateAttrs[],
   existing: readonly ExcalidrawElement[],
 ): { created: ExcalidrawElement[]; containerUpdates: ExcalidrawElement[] } => {
+  const items = rawItems.map((item) => applyRole(item) as CreateAttrs);
   const working = [...existing];
   const created: ExcalidrawElement[] = [];
   const createdIndex = new Map<string, number>();

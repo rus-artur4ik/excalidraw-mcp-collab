@@ -52,3 +52,26 @@ export const contrastRatio = (foreground: Rgb, background: Rgb): number => {
   const darker = Math.min(l1, l2);
   return (lighter + 0.05) / (darker + 0.05);
 };
+
+const colorDistance = (a: Rgb, b: Rgb): number =>
+  (a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2;
+
+export const suggestReadableColor = (
+  current: Rgb,
+  background: Rgb,
+  threshold: number,
+  candidates: readonly string[],
+): string | null => {
+  let best: { hex: string; distance: number } | null = null;
+  for (const hex of candidates) {
+    const rgb = parseColor(hex);
+    if (!rgb || contrastRatio(rgb, background) < threshold) {
+      continue;
+    }
+    const distance = colorDistance(rgb, current);
+    if (!best || distance < best.distance) {
+      best = { hex, distance };
+    }
+  }
+  return best?.hex ?? null;
+};

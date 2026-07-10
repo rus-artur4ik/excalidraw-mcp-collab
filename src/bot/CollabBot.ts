@@ -4,6 +4,7 @@ import {io, type Socket} from "socket.io-client";
 
 import {config} from "../config";
 import {auth, db} from "../firebase";
+import {getBot} from "../bots";
 import {decryptJSON, encryptJSON} from "../encryption";
 import {appendSceneHistory, getSceneVersion, loadScene, persistScene,} from "../scene";
 import {
@@ -25,6 +26,7 @@ import {
   CONTAINER_TYPES,
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE,
+  type DiagramInput,
   elementAtPoint,
   getCommonBounds,
   getElementBounds,
@@ -36,6 +38,7 @@ import {
   lintScene,
   type LintScopeOptions,
   planConnection,
+  planDiagram,
   type RenderOptions,
   renderSvg,
   svgToPngBase64,
@@ -65,6 +68,7 @@ type CursorFrame = {
     selectedElementIds: Record<string, true>;
     username: string;
     avatarUrl: string | null;
+    color: { background: string; stroke: string } | null;
   };
 };
 
@@ -124,6 +128,8 @@ export class CollabBot {
   private idToken = "";
   private idTokenExpiresAt = 0;
   private displayName = "";
+  private presenceColor: string | null = null;
+  private presenceEmoji = "🤖";
   private lastActiveAt = 0;
 
   private socket: Socket | null = null;
@@ -177,45 +183,24 @@ export class CollabBot {
   }
 
   private get presenceName(): string {
-    return `🤖 ${this.displayName || "Bot"}`;
+    return `${this.presenceEmoji} ${this.displayName || "Bot"}`;
   }
 
-  private async emitCursor(
-    pointer: { x: number; y: number },
-    selectedElementIds: Record<string, true>,
-  ): Promise<void> {
-    const socket = this.socket;
-    if (!socket?.connected || !socket.id) {
-      return;
-    }
-    const frame: CursorFrame = {
-      type: WS_SUBTYPE_MOUSE_LOCATION,
-      payload: {
-        socketId: socket.id,
-        pointer: { x: pointer.x, y: pointer.y, tool: "pointer" },
-        button: "up",
-        selectedElementIds,
-        username: this.presenceName,
-        avatarUrl: null,
-      },
-    };
-    try {
-      const { ciphertext, iv } = await encryptJSON(this.roomKey, frame);
-      socket.emit(
-        "server-volatile-broadcast",
-        this.boardId,
-        ciphertext.buffer.slice(
-          ciphertext.byteOffset,
-          ciphertext.byteOffset + ciphertext.byteLength,
-        ),
-        iv,
-      );
-    } catch (error) {
-      logWarn("collab.presence.emit_failed", {
-        boardId: this.boardId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+  async createDiagram(
+    input: DiagramInput,
+    opts: { returnIds?: boolean } = {},
+  ): Promise<{
+    created: ExcalidrawElement[] | string[];
+    nodes: Record<string, string>;
+    bounds: { x: number; y: number; width: number; height: number };
+    sceneVersion: number;
+    warnings: LintFinding[];
+    conflicts: ConflictRecord[];
+  }> {
+    this.requireEditor();
+    const plan = await planDiagram(input, randomUUID);
+    const result = await this.createElements(plan.items, opts);
+    return { ...result, nodes: plan.nodeElementIds, bounds: plan.bounds };
   }
 
   private async showActivity(
@@ -278,6 +263,47 @@ export class CollabBot {
     return this.connecting;
   }
 
+  private async emitCursor(
+    pointer: { x: number; y: number },
+    selectedElementIds: Record<string, true>,
+  ): Promise<void> {
+    const socket = this.socket;
+    if (!socket?.connected || !socket.id) {
+      return;
+    }
+    const frame: CursorFrame = {
+      type: WS_SUBTYPE_MOUSE_LOCATION,
+      payload: {
+        socketId: socket.id,
+        pointer: { x: pointer.x, y: pointer.y, tool: "pointer" },
+        button: "up",
+        selectedElementIds,
+        username: this.presenceName,
+        avatarUrl: null,
+        color: this.presenceColor
+          ? { background: this.presenceColor, stroke: this.presenceColor }
+          : null,
+      },
+    };
+    try {
+      const { ciphertext, iv } = await encryptJSON(this.roomKey, frame);
+      socket.emit(
+        "server-volatile-broadcast",
+        this.boardId,
+        ciphertext.buffer.slice(
+          ciphertext.byteOffset,
+          ciphertext.byteOffset + ciphertext.byteLength,
+        ),
+        iv,
+      );
+    } catch (error) {
+      logWarn("collab.presence.emit_failed", {
+        boardId: this.boardId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private async loadBoardContext(): Promise<void> {
     const keySnap = await (async () => {
       try {
@@ -322,6 +348,8 @@ export class CollabBot {
       });
       this.displayName = this.uid;
     }
+
+    await this.loadBotPresence();
   }
 
   private async initElements(): Promise<void> {
@@ -670,6 +698,34 @@ export class CollabBot {
       warnings,
       conflicts: this.conflictsFor(created.map((element) => element.id)),
     };
+  }
+
+  private async loadBotPresence(): Promise<void> {
+    if (!this.botId) {
+      return;
+    }
+    try {
+      const bot = await getBot(this.botId);
+      if (!bot) {
+        return;
+      }
+      if (bot.name?.trim()) {
+        this.displayName = bot.name.trim();
+      }
+      if (typeof bot.color === "string" && bot.color.trim()) {
+        this.presenceColor = bot.color.trim();
+      }
+      const emoji = (bot.avatar as { value?: string } | undefined)?.value;
+      if (typeof emoji === "string" && emoji.trim()) {
+        this.presenceEmoji = emoji.trim();
+      }
+    } catch (error) {
+      logWarn("firestore.bot.presence_load_failed", {
+        boardId: this.boardId,
+        botId: this.botId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async deleteElements(selector: {

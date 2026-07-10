@@ -3,7 +3,8 @@ import * as z from "zod/v3";
 
 import {BotAccessDeniedError, type CollabBot, ReadOnlyError,} from "./bot/CollabBot";
 import {logError, logInfo, logWarn} from "./logger";
-import {type ArrangeOptions, BOUND_TEXT_PADDING, measureText, wrapText,} from "./verify";
+import {type ArrangeOptions, BOUND_TEXT_PADDING, measureText, ROLE_NAMES, wrapText,} from "./verify";
+import {DIAGRAM_GUIDE, PALETTE_JSON} from "./guide";
 
 import type {AccessibleBoard} from "./boards";
 import type {ExcalidrawElement} from "./types";
@@ -18,6 +19,12 @@ const elementFields = {
   type: z
     .string()
     .describe("Excalidraw element type, e.g. rectangle, ellipse, text, line"),
+  role: z
+    .string()
+    .optional()
+    .describe(
+      "Semantic style role (process, decision, terminal, error, external, accent, note, neutral): fills backgroundColor/strokeColor/labelColor from the board palette so colors stay consistent. Explicit colors win. See get_diagram_guide.",
+    ),
   id: z.string().optional(),
   x: z.number().optional(),
   y: z.number().optional(),
@@ -310,6 +317,50 @@ const batchCreateShape = {
   elements: z.array(z.object(elementFields)),
 };
 
+const diagramNodeShape = z.object({
+  id: z.string().describe("Your reference id for edges; the element gets a fresh id (see `nodes` in the result)."),
+  label: z.string(),
+  role: z
+    .enum(ROLE_NAMES)
+    .optional()
+    .describe("Semantic style role; sets colors and default shape (decision→diamond, terminal→ellipse). Default process."),
+  shape: z.enum(["rectangle", "ellipse", "diamond"]).optional(),
+  width: z.number().optional().describe("Fixed size; omit to auto-size from the label."),
+  height: z.number().optional(),
+  group: z.string().optional().describe("Id of a `groups` entry to cluster this node into."),
+});
+
+const diagramEdgeShape = z.object({
+  from: z.string(),
+  to: z.string(),
+  label: z.string().optional(),
+  strokeStyle: z.enum(["solid", "dashed", "dotted"]).optional(),
+  startArrowhead: z.string().nullable().optional(),
+  endArrowhead: z.string().nullable().optional(),
+});
+
+const createDiagramShape = {
+  ...boardIdShape,
+  ...returnFieldShape,
+  nodes: z.array(diagramNodeShape),
+  edges: z.array(diagramEdgeShape),
+  groups: z
+    .array(z.object({ id: z.string(), label: z.string().optional() }))
+    .optional()
+    .describe("Named clusters drawn as dashed containers around their member nodes."),
+  direction: z
+    .enum(["DOWN", "RIGHT", "UP", "LEFT"])
+    .optional()
+    .describe("Main flow direction (default DOWN)."),
+  spacing: z.number().optional().describe("Base gap between nodes (default 48)."),
+  origin: z
+    .object({ x: z.number(), y: z.number() })
+    .optional()
+    .describe("Scene position of the diagram's top-left corner; pick a free area (get_bounds) so it lands next to existing content."),
+  fontSize: z.number().optional(),
+  roughness: z.number().optional(),
+};
+
 const arrangeShape = {
   ...boardIdShape,
   ids: z.array(z.string()),
@@ -449,16 +500,86 @@ const imageResult = (png: string, meta: unknown): ToolContent => ({
   ],
 });
 
+const SELF_REVIEW_HINT =
+  "Self-review now: render_region the changed area, look at the image, then validate_scene scoped to the changed ids and apply each finding's `suggestion` (they carry ready-to-use numbers). Re-render until clean.";
+
+const withSelfReview = (result: unknown): unknown => {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return result;
+  }
+  const warnings = (result as { warnings?: unknown[] }).warnings;
+  const warningNote =
+    Array.isArray(warnings) && warnings.length
+      ? ` ${warnings.length} inline warning(s) above already include fix-ready suggestions.`
+      : "";
+  return { ...result, next: SELF_REVIEW_HINT + warningNote };
+};
+
+const SERVER_INSTRUCTIONS = `Excalidraw drawing tools for shared team boards.
+
+Before the FIRST diagram of a session, call get_diagram_guide (style roles, palette, workflow, worked example).
+
+Creating content:
+- Graph-shaped diagrams (flowcharts, architectures, pipelines, dependency maps): use create_diagram — you pass nodes + edges + direction, the server computes the layout. Do not hand-compute coordinates for graphs.
+- Free-form visuals: batch_create with \`label\` for text inside shapes (never a standalone text element over a shape) and \`fromId\`/\`toId\` for arrows (never manual points between shapes). Size containers with measure_text.
+- Colors: set \`role\` (process, decision, terminal, error, external, accent, note, neutral) instead of inventing hex values.
+
+After EVERY write: render_region the changed area, look at the image, validate_scene the changed ids, apply each finding's \`suggestion\` (ready-to-use dx/dy, width/height, strokeColor, patch), re-render. 2-3 passes is normal. Never finish with unresolved errors.
+
+Keep diagrams ≤20 nodes — split bigger content. Titles ≤6 words, no paragraphs on canvas. Emoji become tofu in PNG renders; use plain glyphs (✓ ★ × ·).`;
+
 export type McpContext = {
   resolveBot: (boardId: string) => Promise<CollabBot>;
   listBoards: () => Promise<AccessibleBoard[]>;
 };
 
 export function buildMcpServer(ctx: McpContext): McpServer {
-  const server = new McpServer({
-    name: "excalidraw-team",
-    version: "1.0.0",
-  });
+  const server = new McpServer(
+    {
+      name: "excalidraw-team",
+      version: "1.0.0",
+    },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
+
+  server.registerResource(
+    "diagram-guide",
+    "guide://excalidraw-team/diagram-guide.md",
+    {
+      title: "Diagram style & workflow guide",
+      description:
+        "How to draw well on these boards: workflow, semantic roles, palette, density caps, worked example.",
+      mimeType: "text/markdown",
+    },
+    async (uri) => ({
+      contents: [{ uri: uri.href, mimeType: "text/markdown", text: DIAGRAM_GUIDE }],
+    }),
+  );
+
+  server.registerResource(
+    "diagram-palette",
+    "guide://excalidraw-team/palette.json",
+    {
+      title: "Semantic style palette",
+      description: "Style roles (colors + default shapes) and the size ladder, as JSON.",
+      mimeType: "application/json",
+    },
+    async (uri) => ({
+      contents: [{ uri: uri.href, mimeType: "application/json", text: PALETTE_JSON }],
+    }),
+  );
+
+  server.registerTool(
+    "get_diagram_guide",
+    {
+      description:
+        "REQUIRED before drawing the first diagram of a session: returns the board style guide — workflow, semantic color roles, size ladder, density caps and a worked create_diagram example. Cheap and static; call once and follow it.",
+      inputSchema: {},
+    },
+    async () => ({
+      content: [{ type: "text" as const, text: DIAGRAM_GUIDE }],
+    }),
+  );
 
   server.registerTool(
     "list_boards",
@@ -519,9 +640,11 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     async (args) =>
       runTool("update_elements", async () => {
         const bot = await ctx.resolveBot(args.boardId);
-        return bot.updateElements(
-          args.elements as Array<{ id: string } & Partial<ExcalidrawElement>>,
-          { returnIds: args.return === "ids" },
+        return withSelfReview(
+          await bot.updateElements(
+            args.elements as Array<{ id: string } & Partial<ExcalidrawElement>>,
+            { returnIds: args.return === "ids" },
+          ),
         );
       }),
   );
@@ -777,11 +900,13 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     async (args) =>
       runTool("connect", async () => {
         const bot = await ctx.resolveBot(args.boardId);
-        return bot.connectElements(args.fromId, args.toId, {
-          mode: args.mode,
-          startArrowhead: args.startArrowhead,
-          endArrowhead: args.endArrowhead,
-        });
+        return withSelfReview(
+          await bot.connectElements(args.fromId, args.toId, {
+            mode: args.mode,
+            startArrowhead: args.startArrowhead,
+            endArrowhead: args.endArrowhead,
+          }),
+        );
       }),
   );
 
@@ -789,15 +914,34 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "batch_create",
     {
       description:
-        "Create multiple elements in a single commit (one broadcast/persist). Supports bound text (containerId / label), line/arrow points, `frameId` to drop an element straight into an existing frame, and arrows bound to shapes via `fromId`/`toId` (bound at creation — no per-arrow connect round-trips, and the shapes stay attached when moved). Returns the created elements (or just ids with return:\"ids\") plus inline lint warnings computed at commit time and any `conflicts`. The bot keeps ownership of the created ids and re-asserts them if a concurrent human session deletes them. Bot write access required.",
+        "Create multiple elements in a single commit (one broadcast/persist). For a NEW diagram call get_diagram_guide first, and prefer create_diagram for graph-shaped content (it computes the layout for you). Supports semantic `role` styling, bound text (containerId / label), line/arrow points, `frameId` to drop an element straight into an existing frame, and arrows bound to shapes via `fromId`/`toId` (bound at creation — no per-arrow connect round-trips, and the shapes stay attached when moved). Returns the created elements (or just ids with return:\"ids\") plus inline lint warnings computed at commit time and any `conflicts`. The bot keeps ownership of the created ids and re-asserts them if a concurrent human session deletes them. Bot write access required.",
       inputSchema: batchCreateShape,
     },
     async (args) =>
       runTool("batch_create", async () => {
         const bot = await ctx.resolveBot(args.boardId);
-        return bot.createElements(
-          args.elements as Array<Partial<ExcalidrawElement> & { type: string }>,
-          { returnIds: args.return === "ids" },
+        return withSelfReview(
+          await bot.createElements(
+            args.elements as Array<Partial<ExcalidrawElement> & { type: string }>,
+            { returnIds: args.return === "ids" },
+          ),
+        );
+      }),
+  );
+
+  server.registerTool(
+    "create_diagram",
+    {
+      description:
+        "PREFERRED way to draw any graph-shaped diagram (flowchart, architecture, pipeline, dependency map): pass nodes + edges + direction and the server computes the whole layout (ELK layered — no overlaps, clean layers, routed spacing), sizes nodes to their labels, applies semantic role colors and creates everything with bound labels and bound arrows in one commit. Never hand-compute coordinates for graph content. Returns the created elements, a `nodes` map (your node id → element id) and the diagram `bounds` for render_region. Call get_diagram_guide first for roles and a worked example. Bot write access required.",
+      inputSchema: createDiagramShape,
+    },
+    async (args) =>
+      runTool("create_diagram", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        const { boardId, return: returnMode, ...input } = args;
+        return withSelfReview(
+          await bot.createDiagram(input, { returnIds: returnMode === "ids" }),
         );
       }),
   );
@@ -812,7 +956,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     async (args) =>
       runTool("arrange", async () => {
         const bot = await ctx.resolveBot(args.boardId);
-        return bot.arrange(args.ids, buildArrangeOptions(args));
+        return withSelfReview(await bot.arrange(args.ids, buildArrangeOptions(args)));
       }),
   );
 

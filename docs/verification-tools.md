@@ -17,7 +17,9 @@ as pure functions over the in-memory element model; `CollabBot` exposes them and
 | `render_scene` | read | SVG (always) + PNG (when `@resvg/resvg-js` is present) of the board, with Set-of-Mark id labels, an optional grid, a coordinate transform and an element legend sorted by z-order (`legendOrder: "z-ascending"`; each entry carries its `z` rank and fractional `index`). |
 | `render_region` | read | Same, clipped to a scene rectangle. |
 | `render_element` | read | Same, cropped to one or more elements by `ids` or `groupId` (focus render). |
-| `batch_create` | write | Create N elements in a single broadcast/persist/history commit. Supports bound text (`containerId`/`label`), line/arrow `points`, `frameId` (drop into a frame) and arrows bound to shapes inline via `fromId`/`toId`. Covers N=1, so there is no singular `create_element`. `return:"ids"` keeps the response small. |
+| `get_diagram_guide` | read | Static style/workflow guide for agents: semantic roles + palette, size ladder, density caps, the mandatory render→validate loop and a worked `create_diagram` example. Also served as MCP resources (`guide://excalidraw-team/diagram-guide.md`, `guide://excalidraw-team/palette.json`). |
+| `batch_create` | write | Create N elements in a single broadcast/persist/history commit. Supports semantic `role` styling (palette colors applied server-side), bound text (`containerId`/`label`), line/arrow `points`, `frameId` (drop into a frame) and arrows bound to shapes inline via `fromId`/`toId`. Covers N=1, so there is no singular `create_element`. `return:"ids"` keeps the response small. |
+| `create_diagram` | write | Graph-shaped diagrams without coordinates: takes `nodes` (+`role`/`shape`/`group`) and `edges` (+labels), sizes nodes to their labels via the text engine, runs ELK layered layout (direction, spacing, clusters as dashed containers) and commits everything as role-styled shapes with bound labels and bound arrows. Returns the created elements, a `nodes` input-id→element-id map and the diagram `bounds` for `render_region`. Rejects >60 nodes. |
 | `update_elements` | write | Patch N elements in a single commit. Patch a container with `{ id, label }` to edit/add its bound-text label without knowing the text id; an explicit `index` is honored (re-stacks). Covers N=1. `return:"ids"` supported. |
 | `delete_elements` | write | Delete N elements by `ids` or by `groupId` in a single commit (bound text cascades with its container). Covers N=1. |
 | `delete_region` | write | Delete everything inside a scene rectangle (`mode` intersect/contain, optional `type` filter). |
@@ -29,9 +31,11 @@ as pure functions over the in-memory element model; `CollabBot` exposes them and
 | `connect` | write | Create a properly bound arrow between two shapes (`FixedPointBinding` + back-references). For many arrows, prefer `fromId`/`toId` in `batch_create`. |
 | `arrange` | write | Re-layout a set of elements (grid / row / column / align / distribute). |
 
-`update_elements` / `batch_create` / `connect` additionally return inline
-`warnings` (a focused lint pass on the affected element) so the agent gets
-self-review feedback without a separate call.
+`update_elements` / `batch_create` / `create_diagram` / `connect` additionally
+return inline `warnings` (a focused lint pass on the affected element) so the
+agent gets self-review feedback without a separate call, plus a `next` hint
+steering it into the render→validate self-review loop. The server also ships
+these workflow rules in the MCP initialize `instructions`.
 Inline warnings are computed at commit time: when several writes race in parallel,
 a warning may reflect state a sibling write has not applied yet — re-run
 `validate_scene` for the authoritative picture.
@@ -89,9 +93,14 @@ hostile/malformed colors cannot corrupt the SVG.
 ## Deterministic lint rules (`validate_scene`)
 
 Each finding: `{ code, severity, elementIds, message, suggestion? }`.
-`severity ∈ {error, warning, info}`. `suggestion` is machine-actionable, e.g.
-`{ action: "resize", id, width, height }`, `{ action: "move", id, dx, dy }`,
-`{ action: "connect", fromId, toId }`, `{ action: "delete", id }`.
+`severity ∈ {error, warning, info}`. `suggestion` is machine-actionable **with
+concrete values** — apply it as-is instead of re-deriving numbers:
+`overlap` → `{ action:"move", id, dx, dy }` (smallest single-axis move that
+separates, +20px margin), `text_overflow` → `{ action:"resize", id, height, width? }`,
+`low_contrast` → `{ action:"recolor", id, strokeColor }` (closest palette color
+passing the threshold), `alignment_near_miss` → `{ action:"align", edge, ids,
+patch:{ id, x|y } }` (feed `patch` straight to `update_elements`),
+`style_many_stroke_colors` → `{ action:"recolor", palette }`.
 
 ### Structural (error)
 | code | trigger |

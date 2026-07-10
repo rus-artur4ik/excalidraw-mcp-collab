@@ -25,7 +25,8 @@ import {
     pointInElement,
 } from "./geometry";
 import {bindingGap} from "./bindings";
-import {contrastRatio, parseColor} from "./colors";
+import {contrastRatio, parseColor, suggestReadableColor} from "./colors";
+import {PALETTE_STROKES} from "./styles";
 import {getBoundTextMaxHeight, getBoundTextMaxWidth, measureText, wrapText,} from "./textMetrics";
 
 export type Severity = "error" | "warning" | "info";
@@ -59,6 +60,25 @@ const SEVERITY_RANK: Record<Severity, number> = {
 
 const boundsIntersect = (a: Bounds, b: Bounds): boolean =>
   a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+
+const SEPARATION_MARGIN = 20;
+
+const smallestSingleAxisSeparation = (
+  move: Bounds,
+  fixed: Bounds,
+): { dx: number; dy: number } => {
+  const pushes: Array<{ dx: number; dy: number }> = [
+    { dx: Math.ceil(fixed[2] - move[0] + SEPARATION_MARGIN), dy: 0 },
+    { dx: -Math.ceil(move[2] - fixed[0] + SEPARATION_MARGIN), dy: 0 },
+    { dx: 0, dy: Math.ceil(fixed[3] - move[1] + SEPARATION_MARGIN) },
+    { dx: 0, dy: -Math.ceil(move[3] - fixed[1] + SEPARATION_MARGIN) },
+  ];
+  return pushes.reduce((best, push) =>
+    Math.abs(push.dx + push.dy) < Math.abs(best.dx + best.dy) ? push : best,
+  );
+};
+
+const CONTRAST_CANDIDATES = ["#1e1e1e", "#ffffff", ...PALETTE_STROKES];
 
 const scopeIdSet = (
   live: readonly ExcalidrawElement[],
@@ -159,6 +179,11 @@ const overflowChecks = (
     if (widthOverflow || heightOverflow) {
       const neededHeight =
         Math.ceil(measured.height) + BOUND_TEXT_PADDING * 2;
+      // maxWidth is derived from container.width by a shape-specific formula,
+      // so scaling the width by the overflow ratio keeps that formula intact.
+      const neededWidth = Math.ceil(
+        (container.width || 0) * (measured.width / Math.max(1, maxWidth)),
+      ) + 1;
       return [
         {
           code: "text_overflow",
@@ -169,6 +194,9 @@ const overflowChecks = (
             action: "resize",
             id: container.id,
             height: Math.max(container.height || 0, neededHeight),
+            ...(widthOverflow && !isArrowLabel
+              ? { width: Math.max(container.width || 0, neededWidth) }
+              : {}),
           },
         },
       ];
@@ -565,8 +593,7 @@ const pairwiseChecks = (
             suggestion: {
               action: "move",
               id: b.id,
-              dx: Math.ceil(ba[2] - bb[0] + 20),
-              dy: 0,
+              ...smallestSingleAxisSeparation(bb, ba),
             },
           });
         }
@@ -610,12 +637,13 @@ const alignFinding = (
   label: string,
   diff: number,
   ids: [string, string],
+  patch: Record<string, unknown>,
 ): LintFinding => ({
   code: "alignment_near_miss",
   severity: "info",
   elementIds: ids,
   message: `${label} are ${diff.toFixed(1)}px apart — likely meant to align.`,
-  suggestion: { action: "align", edge, ids },
+  suggestion: { action: "align", edge, ids, patch },
 });
 
 // Coords are [edge1, center, edge2]. Edges of differently-sized elements
@@ -627,14 +655,19 @@ const nearMissOnAxis = (
   bCoords: readonly number[],
   edges: readonly string[],
   ids: [string, string],
+  axis: "x" | "y",
 ): LintFinding | null => {
   const diffs = aCoords.map((v, i) => Math.abs(v - bCoords[i]));
+  const patchFor = (k: number): Record<string, unknown> => ({
+    id: ids[1],
+    [axis]: bCoords[0] + (aCoords[k] - bCoords[k]),
+  });
   const centerDiff = diffs[1];
   if (centerDiff < ALIGN_MIN) {
     return null;
   }
   if (centerDiff <= ALIGN_SNAP) {
-    return alignFinding(edges[1], edges[1], centerDiff, ids);
+    return alignFinding(edges[1], edges[1], centerDiff, ids, patchFor(1));
   }
   const edgeIndices = [0, 2];
   if (edgeIndices.some((k) => diffs[k] < ALIGN_MIN)) {
@@ -642,7 +675,7 @@ const nearMissOnAxis = (
   }
   for (const k of edgeIndices) {
     if (diffs[k] <= ALIGN_SNAP) {
-      return alignFinding(edges[k], `${edges[k]} edges`, diffs[k], ids);
+      return alignFinding(edges[k], `${edges[k]} edges`, diffs[k], ids, patchFor(k));
     }
   }
   return null;
@@ -658,6 +691,7 @@ const nearMissAlignment = (
     [b.x, b.x + (b.width || 0) / 2, b.x + (b.width || 0)],
     ["left", "centerX", "right"],
     ids,
+    "x",
   );
   if (horizontal) {
     return horizontal;
@@ -667,6 +701,7 @@ const nearMissAlignment = (
     [b.y, b.y + (b.height || 0) / 2, b.y + (b.height || 0)],
     ["top", "centerY", "bottom"],
     ids,
+    "y",
   );
 };
 
@@ -829,12 +864,17 @@ const contrastChecks = (
     const ratio = contrastRatio(fg, bg);
     const threshold = fontSizeOf(element) >= 24 ? 3 : 4.5;
     if (ratio < threshold) {
+      const readable = suggestReadableColor(fg, bg, threshold, CONTRAST_CANDIDATES);
       findings.push({
         code: "low_contrast",
         severity: "warning",
         elementIds: [element.id],
         message: `Text contrast ${ratio.toFixed(2)}:1 against its background is below the ${threshold}:1 readability threshold.`,
-        suggestion: { action: "recolor", id: element.id },
+        suggestion: {
+          action: "recolor",
+          id: element.id,
+          ...(readable ? { strokeColor: readable } : {}),
+        },
       });
     }
   }
@@ -866,6 +906,7 @@ const styleChecks = (
       severity: "info",
       elementIds: [],
       message: `${strokes.size} distinct stroke colors are used; a tighter palette usually reads better.`,
+      suggestion: { action: "recolor", palette: PALETTE_STROKES },
     });
   }
   return findings;
@@ -1009,7 +1050,11 @@ export const lintElement = (
             severity: "warning",
             elementIds: [element.id, other.id],
             message: `Overlaps ${other.type} by ${Math.round(ratio * 100)}% of the smaller element.`,
-            suggestion: { action: "move", id: element.id },
+            suggestion: {
+              action: "move",
+              id: element.id,
+              ...smallestSingleAxisSeparation(myBounds, otherBounds),
+            },
           });
         }
       }
