@@ -63,6 +63,10 @@ Then: \`render_region\` the returned \`bounds\`, check the image, \`validate_sce
 - The content is a table or a list — write it as text instead.
 - More than ~30 nodes of tightly-coupled detail — split by subsystem first.
 - You cannot name the visual encoding — go back to step 1.
+
+## Where the result lives
+
+Always on a shared board (list_boards). Never deliver a diagram as a local .excalidraw/PNG file — local artifacts live outside the board, the team can't see or edit them.
 `;
 
 export const PALETTE_JSON = JSON.stringify(

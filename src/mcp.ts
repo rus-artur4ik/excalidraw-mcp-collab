@@ -517,6 +517,8 @@ const withSelfReview = (result: unknown): unknown => {
 
 const SERVER_INSTRUCTIONS = `Excalidraw drawing tools for shared team boards.
 
+When asked for a diagram or visualization, draw it HERE on a shared board — never produce local .excalidraw/PNG files (they live outside the board; the team can't see or edit them).
+
 Before the FIRST diagram of a session, call get_diagram_guide (style roles, palette, workflow, worked example).
 
 Creating content:
