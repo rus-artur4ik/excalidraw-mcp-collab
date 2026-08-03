@@ -3,7 +3,6 @@ import {
     ARROWHEADS,
     asLinear,
     asText,
-    BOUND_TEXT_PADDING,
     type Bounds,
     FILL_STYLES,
     FONT_LINE_HEIGHTS,
@@ -21,13 +20,22 @@ import {
     distanceToElement,
     getCommonBounds,
     getElementBounds,
+    globalLinearPoints,
     intersectionArea,
     pointInElement,
+    segmentElementOverlap,
 } from "./geometry";
 import {bindingGap} from "./bindings";
 import {contrastRatio, parseColor, suggestReadableColor} from "./colors";
 import {PALETTE_STROKES} from "./styles";
-import {getBoundTextMaxHeight, getBoundTextMaxWidth, measureText, wrapText,} from "./textMetrics";
+import {
+    type ContainerTextFit,
+    fitTextToContainer,
+    largestFittingFontSize,
+    measureText,
+    OVERFLOW_EPSILON,
+    wrapText,
+} from "./textMetrics";
 
 export type Severity = "error" | "warning" | "info";
 
@@ -111,7 +119,6 @@ const MAX_FONTS = 2;
 const MAX_STROKE_COLORS = 6;
 const MAX_PAIRWISE_ELEMENTS = 1500;
 const MAX_ALIGNMENT_FINDINGS = 25;
-const OVERFLOW_EPSILON = 1;
 
 const OVERLAP_TYPES = new Set(["rectangle", "ellipse", "diamond", "image"]);
 
@@ -148,6 +155,48 @@ const globalEndpoint = (
   return [arrow.x + p[0], arrow.y + p[1]];
 };
 
+const INSCRIBED_TYPES = new Set(["diamond", "ellipse"]);
+
+const overflowMessage = (
+  container: ExcalidrawElement,
+  fit: ContainerTextFit,
+): string => {
+  const shape = container.type;
+  const inscribed = INSCRIBED_TYPES.has(shape)
+    ? ` A ${shape} inscribes its label, so its ${Math.round(container.width || 0)}×${Math.round(container.height || 0)} box only offers a ${fit.usableWidth}×${fit.usableHeight} label area.`
+    : "";
+  if (fit.widthOverflow && fit.heightOverflow) {
+    return `Text does not fit its ${shape}: ${fit.textWidth}×${fit.textHeight} of text against a ${fit.usableWidth}×${fit.usableHeight} label area.${inscribed}`;
+  }
+  if (fit.widthOverflow) {
+    return `Text is too WIDE for its ${shape}: needs ${fit.textWidth}, the label area is ${fit.usableWidth}.${inscribed}`;
+  }
+  return `Text is too TALL for its ${shape}: it wraps to ${fit.textHeight} high, the label area is ${fit.usableHeight}.${inscribed}`;
+};
+
+const overflowSuggestion = (
+  text: ExcalidrawElement,
+  container: ExcalidrawElement,
+  fit: ContainerTextFit,
+  fontSize: number,
+  fontFamily: number | undefined,
+): Record<string, unknown> => {
+  const smaller = largestFittingFontSize(container, textContent(text), fontFamily, fontSize);
+  const shrinkText = smaller
+    ? { alternative: { action: "restyle", id: text.id, fontSize: smaller } }
+    : { alternative: { action: "shorten", id: text.id } };
+  if (isLinear(container)) {
+    return { action: "restyle", id: text.id, ...(smaller ? { fontSize: smaller } : {}) };
+  }
+  return {
+    action: "resize",
+    id: container.id,
+    ...(fit.widthOverflow ? { width: fit.fittedWidth } : {}),
+    ...(fit.heightOverflow ? { height: fit.fittedHeight } : {}),
+    ...shrinkText,
+  };
+};
+
 const overflowChecks = (
   element: ExcalidrawElement,
   byId: Map<string, ExcalidrawElement>,
@@ -168,40 +217,19 @@ const overflowChecks = (
     if (!container) {
       return [];
     }
-    const isArrowLabel = container.type === "arrow" || container.type === "line";
-    const maxWidth = getBoundTextMaxWidth(container, fontSize);
-    const wrapped = wrapText(text, fontSize, fontFamily, maxWidth);
-    const measured = measureText(wrapped, fontSize, fontFamily);
-    const widthOverflow = measured.width > maxWidth + OVERFLOW_EPSILON;
-    const maxHeight = isArrowLabel ? 0 : getBoundTextMaxHeight(container);
-    const heightOverflow =
-      !isArrowLabel && maxHeight > 0 && measured.height > maxHeight + OVERFLOW_EPSILON;
-    if (widthOverflow || heightOverflow) {
-      const neededHeight =
-        Math.ceil(measured.height) + BOUND_TEXT_PADDING * 2;
-      // maxWidth is derived from container.width by a shape-specific formula,
-      // so scaling the width by the overflow ratio keeps that formula intact.
-      const neededWidth = Math.ceil(
-        (container.width || 0) * (measured.width / Math.max(1, maxWidth)),
-      ) + 1;
-      return [
-        {
-          code: "text_overflow",
-          severity: "warning",
-          elementIds: [element.id, container.id],
-          message: `Text does not fit its ${container.type} container (needs ~${Math.ceil(measured.width)} wide, container fits ${Math.round(maxWidth)}).`,
-          suggestion: {
-            action: "resize",
-            id: container.id,
-            height: Math.max(container.height || 0, neededHeight),
-            ...(widthOverflow && !isArrowLabel
-              ? { width: Math.max(container.width || 0, neededWidth) }
-              : {}),
-          },
-        },
-      ];
+    const fit = fitTextToContainer(container, text, fontSize, fontFamily);
+    if (!fit.widthOverflow && !fit.heightOverflow) {
+      return [];
     }
-    return [];
+    return [
+      {
+        code: "text_overflow",
+        severity: "warning",
+        elementIds: [element.id, container.id],
+        message: overflowMessage(container, fit),
+        suggestion: overflowSuggestion(element, container, fit, fontSize, fontFamily),
+      },
+    ];
   }
 
   if (asText(element).autoResize === false && (element.width || 0) > 0) {
@@ -485,6 +513,116 @@ const arrowChecks = (
         }
       }
     }
+  }
+  return findings;
+};
+
+const CROSSING_MIN_CHORD = 4;
+const REROUTE_MARGIN = 24;
+const CROSSING_OBSTACLE_TYPES = new Set(["rectangle", "ellipse", "diamond", "image"]);
+
+const arrowExemptIds = (arrow: ExcalidrawElement): Set<string> => {
+  const linear = asLinear(arrow);
+  const exempt = new Set<string>([arrow.id]);
+  if (linear.startBinding) {
+    exempt.add(linear.startBinding.elementId);
+  }
+  if (linear.endBinding) {
+    exempt.add(linear.endBinding.elementId);
+  }
+  for (const entry of arrow.boundElements ?? []) {
+    exempt.add(entry.id);
+  }
+  return exempt;
+};
+
+const rerouteWaypoint = (
+  obstacle: ExcalidrawElement,
+  start: Point,
+  end: Point,
+): Point | null => {
+  const [x1, y1, x2, y2] = getElementBounds(obstacle);
+  const margin = bindingGap(obstacle) + REROUTE_MARGIN;
+  const cx = (x1 + x2) / 2;
+  const cy = (y1 + y2) / 2;
+  const detours: Point[] = [
+    [x1 - margin, cy],
+    [x2 + margin, cy],
+    [cx, y1 - margin],
+    [cx, y2 + margin],
+  ];
+  let best: { point: Point; length: number } | null = null;
+  for (const point of detours) {
+    if (
+      segmentElementOverlap(obstacle, start, point) > 0 ||
+      segmentElementOverlap(obstacle, point, end) > 0
+    ) {
+      continue;
+    }
+    const length =
+      Math.hypot(point[0] - start[0], point[1] - start[1]) +
+      Math.hypot(end[0] - point[0], end[1] - point[1]);
+    if (!best || length < best.length) {
+      best = { point, length };
+    }
+  }
+  return best?.point ?? null;
+};
+
+const crossingChecksFor = (
+  arrow: ExcalidrawElement,
+  obstacles: readonly ExcalidrawElement[],
+): LintFinding[] => {
+  const path = globalLinearPoints(arrow);
+  if (path.length < 2) {
+    return [];
+  }
+  const findings: LintFinding[] = [];
+  const exempt = arrowExemptIds(arrow);
+  const arrowBounds = getElementBounds(arrow);
+  const start = path[0];
+  const end = path[path.length - 1];
+
+  for (const obstacle of obstacles) {
+    if (
+      obstacle.isDeleted ||
+      exempt.has(obstacle.id) ||
+      !CROSSING_OBSTACLE_TYPES.has(obstacle.type) ||
+      (obstacle.boundElements ?? []).some((entry) => entry.id === arrow.id)
+    ) {
+      continue;
+    }
+    // A shape enclosing the whole arrow is a backdrop or cluster box, not an
+    // obstacle; and an endpoint sitting inside a shape is arrow_unbound_endpoint's job.
+    if (
+      boundsContain(getElementBounds(obstacle), arrowBounds) ||
+      pointInElement(obstacle, start[0], start[1]) ||
+      pointInElement(obstacle, end[0], end[1])
+    ) {
+      continue;
+    }
+    let chord = 0;
+    for (let i = 0; i < path.length - 1; i++) {
+      chord += segmentElementOverlap(obstacle, path[i], path[i + 1]);
+    }
+    if (chord < CROSSING_MIN_CHORD) {
+      continue;
+    }
+    const waypoint = rerouteWaypoint(obstacle, start, end);
+    findings.push({
+      code: "arrow_crosses_element",
+      severity: "warning",
+      elementIds: [arrow.id, obstacle.id],
+      message: `${arrow.type} runs through ${obstacle.type} ${obstacle.id} for ~${Math.round(chord)}px; route it around instead of across.`,
+      suggestion: waypoint
+        ? {
+            action: "reroute",
+            id: arrow.id,
+            blockedBy: obstacle.id,
+            waypoints: [waypoint],
+          }
+        : { action: "review", id: arrow.id, blockedBy: obstacle.id },
+    });
   }
   return findings;
 };
@@ -912,6 +1050,30 @@ const styleChecks = (
   return findings;
 };
 
+export const ISOLATED_RULE = "isolated";
+
+const lintIgnoreCodes = (element: ExcalidrawElement): string[] => {
+  const custom = element.customData as { lintIgnore?: unknown } | undefined | null;
+  const codes = custom?.lintIgnore ?? (element as { lintIgnore?: unknown }).lintIgnore;
+  return Array.isArray(codes)
+    ? codes.filter((code): code is string => typeof code === "string")
+    : [];
+};
+
+export const ignoresRule = (
+  element: ExcalidrawElement,
+  code: string,
+): boolean => lintIgnoreCodes(element).includes(code);
+
+const suppressedByElement = (
+  finding: LintFinding,
+  byId: Map<string, ExcalidrawElement>,
+): boolean =>
+  finding.elementIds.some((id) => {
+    const element = byId.get(id);
+    return !!element && ignoresRule(element, finding.code);
+  });
+
 export const buildConnectivityGraph = (
   elements: readonly ExcalidrawElement[],
 ): { nodeCount: number; edgeCount: number; isolated: string[] } => {
@@ -937,7 +1099,9 @@ export const buildConnectivityGraph = (
   return {
     nodeCount: nodes.length,
     edgeCount,
-    isolated: nodes.filter((n) => !connected.has(n.id)).map((n) => n.id),
+    isolated: nodes
+      .filter((n) => !connected.has(n.id) && !ignoresRule(n, ISOLATED_RULE))
+      .map((n) => n.id),
   };
 };
 
@@ -964,18 +1128,25 @@ export const lintScene = (
   if (live.length <= MAX_PAIRWISE_ELEMENTS) {
     findings.push(...pairwiseChecks(live));
     findings.push(...outlierChecks(live));
+    for (const element of live) {
+      if (isLinear(element)) {
+        findings.push(...crossingChecksFor(element, live));
+      }
+    }
   } else {
     findings.push({
       code: "scene_too_large",
       severity: "info",
       elementIds: [],
-      message: `Scene has ${live.length} elements; pairwise checks (overlap, duplicate, occlusion, alignment, outlier) were skipped.`,
+      message: `Scene has ${live.length} elements; pairwise checks (overlap, duplicate, occlusion, alignment, outlier, arrow_crosses_element) were skipped.`,
     });
   }
   findings.push(...contrastChecks(live, live, viewBackgroundColor));
   findings.push(...styleChecks(live));
 
-  findings = findings.filter((f) => !disabled.has(f.code));
+  findings = findings.filter(
+    (f) => !disabled.has(f.code) && !suppressedByElement(f, byId),
+  );
 
   const scope = scopeIdSet(live, options);
   if (scope) {
@@ -1025,6 +1196,15 @@ export const lintElement = (
   const findings: LintFinding[] = [];
   findings.push(...structuralChecks(element, byId));
 
+  const context = [...byId.values()];
+  findings.push(
+    ...(isLinear(element)
+      ? crossingChecksFor(element, context)
+      : context
+          .filter((other) => other.id !== element.id && isLinear(other))
+          .flatMap((arrow) => crossingChecksFor(arrow, [element]))),
+  );
+
   const myBounds = getElementBounds(element);
   if (eligibleForOverlap(element)) {
     for (const other of live) {
@@ -1061,6 +1241,8 @@ export const lintElement = (
     }
   }
 
-  findings.push(...contrastChecks([element], [...byId.values()], viewBackgroundColor));
-  return findings.filter((f) => !disabled.has(f.code));
+  findings.push(...contrastChecks([element], context, viewBackgroundColor));
+  return findings.filter(
+    (f) => !disabled.has(f.code) && !suppressedByElement(f, byId),
+  );
 };

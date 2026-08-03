@@ -1,7 +1,7 @@
 import ELK, {type ElkExtendedEdge, type ElkNode} from "elkjs";
 
 import {BOUND_TEXT_PADDING, DEFAULT_FONT_FAMILY} from "./model";
-import {measureText, wrapText} from "./textMetrics";
+import {containerSizeForText, measureText, wrapText} from "./textMetrics";
 import {ROLE_NAMES, ROLE_SHAPES, SIZE_LADDER} from "./styles";
 import type {CreateAttrs} from "../elements";
 
@@ -67,14 +67,15 @@ const nodeSize = (
   }
   const wrapped = wrapText(node.label, fontSize, DEFAULT_FONT_FAMILY, NODE_MAX_LABEL_WIDTH);
   const measured = measureText(wrapped, fontSize, DEFAULT_FONT_FAMILY);
-  const textWidth = measured.width + NODE_TEXT_PADDING_X * 2 + BOUND_TEXT_PADDING * 2;
-  const textHeight = measured.height + BOUND_TEXT_PADDING * 4;
   const shape = node.shape ?? ROLE_SHAPES[node.role ?? ""] ?? "rectangle";
-  // Text is inscribed in ellipses/diamonds, so the shape needs extra room around it.
-  const shapeFactor = shape === "rectangle" ? 1 : shape === "ellipse" ? Math.SQRT2 : 1.6;
+  const box = containerSizeForText(
+    shape,
+    measured.width + NODE_TEXT_PADDING_X * 2,
+    measured.height + BOUND_TEXT_PADDING * 2,
+  );
   return {
-    width: Math.ceil(Math.max(node.width ?? NODE_MIN.width, textWidth * shapeFactor)),
-    height: Math.ceil(Math.max(node.height ?? NODE_MIN.height, textHeight * shapeFactor)),
+    width: Math.ceil(Math.max(node.width ?? NODE_MIN.width, box.width)),
+    height: Math.ceil(Math.max(node.height ?? NODE_MIN.height, box.height)),
   };
 };
 

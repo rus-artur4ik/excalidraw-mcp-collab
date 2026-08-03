@@ -3,8 +3,8 @@ import * as z from "zod/v3";
 
 import {BotAccessDeniedError, type CollabBot, ReadOnlyError,} from "./bot/CollabBot";
 import {logError, logInfo, logWarn} from "./logger";
-import {type ArrangeOptions, BOUND_TEXT_PADDING, measureText, ROLE_NAMES, wrapText,} from "./verify";
-import {DIAGRAM_GUIDE, PALETTE_JSON} from "./guide";
+import {type ArrangeOptions, containerSizeForText, measureText, ROLE_NAMES, wrapText,} from "./verify";
+import {DIAGRAM_GUIDE, PALETTE_JSON, SERVER_README} from "./guide";
 
 import type {AccessibleBoard} from "./boards";
 import type {ExcalidrawElement} from "./types";
@@ -39,32 +39,66 @@ const elementFields = {
   roughness: z.number().optional(),
   opacity: z.number().optional(),
   text: z.string().optional(),
-  fontSize: z.number().optional(),
-  fontFamily: z.number().optional(),
+  fontSize: z
+    .number()
+    .optional()
+    .describe(
+      "Font size. Alongside `label` it styles the LABEL (a container has no text of its own), not the shape.",
+    ),
+  fontFamily: z
+    .number()
+    .optional()
+    .describe("Font family id. Alongside `label` it styles the LABEL."),
   textAlign: z.string().optional(),
   verticalAlign: z.string().optional(),
   points: z
     .array(z.tuple([z.number(), z.number()]))
     .optional()
     .describe(
-      "line/arrow vertices relative to x,y. Omit and a line/arrow is auto-built as a 2-point segment from width/height (so it is never zero-length).",
+      "line/arrow vertices relative to x,y. Omit and a line/arrow is auto-built as a 2-point segment from width/height (so it is never zero-length). Never use `points` to draw an arrow between two shapes — use fromId/toId (+ `waypoints`/`route` to detour), or the arrow will not stay attached.",
+    ),
+  waypoints: z
+    .array(z.tuple([z.number(), z.number()]))
+    .optional()
+    .describe(
+      "Absolute scene points a fromId/toId arrow must pass through. Bindings are preserved, so you can route around an obstacle without giving up attachment. Fixes `arrow_crosses_element`.",
+    ),
+  route: z
+    .enum(["direct", "orthogonal"])
+    .optional()
+    .describe(
+      "Path shape for a fromId/toId arrow: direct (default) or orthogonal (server-computed elbow). Bindings are preserved.",
+    ),
+  lintIgnore: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Rule codes validate_scene must not report for THIS element, e.g. ["arrow_unbound_endpoint"]. Use "isolated" to drop it from graph.isolated (legend boxes). Persisted in customData. Prefer this over the board-wide disabledRules.',
     ),
   containerId: z
     .string()
     .optional()
     .describe(
-      "Bind this text to a container shape: it is centered, auto-sized and moves with the container, and is excluded from overlap warnings.",
+      "Bind this text to a container shape or arrow: it is centered, auto-sized and moves with the container, and is excluded from overlap warnings.",
     ),
   label: z
     .string()
     .optional()
     .describe(
-      "On rectangle/ellipse/diamond: also create a bound text label inside the shape in the same call.",
+      "On rectangle/ellipse/diamond/arrow: also create a bound text label inside the shape in the same call. `fontSize`/`fontFamily`/`labelColor` on the same item style this label. The created text id comes back in the response `labels` map.",
     ),
   labelColor: z
     .string()
     .optional()
     .describe("Stroke color for the bound text created via `label`."),
+  labelFontSize: z
+    .number()
+    .optional()
+    .describe("Font size for the bound text created via `label`; overrides `fontSize`."),
+  labelFontFamily: z
+    .number()
+    .optional()
+    .describe("Font family for the bound text created via `label`; overrides `fontFamily`."),
   frameId: z
     .string()
     .nullable()
@@ -88,6 +122,23 @@ const elementFields = {
     .describe("Binding mode for a fromId/toId arrow (default orbit)."),
   startArrowhead: z.string().nullable().optional(),
   endArrowhead: z.string().nullable().optional(),
+  fileId: z
+    .string()
+    .optional()
+    .describe(
+      "On an image element: id returned by upload_file. The element gets status \"saved\" and scale [1,1] automatically.",
+    ),
+};
+
+const uploadFileShape = {
+  ...boardIdShape,
+  data: z
+    .string()
+    .describe("File content: base64 bytes or a full data URL (data:image/png;base64,...)."),
+  mimeType: z
+    .string()
+    .optional()
+    .describe("Required when `data` is bare base64; inferred from a data URL otherwise."),
 };
 
 const projectionShape = {
@@ -250,6 +301,12 @@ const measureShape = {
   fontSize: z.number().optional(),
   fontFamily: z.number().optional(),
   maxWidth: z.number().optional(),
+  containerType: z
+    .enum(["rectangle", "diamond", "ellipse"])
+    .optional()
+    .describe(
+      "Shape the text will live in (default rectangle). A diamond/ellipse inscribes its label, so it needs a much bigger box for the same text — `recommendedContainer` accounts for that.",
+    ),
 };
 
 const boundsShape = {
@@ -309,6 +366,16 @@ const connectShape = {
   mode: z.enum(["inside", "orbit", "skip"]).optional(),
   startArrowhead: z.string().nullable().optional(),
   endArrowhead: z.string().nullable().optional(),
+  waypoints: z
+    .array(z.tuple([z.number(), z.number()]))
+    .optional()
+    .describe(
+      "Absolute scene points the arrow must pass through; both bindings are preserved.",
+    ),
+  route: z
+    .enum(["direct", "orthogonal"])
+    .optional()
+    .describe("direct (default) or orthogonal elbow routing; bindings are preserved."),
 };
 
 const batchCreateShape = {
@@ -519,11 +586,12 @@ const SERVER_INSTRUCTIONS = `Excalidraw drawing tools for shared team boards.
 
 When asked for a diagram or visualization, draw it HERE on a shared board — never produce local .excalidraw/PNG files (they live outside the board; the team can't see or edit them).
 
-Before the FIRST diagram of a session, call get_diagram_guide (style roles, palette, workflow, worked example).
+Before the FIRST write of a session, call read_me (data model, contracts, gotchas). Before the FIRST diagram, also call get_diagram_guide (style roles, palette, workflow, worked example).
 
 Creating content:
 - Graph-shaped diagrams (flowcharts, architectures, pipelines, dependency maps): use create_diagram — you pass nodes + edges + direction, the server computes the layout. Do not hand-compute coordinates for graphs.
-- Free-form visuals: batch_create with \`label\` for text inside shapes (never a standalone text element over a shape) and \`fromId\`/\`toId\` for arrows (never manual points between shapes). Size containers with measure_text.
+- Free-form visuals: batch_create with \`label\` for text inside shapes (never a standalone text element over a shape) and \`fromId\`/\`toId\` for arrows (never manual points between shapes). Size containers with measure_text — pass \`containerType\` for diamonds/ellipses.
+- To route an arrow around an obstacle, keep \`fromId\`/\`toId\` and add \`waypoints\` or \`route:"orthogonal"\` — dropping to manual \`points\` loses the binding.
 - Colors: set \`role\` (process, decision, terminal, error, external, accent, note, neutral) instead of inventing hex values.
 
 After EVERY write: render_region the changed area, look at the image, validate_scene the changed ids, apply each finding's \`suggestion\` (ready-to-use dx/dy, width/height, strokeColor, patch), re-render. 2-3 passes is normal. Never finish with unresolved errors.
@@ -568,6 +636,32 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     },
     async (uri) => ({
       contents: [{ uri: uri.href, mimeType: "application/json", text: PALETTE_JSON }],
+    }),
+  );
+
+  server.registerTool(
+    "read_me",
+    {
+      description:
+        "REQUIRED before the first write of a session: the mechanical contract of this server — which tool to reach for, how bound labels and their fonts work, why a diamond needs a bigger box than its text, how to route an arrow around an obstacle without losing its binding, what delete cleans up, how to silence one lint rule on one element, and the full rule-code list. Cheap and static; call once. Style advice lives in get_diagram_guide.",
+      inputSchema: {},
+    },
+    async () => ({
+      content: [{ type: "text" as const, text: SERVER_README }],
+    }),
+  );
+
+  server.registerResource(
+    "server-readme",
+    "guide://excalidraw-team/README.md",
+    {
+      title: "Data model, contracts and gotchas",
+      description:
+        "Tool selection, bound labels, inscribed containers, arrow routing, delete semantics, lint opt-out, rule codes.",
+      mimeType: "text/markdown",
+    },
+    async (uri) => ({
+      contents: [{ uri: uri.href, mimeType: "text/markdown", text: SERVER_README }],
     }),
   );
 
@@ -636,7 +730,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "update_elements",
     {
       description:
-        "Update many elements in a single commit. Each item is { id, ...fields }. Patch a container with { id, label:\"...\" } to edit (or add) its bound-text label without knowing the text's id — the label is re-laid out inside the box. An explicit `index` (fractional key) is honored, so this also re-stacks elements. Missing/already-deleted ids are skipped and listed in `missing` rather than aborting the batch — the valid patches still commit atomically. Standalone text auto-resizes to its new content unless an explicit width+height is given. Use return:\"ids\" to keep the response small. Bot write access required.",
+        "Update many elements in a single commit. Each item is { id, ...fields }. Patch a container (or arrow) with { id, label:\"...\" } to edit (or add) its bound-text label without knowing the text's id — the label is re-laid out inside the box. Patch a bound arrow with { id, waypoints:[[x,y]] } or { id, route:\"orthogonal\" } to reroute it around an obstacle while both bindings survive; its label follows. Set `lintIgnore` to silence rules on one element. An explicit `index` (fractional key) is honored, so this also re-stacks elements. Missing/already-deleted ids are skipped and listed in `missing` rather than aborting the batch — the valid patches still commit atomically. Standalone text auto-resizes to its new content unless an explicit width+height is given. Any label created on the way back comes back in the `labels` map. Use return:\"ids\" to keep the response small. Bot write access required.",
       inputSchema: updateElementsShape,
     },
     async (args) =>
@@ -655,7 +749,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "delete_elements",
     {
       description:
-        "Delete many elements in a single commit, by ids or by groupId (whole group). Bound text is removed with its container. Bot write access required.",
+        "Delete many elements in a single commit, by ids or by groupId (whole group). Bound text is removed with its container, and every survivor is detached: boundElements back-references to the deleted ids are stripped and arrow bindings that pointed at them are nulled, so no binding_backref_missing / arrow_dangling_binding is left behind. Returns `deleted` and `detached` ids. Bot write access required.",
       inputSchema: deleteElementsShape,
     },
     async (args) =>
@@ -669,7 +763,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "delete_region",
     {
       description:
-        "Delete every element inside a scene-coordinate rectangle (mode intersect|contain), optionally filtered by type. Useful for \"erase the old drawing then redraw\". Bot write access required.",
+        "Delete every element inside a scene-coordinate rectangle (mode intersect|contain), optionally filtered by type. Survivors are detached from the deleted elements exactly as in delete_elements. Useful for \"erase the old drawing then redraw\". Bot write access required.",
       inputSchema: deleteRegionShape,
     },
     async (args) =>
@@ -686,7 +780,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "validate_scene",
     {
       description:
-        "Run the deterministic self-review lint over a board: overlaps, text overflow, broken/unbound arrow bindings, occlusion, duplicates, alignment, contrast and style issues. Scope it with ids/region and trim it with codes/minSeverity/summaryOnly to keep the response small on big or shared boards. Returns findings with element ids and machine-actionable suggestions, plus a connectivity graph.",
+        "Run the deterministic self-review lint over a board: overlaps, text overflow, arrows crossing shapes, broken/unbound arrow bindings, occlusion, duplicates, alignment, contrast and style issues. Scope it with ids/region and trim it with codes/minSeverity/summaryOnly to keep the response small on big or shared boards. Returns findings with element ids and machine-actionable suggestions, plus a connectivity graph. To silence a rule for one deliberate exception set `lintIgnore` on that element instead of the board-wide `disabledRules`.",
       inputSchema: validateShape,
     },
     async (args) =>
@@ -706,12 +800,13 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "measure_text",
     {
       description:
-        "Measure wrapped text width/height for a font (and the container size needed to fit it) without touching a board. Use before creating text so containers are sized correctly.",
+        "Measure wrapped text width/height for a font (and the container size needed to fit it) without touching a board. Pass `containerType` so a diamond/ellipse gets a box that actually fits its inscribed label. Use before creating text so containers are sized correctly.",
       inputSchema: measureShape,
     },
     async (args) =>
       runTool("measure_text", async () => {
         const fontSize = args.fontSize ?? 20;
+        const containerType = args.containerType ?? "rectangle";
         const wrapped =
           typeof args.maxWidth === "number"
             ? wrapText(args.text, fontSize, args.fontFamily, args.maxWidth)
@@ -722,10 +817,12 @@ export function buildMcpServer(ctx: McpContext): McpServer {
           height: Math.ceil(measured.height),
           lineCount: measured.lineCount,
           ...(wrapped !== args.text ? { wrappedText: wrapped } : {}),
-          recommendedContainer: {
-            width: Math.ceil(measured.width) + BOUND_TEXT_PADDING * 2,
-            height: Math.ceil(measured.height) + BOUND_TEXT_PADDING * 2,
-          },
+          containerType,
+          recommendedContainer: containerSizeForText(
+            containerType,
+            Math.ceil(measured.width),
+            Math.ceil(measured.height),
+          ),
         };
       }),
   );
@@ -896,7 +993,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "connect",
     {
       description:
-        "Create an arrow that is properly bound between two shapes (sets FixedPointBinding on both ends and the boundElements back-references) so it stays attached when the shapes move. Bot write access required.",
+        "Create an arrow that is properly bound between two shapes (sets FixedPointBinding on both ends and the boundElements back-references) so it stays attached when the shapes move. Use `waypoints` or `route:\"orthogonal\"` to steer it around an obstacle without losing the binding. Bot write access required.",
       inputSchema: connectShape,
     },
     async (args) =>
@@ -907,6 +1004,8 @@ export function buildMcpServer(ctx: McpContext): McpServer {
             mode: args.mode,
             startArrowhead: args.startArrowhead,
             endArrowhead: args.endArrowhead,
+            waypoints: args.waypoints,
+            route: args.route,
           }),
         );
       }),
@@ -916,7 +1015,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "batch_create",
     {
       description:
-        "Create multiple elements in a single commit (one broadcast/persist). For a NEW diagram call get_diagram_guide first, and prefer create_diagram for graph-shaped content (it computes the layout for you). Supports semantic `role` styling, bound text (containerId / label), line/arrow points, `frameId` to drop an element straight into an existing frame, and arrows bound to shapes via `fromId`/`toId` (bound at creation — no per-arrow connect round-trips, and the shapes stay attached when moved). Returns the created elements (or just ids with return:\"ids\") plus inline lint warnings computed at commit time and any `conflicts`. The bot keeps ownership of the created ids and re-asserts them if a concurrent human session deletes them. Bot write access required.",
+        "Create multiple elements in a single commit (one broadcast/persist). For a NEW diagram call get_diagram_guide first, and prefer create_diagram for graph-shaped content (it computes the layout for you). Supports semantic `role` styling, bound text (containerId / label), line/arrow points, `frameId` to drop an element straight into an existing frame, and arrows bound to shapes via `fromId`/`toId` (bound at creation — no per-arrow connect round-trips, and the shapes stay attached when moved). Returns the created elements (or just ids with return:\"ids\"), a `labels` map of containerId → bound-text id, plus inline lint warnings computed at commit time and any `conflicts`. The bot keeps ownership of the created ids and re-asserts them if a concurrent human session deletes them. Bot write access required.",
       inputSchema: batchCreateShape,
     },
     async (args) =>
@@ -932,10 +1031,24 @@ export function buildMcpServer(ctx: McpContext): McpServer {
   );
 
   server.registerTool(
+    "upload_file",
+    {
+      description:
+        "Upload an image to the board's file storage (encrypted with the room key, same format as browser uploads — every collaborator can load it). Returns `fileId`; place it with batch_create {type:\"image\", fileId, x, y, width, height}. The id is content-addressed (sha1), so re-uploading the same bytes reuses the stored file. Max 4 MiB; image mime types only. Bot write access required.",
+      inputSchema: uploadFileShape,
+    },
+    async (args) =>
+      runTool("upload_file", async () => {
+        const bot = await ctx.resolveBot(args.boardId);
+        return bot.uploadFile({ data: args.data, mimeType: args.mimeType });
+      }),
+  );
+
+  server.registerTool(
     "create_diagram",
     {
       description:
-        "PREFERRED way to draw any graph-shaped diagram (flowchart, architecture, pipeline, dependency map): pass nodes + edges + direction and the server computes the whole layout (ELK layered — no overlaps, clean layers, routed spacing), sizes nodes to their labels, applies semantic role colors and creates everything with bound labels and bound arrows in one commit. Never hand-compute coordinates for graph content. Returns the created elements, a `nodes` map (your node id → element id) and the diagram `bounds` for render_region. Call get_diagram_guide first for roles and a worked example. Bot write access required.",
+        "PREFERRED way to draw any graph-shaped diagram (flowchart, architecture, pipeline, dependency map): pass nodes + edges + direction and the server computes the whole layout (ELK layered — no overlaps, clean layers, routed spacing), sizes nodes to their labels, applies semantic role colors and creates everything with bound labels and bound arrows in one commit. Never hand-compute coordinates for graph content. Returns the created elements, a `nodes` map (your node id → element id), a `labels` map (element id → its bound-text id) and the diagram `bounds` for render_region. Call get_diagram_guide first for roles and a worked example. Bot write access required.",
       inputSchema: createDiagramShape,
     },
     async (args) =>

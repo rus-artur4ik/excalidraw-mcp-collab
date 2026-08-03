@@ -74,3 +74,72 @@ export const PALETTE_JSON = JSON.stringify(
   null,
   2,
 );
+
+export const SERVER_README = `# excalidraw-team: data model, contracts and gotchas
+
+Style and layout advice lives in \`get_diagram_guide\`. This is the mechanical contract.
+
+## Which tool
+
+| You want | Call |
+|---|---|
+| flowchart / architecture / pipeline / dependency map | \`create_diagram\` (server lays it out) |
+| free-form shapes, legends, annotations | \`batch_create\` |
+| one arrow between two existing shapes | \`connect\` |
+| change anything that already exists | \`update_elements\` |
+| look at the result | \`render_region\` / \`render_scene\` |
+| prove the result | \`validate_scene\` |
+
+## Text lives inside shapes, never on top of them
+
+- \`batch_create [{type:"rectangle", label:"Ready"}]\` creates the box **and** a bound text element.
+- A standalone \`text\` element positioned over a shape is a defect: it does not move, wrap or delete with the shape.
+- Next to a \`label\`, **\`fontSize\`/\`fontFamily\`/\`textAlign\`/\`verticalAlign\` describe the label**, not the box (a box has no text of its own). \`labelFontSize\`/\`labelFontFamily\` override them explicitly.
+- \`batch_create\` and \`create_diagram\` return a \`labels\` map (\`{containerId: textElementId}\`) — no follow-up \`query_elements\` needed to patch a label.
+- To edit a label later: \`update_elements [{id: containerId, label:"New"}]\`. You never need the text id.
+- Arrows take \`label\` too; the text binds to the arrow and rides along.
+
+## A diamond is not its bounding box
+
+A label is **inscribed**, so the usable area is smaller than the shape:
+
+| shape | usable width | usable height |
+|---|---|---|
+| rectangle | \`w - 10\` | \`h - 10\` |
+| ellipse | \`w/√2 - 10\` | \`h/√2 - 10\` |
+| diamond | \`w/2 - 10\` | \`h/2 - 10\` |
+
+Pass \`containerType\` to \`measure_text\` and its \`recommendedContainer\` accounts for this. A \`text_overflow\` finding names the axis that actually failed (WIDE vs TALL) and its \`suggestion.alternative\` carries the largest \`fontSize\` that fits the current box.
+
+## Arrows: bind, then route
+
+- \`fromId\`/\`toId\` bind both ends (FixedPointBinding + \`boundElements\` back-references). Bound arrows follow their shapes.
+- Hand-written \`points\` between two shapes is a defect: no binding, and the arrow detaches on the first move.
+- To avoid an obstacle **without losing the binding**, keep \`fromId\`/\`toId\` and add either:
+  - \`waypoints: [[x,y], ...]\` — absolute scene coordinates the path must pass through, or
+  - \`route: "orthogonal"\` — server-computed elbow path.
+  Both work on \`batch_create\`, \`connect\` and \`update_elements\`.
+- \`arrow_crosses_element\` fires when a path cuts through a shape; its \`suggestion.waypoints\` is a ready-to-apply detour.
+
+## Deleting is safe
+
+\`delete_elements\` / \`delete_region\` cascade to bound text, strip \`boundElements\` back-references from survivors and null out bindings that pointed at the deleted element. The response reports both \`deleted\` and \`detached\` ids. No \`binding_backref_missing\` is left behind.
+
+## Silencing a rule you meant to break
+
+- Per element: \`lintIgnore: ["arrow_unbound_endpoint"]\` on create or update. It is stored in \`customData\` and survives reload.
+- \`lintIgnore: ["isolated"]\` also drops the element from \`validate_scene\`'s \`graph.isolated\` (use it for legend boxes).
+- \`disabledRules\` on \`validate_scene\` is board-wide — prefer the per-element opt-out so real defects still surface.
+
+## Colors
+
+Set \`role\` instead of hex. \`low_contrast\` suggests the nearest passing shade **of the same hue**, so a green label stays green — apply \`suggestion.strokeColor\` verbatim.
+
+## Rule codes
+
+\`text_overflow\`, \`overlap\`, \`occlusion\`, \`duplicate\`, \`alignment_near_miss\`, \`low_contrast\`, \`arrow_crosses_element\`, \`arrow_unbound_endpoint\`, \`arrow_dangling_binding\`, \`arrow_zero_length\`, \`binding_backref_missing\`, \`binding_invalid\`, \`bound_text_below_container\`, \`degenerate_size\`, \`empty_text\`, \`invalid_enum\`, \`out_of_range\`, \`invisible_opacity\`, \`off_canvas_outlier\`, \`style_many_fonts\`, \`style_many_stroke_colors\`.
+
+## The loop
+
+write → \`render_region\` the changed area → look → \`validate_scene\` scoped to the changed ids → apply each \`suggestion\` → re-render. Writes already return inline \`warnings\`; act on them before rendering. Never finish with unresolved errors.
+`;

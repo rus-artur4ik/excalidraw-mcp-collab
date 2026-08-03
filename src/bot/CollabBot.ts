@@ -5,6 +5,12 @@ import {io, type Socket} from "socket.io-client";
 import {config} from "../config";
 import {auth, db} from "../firebase";
 import {getBot} from "../bots";
+import {
+  encodeBinaryFile,
+  fileIdForBytes,
+  parseUploadData,
+  writeRoomFile,
+} from "../binaryFiles";
 import {decryptJSON, encryptJSON} from "../encryption";
 import {appendSceneHistory, getSceneVersion, loadScene, persistScene,} from "../scene";
 import {
@@ -12,6 +18,7 @@ import {
   bottomFractionalIndex,
   buildNewElement,
   type CreateAttrs,
+  detachDeleted,
   markDeleted,
   planCreations,
   planReorder,
@@ -21,6 +28,7 @@ import {type ConflictKind, decideIncoming} from "../reconcile";
 import {
   type ArrangeOptions,
   arrangePositions,
+  asLinear,
   asText,
   type Bounds,
   CONTAINER_TYPES,
@@ -31,15 +39,19 @@ import {
   getCommonBounds,
   getElementBounds,
   isBindable,
+  isLinear,
   layoutBoundText,
   layoutText,
   lintElement,
   type LintFinding,
   lintScene,
   type LintScopeOptions,
+  planArrowPath,
   planConnection,
   planDiagram,
   type RenderOptions,
+  reshapeArrowPath,
+  type RouteMode,
   renderSvg,
   svgToPngBase64,
 } from "../verify";
@@ -191,6 +203,7 @@ export class CollabBot {
     opts: { returnIds?: boolean } = {},
   ): Promise<{
     created: ExcalidrawElement[] | string[];
+    labels: Record<string, string>;
     nodes: Record<string, string>;
     bounds: { x: number; y: number; width: number; height: number };
     sceneVersion: number;
@@ -544,6 +557,7 @@ export class CollabBot {
     opts: { returnIds?: boolean } = {},
   ): Promise<{
     updated: ExcalidrawElement[] | string[];
+    labels: Record<string, string>;
     missing: string[];
     sceneVersion: number;
     warnings: LintFinding[];
@@ -551,6 +565,7 @@ export class CollabBot {
     this.requireEditor();
     await this.ensureConnected();
     const { updates, creations } = this.splitLabelPatches(patches);
+    let labels: Record<string, string> = {};
 
     const finalById = new Map<string, ExcalidrawElement>();
     // Apply plain patches first so a container resized in the same call is at its
@@ -562,9 +577,15 @@ export class CollabBot {
         missing.push(id);
         continue;
       }
-      const next = applyUpdate(current, this.withTextSizing(current, patch));
+      const { patch: routed, rerouted } = this.withArrowRouting(current, patch);
+      const next = applyUpdate(current, this.withTextSizing(current, routed));
       this.elements.set(id, next);
       finalById.set(id, next);
+      const relabelled = rerouted ? this.relayoutBoundText(next) : undefined;
+      if (relabelled) {
+        this.elements.set(relabelled.id, relabelled);
+        finalById.set(relabelled.id, relabelled);
+      }
     }
 
     if (creations.length) {
@@ -578,6 +599,7 @@ export class CollabBot {
         finalById.set(element.id, element);
       }
       this.claimOwnership(plan.created);
+      labels = plan.labels;
     }
 
     const changed = [...finalById.values()];
@@ -588,6 +610,7 @@ export class CollabBot {
     const live = this.liveElements();
     return {
       updated: opts.returnIds ? changed.map((element) => element.id) : changed,
+      labels,
       missing,
       sceneVersion: this.currentSceneVersion(),
       warnings: changed.flatMap((element) => lintElement(element, live)),
@@ -680,13 +703,14 @@ export class CollabBot {
     opts: { returnIds?: boolean } = {},
   ): Promise<{
     created: ExcalidrawElement[] | string[];
+    labels: Record<string, string>;
     sceneVersion: number;
     warnings: LintFinding[];
     conflicts: ConflictRecord[];
   }> {
     this.requireEditor();
     await this.ensureConnected();
-    const { created, containerUpdates } = planCreations(items, [
+    const { created, containerUpdates, labels } = planCreations(items, [
       ...this.elements.values(),
     ]);
     await this.commitCreations(created, containerUpdates, { select: true });
@@ -694,6 +718,7 @@ export class CollabBot {
     const warnings = created.flatMap((element) => lintElement(element, live));
     return {
       created: opts.returnIds ? created.map((element) => element.id) : created,
+      labels,
       sceneVersion: this.currentSceneVersion(),
       warnings,
       conflicts: this.conflictsFor(created.map((element) => element.id)),
@@ -783,6 +808,25 @@ export class CollabBot {
     if (this.role !== "editor") {
       throw new ReadOnlyError();
     }
+  }
+
+  async uploadFile(input: {
+    data: string;
+    mimeType?: string;
+  }): Promise<{ fileId: string; size: number; mimeType: string; reused: boolean }> {
+    this.requireEditor();
+    await this.ensureConnected();
+    const { bytes, mimeType } = parseUploadData(input.data, input.mimeType);
+    const fileId = fileIdForBytes(bytes);
+    const now = Date.now();
+    const dataURL = `data:${mimeType};base64,${bytes.toString("base64")}`;
+    const encoded = await encodeBinaryFile(
+      dataURL,
+      { id: fileId, mimeType, created: now, lastRetrieved: now },
+      this.roomKey,
+    );
+    const { reused } = await writeRoomFile(this.boardId, fileId, encoded);
+    return { fileId, size: bytes.length, mimeType, reused };
   }
 
   async ungroupElements(selector: {
@@ -969,7 +1013,11 @@ export class CollabBot {
         labelColor?: string;
       } & Partial<ExcalidrawElement>;
       const container = this.elements.get(patch.id);
-      if (!container || container.isDeleted || !CONTAINER_TYPES.has(container.type)) {
+      const labellable =
+        !!container &&
+        !container.isDeleted &&
+        (CONTAINER_TYPES.has(container.type) || isLinear(container));
+      if (!container || !labellable) {
         // Not a text container: a label has nowhere to go. Forward the rest so
         // the real fields still apply, but drop the stray `label`/`labelColor`.
         if (Object.keys(rest).some((key) => key !== "id")) {
@@ -1066,6 +1114,8 @@ export class CollabBot {
       mode?: "inside" | "orbit" | "skip";
       startArrowhead?: string | null;
       endArrowhead?: string | null;
+      waypoints?: [number, number][];
+      route?: RouteMode;
     } = {},
   ): Promise<ElementWriteResult> {
     this.requireEditor();
@@ -1091,6 +1141,8 @@ export class CollabBot {
       mode: options.mode,
       startArrowhead: options.startArrowhead,
       endArrowhead: options.endArrowhead,
+      waypoints: options.waypoints,
+      route: options.route,
     });
     const arrow = buildNewElement(
       { ...plan.arrow, id: arrowId },
@@ -1129,6 +1181,75 @@ export class CollabBot {
       owned: this.ownedIds.has(arrowId),
       conflicts: this.conflictsFor([arrowId]),
     };
+  }
+
+  private withArrowRouting(
+    current: ExcalidrawElement,
+    patch: Partial<ExcalidrawElement>,
+  ): { patch: Partial<ExcalidrawElement>; rerouted: boolean } {
+    const { waypoints, route, ...rest } = patch as Partial<ExcalidrawElement> & {
+      waypoints?: [number, number][];
+      route?: RouteMode;
+    };
+    if (waypoints === undefined && route === undefined) {
+      return { patch, rerouted: false };
+    }
+    if (!isLinear(current)) {
+      return { patch: rest, rerouted: false };
+    }
+    const linear = asLinear(current);
+    const from = linear.startBinding
+      ? this.elements.get(linear.startBinding.elementId)
+      : undefined;
+    const to = linear.endBinding
+      ? this.elements.get(linear.endBinding.elementId)
+      : undefined;
+    if (!from || from.isDeleted || !to || to.isDeleted) {
+      return {
+        patch: { ...rest, ...reshapeArrowPath(current, { waypoints, route }) },
+        rerouted: true,
+      };
+    }
+    return {
+      patch: {
+        ...rest,
+        ...planArrowPath(from, to, {
+          mode: linear.startBinding?.mode,
+          waypoints,
+          route,
+        }),
+      },
+      rerouted: true,
+    };
+  }
+
+  private relayoutBoundText(
+    container: ExcalidrawElement,
+  ): ExcalidrawElement | undefined {
+    const text = this.boundTextOf(container);
+    if (!text) {
+      return undefined;
+    }
+    const view = asText(text);
+    const verticalAlign =
+      view.verticalAlign === "top" || view.verticalAlign === "bottom"
+        ? view.verticalAlign
+        : "middle";
+    const layout = layoutBoundText(
+      container,
+      String(view.originalText ?? view.text ?? ""),
+      view.fontSize ?? DEFAULT_FONT_SIZE,
+      view.fontFamily ?? DEFAULT_FONT_FAMILY,
+      verticalAlign,
+    );
+    return applyUpdate(text, {
+      text: layout.text,
+      width: layout.width,
+      height: layout.height,
+      x: layout.x,
+      y: layout.y,
+      lineHeight: layout.lineHeight,
+    });
   }
 
   private withTextSizing(
@@ -1414,7 +1535,11 @@ export class CollabBot {
   // Deleting a container cascades to its bound text, matching the live editor.
   private async deleteResolved(
     targets: ExcalidrawElement[],
-  ): Promise<{ deleted: string[]; sceneVersion: number }> {
+  ): Promise<{
+    deleted: string[];
+    detached: string[];
+    sceneVersion: number;
+  }> {
     const ids = new Set(targets.map((element) => element.id));
     for (const element of this.liveElements()) {
       const container = asText(element).containerId;
@@ -1422,22 +1547,28 @@ export class CollabBot {
         ids.add(element.id);
       }
     }
-    const changed: ExcalidrawElement[] = [];
+    const deleted: ExcalidrawElement[] = [];
     for (const id of ids) {
       const current = this.elements.get(id);
       if (!current || current.isDeleted) {
         continue;
       }
-      const deleted = markDeleted(current);
-      this.elements.set(id, deleted);
-      changed.push(deleted);
+      const removed = markDeleted(current);
+      this.elements.set(id, removed);
+      deleted.push(removed);
     }
+    const detached = detachDeleted(this.liveElements(), ids);
+    for (const element of detached) {
+      this.elements.set(element.id, element);
+    }
+    const changed = [...deleted, ...detached];
     if (changed.length) {
       await this.commit(changed);
       this.recordWrites(changed, "bot");
     }
     return {
-      deleted: changed.map((element) => element.id),
+      deleted: deleted.map((element) => element.id),
+      detached: detached.map((element) => element.id),
       sceneVersion: this.currentSceneVersion(),
     };
   }

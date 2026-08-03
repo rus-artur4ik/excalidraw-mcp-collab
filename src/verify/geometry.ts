@@ -210,6 +210,115 @@ export const pointInElement = (
   return lx >= left && lx <= right && ly >= top && ly <= bottom;
 };
 
+type HalfPlane = { nx: number; ny: number; d: number };
+
+const halfPlanesFor = (element: ExcalidrawElement): HalfPlane[] => {
+  const width = element.width || 0;
+  const height = element.height || 0;
+  const left = element.x;
+  const top = element.y;
+  if (element.type === "diamond") {
+    const halfW = width / 2;
+    const halfH = height / 2;
+    const cx = left + halfW;
+    const cy = top + halfH;
+    const planes: HalfPlane[] = [];
+    for (const sx of [1, -1]) {
+      for (const sy of [1, -1]) {
+        const nx = sx / halfW;
+        const ny = sy / halfH;
+        planes.push({ nx, ny, d: 1 + nx * cx + ny * cy });
+      }
+    }
+    return planes;
+  }
+  return [
+    { nx: 1, ny: 0, d: left + width },
+    { nx: -1, ny: 0, d: -left },
+    { nx: 0, ny: 1, d: top + height },
+    { nx: 0, ny: -1, d: -top },
+  ];
+};
+
+const clipToHalfPlanes = (
+  planes: readonly HalfPlane[],
+  a: Point,
+  b: Point,
+): [number, number] | null => {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  let enter = 0;
+  let exit = 1;
+  for (const { nx, ny, d } of planes) {
+    const denominator = nx * dx + ny * dy;
+    const numerator = d - (nx * a[0] + ny * a[1]);
+    if (Math.abs(denominator) < 1e-12) {
+      if (numerator < 0) {
+        return null;
+      }
+      continue;
+    }
+    const t = numerator / denominator;
+    if (denominator > 0) {
+      exit = Math.min(exit, t);
+    } else {
+      enter = Math.max(enter, t);
+    }
+  }
+  return enter < exit ? [enter, exit] : null;
+};
+
+const clipToEllipse = (
+  element: ExcalidrawElement,
+  a: Point,
+  b: Point,
+): [number, number] | null => {
+  const rx = (element.width || 0) / 2;
+  const ry = (element.height || 0) / 2;
+  const cx = element.x + rx;
+  const cy = element.y + ry;
+  const ax = (a[0] - cx) / rx;
+  const ay = (a[1] - cy) / ry;
+  const dx = (b[0] - cx) / rx - ax;
+  const dy = (b[1] - cy) / ry - ay;
+  const qa = dx * dx + dy * dy;
+  const qb = 2 * (ax * dx + ay * dy);
+  const qc = ax * ax + ay * ay - 1;
+  if (qa < 1e-12) {
+    return qc <= 0 ? [0, 1] : null;
+  }
+  const discriminant = qb * qb - 4 * qa * qc;
+  if (discriminant <= 0) {
+    return null;
+  }
+  const root = Math.sqrt(discriminant);
+  const enter = Math.max(0, (-qb - root) / (2 * qa));
+  const exit = Math.min(1, (-qb + root) / (2 * qa));
+  return enter < exit ? [enter, exit] : null;
+};
+
+// Length of the part of segment a→b that runs inside the element, in scene units.
+export const segmentElementOverlap = (
+  element: ExcalidrawElement,
+  a: Point,
+  b: Point,
+): number => {
+  if ((element.width || 0) <= 0 || (element.height || 0) <= 0) {
+    return 0;
+  }
+  const span = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  if (span === 0) {
+    return 0;
+  }
+  const localA = unrotateToLocal(element, a[0], a[1]);
+  const localB = unrotateToLocal(element, b[0], b[1]);
+  const range =
+    element.type === "ellipse"
+      ? clipToEllipse(element, localA, localB)
+      : clipToHalfPlanes(halfPlanesFor(element), localA, localB);
+  return range ? (range[1] - range[0]) * span : 0;
+};
+
 export const distanceToElement = (
   element: ExcalidrawElement,
   x: number,

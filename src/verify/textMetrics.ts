@@ -5,9 +5,11 @@ import {
     BOUND_TEXT_PADDING,
     DEFAULT_FONT_FAMILY,
     DEFAULT_FONT_SIZE,
+    isLinear,
     lineHeightForFamily,
     MONOSPACE_FAMILIES,
 } from "./model";
+import {getElementBounds} from "./geometry";
 import type {ExcalidrawElement} from "../types";
 
 const ADVANCE_PER_MILLE: Record<string, number> = {
@@ -293,6 +295,25 @@ export type BoundTextLayout = TextLayout & {
   containerHeight: number;
 };
 
+const layoutLinearLabel = (
+  container: ExcalidrawElement,
+  wrapped: string,
+  width: number,
+  height: number,
+  fontFamily: number,
+): BoundTextLayout => {
+  const [minX, minY, maxX, maxY] = getElementBounds(container);
+  return {
+    width,
+    height,
+    lineHeight: lineHeightForFamily(fontFamily),
+    text: wrapped,
+    x: (minX + maxX) / 2 - width / 2,
+    y: (minY + maxY) / 2 - height / 2,
+    containerHeight: container.height || 0,
+  };
+};
+
 export const layoutBoundText = (
   container: ExcalidrawElement,
   text: string,
@@ -305,6 +326,9 @@ export const layoutBoundText = (
   const measured = measureText(wrapped, fontSize, fontFamily);
   const width = Math.min(Math.ceil(measured.width), Math.floor(maxWidth));
   const height = Math.ceil(measured.height);
+  if (isLinear(container)) {
+    return layoutLinearLabel(container, wrapped, width, height, fontFamily);
+  }
   const containerHeight = Math.max(
     container.height || 0,
     height + BOUND_TEXT_PADDING * 2,
@@ -342,4 +366,113 @@ export const getBoundTextMaxHeight = (
     default:
       return height - BOUND_TEXT_PADDING * 2;
   }
+};
+
+export const OVERFLOW_EPSILON = 1;
+
+export const MIN_LABEL_FONT_SIZE = 8;
+
+// Inverse of getBoundTextMaxWidth/Height: an inscribed shape needs a bigger box
+// than its usable label area, so a diamond fitting 190px of text is 400px wide.
+const CONTAINER_SHAPE_FACTOR: Record<string, number> = {
+  ellipse: SQRT2,
+  diamond: 2,
+};
+
+export const containerSizeForText = (
+  containerType: string,
+  textWidth: number,
+  textHeight: number,
+): { width: number; height: number } => {
+  const factor = CONTAINER_SHAPE_FACTOR[containerType] ?? 1;
+  return {
+    width: Math.ceil((textWidth + BOUND_TEXT_PADDING * 2) * factor),
+    height: Math.ceil((textHeight + BOUND_TEXT_PADDING * 2) * factor),
+  };
+};
+
+export type ContainerTextFit = {
+  usableWidth: number;
+  usableHeight: number;
+  textWidth: number;
+  textHeight: number;
+  widthOverflow: boolean;
+  heightOverflow: boolean;
+  fittedWidth: number;
+  fittedHeight: number;
+};
+
+export const fitTextToContainer = (
+  container: ExcalidrawElement,
+  text: string,
+  fontSize: number = DEFAULT_FONT_SIZE,
+  fontFamily: number = DEFAULT_FONT_FAMILY,
+): ContainerTextFit => {
+  const linear = isLinear(container);
+  const usableWidth = getBoundTextMaxWidth(container, fontSize);
+  const usableHeight = linear ? Infinity : getBoundTextMaxHeight(container);
+  const measured = measureText(
+    wrapText(text, fontSize, fontFamily, usableWidth),
+    fontSize,
+    fontFamily,
+  );
+  const widthOverflow = measured.width > usableWidth + OVERFLOW_EPSILON;
+  const heightOverflow =
+    !linear &&
+    usableHeight > 0 &&
+    measured.height > usableHeight + OVERFLOW_EPSILON;
+
+  const currentWidth = container.width || 0;
+  const fittedWidth = widthOverflow
+    ? Math.max(
+        currentWidth,
+        containerSizeForText(container.type, measured.width, 0).width,
+      )
+    : currentWidth;
+  // Widening rewraps the text, so height must be measured against the wider box.
+  const rewrapped =
+    fittedWidth === currentWidth
+      ? measured
+      : measureText(
+          wrapText(
+            text,
+            fontSize,
+            fontFamily,
+            getBoundTextMaxWidth({ ...container, width: fittedWidth }, fontSize),
+          ),
+          fontSize,
+          fontFamily,
+        );
+  const fittedHeight = linear
+    ? container.height || 0
+    : Math.max(
+        container.height || 0,
+        containerSizeForText(container.type, 0, rewrapped.height).height,
+      );
+
+  return {
+    usableWidth: Math.round(usableWidth),
+    usableHeight: linear ? Infinity : Math.round(usableHeight),
+    textWidth: Math.ceil(measured.width),
+    textHeight: Math.ceil(measured.height),
+    widthOverflow,
+    heightOverflow,
+    fittedWidth: Math.ceil(fittedWidth),
+    fittedHeight: Math.ceil(fittedHeight),
+  };
+};
+
+export const largestFittingFontSize = (
+  container: ExcalidrawElement,
+  text: string,
+  fontFamily: number = DEFAULT_FONT_FAMILY,
+  maxFontSize: number = DEFAULT_FONT_SIZE,
+): number | null => {
+  for (let size = Math.floor(maxFontSize) - 1; size >= MIN_LABEL_FONT_SIZE; size--) {
+    const fit = fitTextToContainer(container, text, size, fontFamily);
+    if (!fit.widthOverflow && !fit.heightOverflow) {
+      return size;
+    }
+  }
+  return null;
 };

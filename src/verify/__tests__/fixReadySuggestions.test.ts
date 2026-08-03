@@ -56,13 +56,25 @@ describe("fix-ready suggestions", () => {
     expect(patch.x).toBe(0);
   });
 
-  it("suggestReadableColor prefers the perceptually closest passing candidate", () => {
+  it("suggestReadableColor keeps the hue and only darkens/lightens", () => {
+    const white = parseColor("#ffffff")!;
+    const green = parseColor("#2b8a3e")!;
+    const suggested = parseColor(
+      suggestReadableColor(green, white, 4.5, ["#1e1e1e", "#e03131"])!,
+    )!;
+    expect(contrastRatio(suggested, white)).toBeGreaterThanOrEqual(4.5);
+    expect(suggested.g).toBeGreaterThan(suggested.r);
+    expect(suggested.g).toBeGreaterThan(suggested.b);
+  });
+
+  it("suggestReadableColor does not turn an achromatic color into a hue", () => {
     const white = parseColor("#ffffff")!;
     const nearWhite = parseColor("#eeeeee")!;
-    const suggested = suggestReadableColor(nearWhite, white, 4.5, [
-      "#1e1e1e",
-      "#e03131",
-    ]);
-    expect(suggested).toBe("#e03131");
+    const suggested = parseColor(
+      suggestReadableColor(nearWhite, white, 4.5, ["#1e1e1e", "#e03131"])!,
+    )!;
+    expect(contrastRatio(suggested, white)).toBeGreaterThanOrEqual(4.5);
+    expect(suggested.r).toBe(suggested.g);
+    expect(suggested.g).toBe(suggested.b);
   });
 });

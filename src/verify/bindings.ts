@@ -1,6 +1,6 @@
 import type {ExcalidrawElement} from "../types";
 import {BASE_BINDING_GAP, type BindMode, CENTER_RATIO, type FixedPointBinding, type Point,} from "./model";
-import {rotatePoint} from "./geometry";
+import {globalLinearPoints, rotatePoint} from "./geometry";
 
 const center = (element: ExcalidrawElement): Point => [
   element.x + (element.width || 0) / 2,
@@ -59,11 +59,28 @@ export type ConnectionPlan = {
   toBoundElements: { id: string; type: string }[];
 };
 
-export type ConnectOptions = {
-  arrowId: string;
+export type RouteMode = "direct" | "orthogonal";
+
+export type ArrowPathOptions = {
   mode?: BindMode;
+  waypoints?: Point[];
+  route?: RouteMode;
+};
+
+export type ConnectOptions = ArrowPathOptions & {
+  arrowId: string;
   startArrowhead?: string | null;
   endArrowhead?: string | null;
+};
+
+export type ArrowPath = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  points: Point[];
+  startBinding: FixedPointBinding;
+  endBinding: FixedPointBinding;
 };
 
 const withBackref = (
@@ -79,60 +96,160 @@ const withBackref = (
   return [...existing, { id: arrowId, type: "arrow" }];
 };
 
+const AXIS_EPSILON = 1;
+
+const shiftToward = (from: Point, toward: Point, distance: number): Point => {
+  const dx = toward[0] - from[0];
+  const dy = toward[1] - from[1];
+  const length = Math.hypot(dx, dy);
+  if (length === 0) {
+    return from;
+  }
+  return [from[0] + (dx / length) * distance, from[1] + (dy / length) * distance];
+};
+
+const elbowBetween = (
+  start: Point,
+  end: Point,
+  horizontal: boolean,
+): Point[] => {
+  if (horizontal) {
+    if (Math.abs(end[1] - start[1]) <= AXIS_EPSILON) {
+      return [];
+    }
+    const midX = (start[0] + end[0]) / 2;
+    return [
+      [midX, start[1]],
+      [midX, end[1]],
+    ];
+  }
+  if (Math.abs(end[0] - start[0]) <= AXIS_EPSILON) {
+    return [];
+  }
+  const midY = (start[1] + end[1]) / 2;
+  return [
+    [start[0], midY],
+    [end[0], midY],
+  ];
+};
+
+const spanOf = (points: Point[]): { width: number; height: number } => {
+  const xs = points.map(([x]) => x);
+  const ys = points.map(([, y]) => y);
+  return {
+    width: Math.max(...xs) - Math.min(...xs),
+    height: Math.max(...ys) - Math.min(...ys),
+  };
+};
+
+export type ArrowGeometry = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  points: Point[];
+};
+
+const geometryFromGlobalPath = (globalPath: Point[]): ArrowGeometry => {
+  const [origin] = globalPath;
+  const points: Point[] = globalPath.map(([x, y]) => [x - origin[0], y - origin[1]]);
+  return { x: origin[0], y: origin[1], ...spanOf(points), points };
+};
+
+const middleFor = (
+  start: Point,
+  end: Point,
+  options: ArrowPathOptions,
+  horizontal: boolean,
+): Point[] => {
+  if (options.waypoints?.length) {
+    return options.waypoints;
+  }
+  return options.route === "orthogonal" ? elbowBetween(start, end, horizontal) : [];
+};
+
+const dominantlyHorizontal = (start: Point, end: Point): boolean =>
+  Math.abs(end[0] - start[0]) >= Math.abs(end[1] - start[1]);
+
+// Reshapes an unbound arrow in place: its own endpoints stay, the detour changes.
+export const reshapeArrowPath = (
+  arrow: ExcalidrawElement,
+  options: ArrowPathOptions,
+): ArrowGeometry => {
+  const path = globalLinearPoints(arrow);
+  const start = path[0];
+  const end = path[path.length - 1];
+  const middle = middleFor(start, end, options, dominantlyHorizontal(start, end));
+  return geometryFromGlobalPath([start, ...middle, end]);
+};
+
+export const planArrowPath = (
+  from: ExcalidrawElement,
+  to: ExcalidrawElement,
+  options: ArrowPathOptions = {},
+): ArrowPath => {
+  const mode: BindMode = options.mode ?? "orbit";
+  const waypoints = options.waypoints ?? [];
+  const centerFrom = center(from);
+  const centerTo = center(to);
+  const horizontal = dominantlyHorizontal(centerFrom, centerTo);
+  const orthogonal = options.route === "orthogonal" && waypoints.length === 0;
+
+  // An elbow leaves and enters along its own axis, not toward the opposite centre.
+  const aimFrom = waypoints[0] ?? (orthogonal
+    ? ([centerTo[0], centerFrom[1]] as Point)
+    : centerTo);
+  const aimTo = waypoints[waypoints.length - 1] ?? (orthogonal
+    ? ([centerFrom[0], centerTo[1]] as Point)
+    : centerFrom);
+
+  const contactFrom = edgePointToward(from, aimFrom);
+  const contactTo = edgePointToward(to, aimTo);
+
+  const middle = middleFor(contactFrom, contactTo, options, horizontal);
+
+  let start = shiftToward(
+    contactFrom,
+    middle[0] ?? contactTo,
+    bindingGap(from),
+  );
+  let end = shiftToward(
+    contactTo,
+    middle[middle.length - 1] ?? contactFrom,
+    bindingGap(to),
+  );
+  if (!middle.length && Math.hypot(end[0] - start[0], end[1] - start[1]) < 1) {
+    start = contactFrom;
+    end = contactTo;
+  }
+
+  return {
+    ...geometryFromGlobalPath([start, ...middle, end]),
+    startBinding: {
+      elementId: from.id,
+      fixedPoint: computeFixedPoint(from, contactFrom),
+      mode,
+    },
+    endBinding: {
+      elementId: to.id,
+      fixedPoint: computeFixedPoint(to, contactTo),
+      mode,
+    },
+  };
+};
+
 export const planConnection = (
   from: ExcalidrawElement,
   to: ExcalidrawElement,
   options: ConnectOptions,
 ): ConnectionPlan => {
-  const mode: BindMode = options.mode ?? "orbit";
-  const contactFrom = edgePointToward(from, center(to));
-  const contactTo = edgePointToward(to, center(from));
-
-  const fixedFrom = computeFixedPoint(from, contactFrom);
-  const fixedTo = computeFixedPoint(to, contactTo);
-
-  const dx = contactTo[0] - contactFrom[0];
-  const dy = contactTo[1] - contactFrom[1];
-  const length = Math.hypot(dx, dy) || 1;
-  const ux = dx / length;
-  const uy = dy / length;
-  const gapFrom = bindingGap(from);
-  const gapTo = bindingGap(to);
-
-  let start: Point = [contactFrom[0] + ux * gapFrom, contactFrom[1] + uy * gapFrom];
-  let end: Point = [contactTo[0] - ux * gapTo, contactTo[1] - uy * gapTo];
-  if (Math.hypot(end[0] - start[0], end[1] - start[1]) < 1) {
-    start = contactFrom;
-    end = contactTo;
-  }
-
-  const localEnd: Point = [end[0] - start[0], end[1] - start[1]];
-  const startBinding: FixedPointBinding = {
-    elementId: from.id,
-    fixedPoint: fixedFrom,
-    mode,
-  };
-  const endBinding: FixedPointBinding = {
-    elementId: to.id,
-    fixedPoint: fixedTo,
-    mode,
-  };
-
+  const path = planArrowPath(from, to, options);
   const arrow: Partial<ExcalidrawElement> & { type: "arrow" } = {
     type: "arrow",
-    x: start[0],
-    y: start[1],
-    width: Math.abs(localEnd[0]),
-    height: Math.abs(localEnd[1]),
-    points: [
-      [0, 0],
-      [localEnd[0], localEnd[1]],
-    ],
+    ...path,
     elbowed: false,
     startArrowhead: options.startArrowhead ?? null,
     endArrowhead: options.endArrowhead === undefined ? "arrow" : options.endArrowhead,
-    startBinding,
-    endBinding,
   } as Partial<ExcalidrawElement> & { type: "arrow" };
 
   return {

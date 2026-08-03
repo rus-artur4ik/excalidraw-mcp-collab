@@ -11,6 +11,7 @@ import {
     pixelToScene,
     pointInElement,
     sceneToPixel,
+    segmentElementOverlap,
 } from "../geometry";
 import {el} from "./factory";
 
@@ -123,5 +124,45 @@ describe("arrange", () => {
     const positions = arrangePositions([a, b], { mode: "row", gap: 10 });
     expect(positions.get(a.id)![0]).toBe(0);
     expect(positions.get(b.id)![0]).toBe(50);
+  });
+});
+
+describe("segmentElementOverlap", () => {
+  it("measures the chord of a segment cutting straight through a rectangle", () => {
+    const rect = el({ type: "rectangle", x: 100, y: 0, width: 50, height: 100 });
+    expect(segmentElementOverlap(rect, [0, 50], [300, 50])).toBeCloseTo(50, 5);
+  });
+
+  it("returns 0 for a segment passing beside the shape", () => {
+    const rect = el({ type: "rectangle", x: 100, y: 0, width: 50, height: 100 });
+    expect(segmentElementOverlap(rect, [0, 500], [300, 500])).toBe(0);
+  });
+
+  it("respects the diamond outline rather than its bounding box", () => {
+    const diamond = el({ type: "diamond", x: 0, y: 0, width: 100, height: 100 });
+    expect(segmentElementOverlap(diamond, [-10, 50], [110, 50])).toBeCloseTo(100, 5);
+    // a horizontal line 5px below the top vertex only clips a sliver
+    expect(segmentElementOverlap(diamond, [-10, 5], [110, 5])).toBeCloseTo(10, 5);
+    // the bbox corner is outside the diamond
+    expect(segmentElementOverlap(diamond, [-10, -10], [5, 5])).toBe(0);
+  });
+
+  it("respects the ellipse outline", () => {
+    const ellipse = el({ type: "ellipse", x: 0, y: 0, width: 100, height: 100 });
+    expect(segmentElementOverlap(ellipse, [-10, 50], [110, 50])).toBeCloseTo(100, 5);
+    expect(segmentElementOverlap(ellipse, [-10, 2], [110, 2])).toBeLessThan(50);
+    expect(segmentElementOverlap(ellipse, [0, 0], [1, 1])).toBe(0);
+  });
+
+  it("handles a rotated rectangle in its own frame", () => {
+    const rect = el({
+      type: "rectangle",
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 20,
+      angle: Math.PI / 2,
+    });
+    expect(segmentElementOverlap(rect, [50, -100], [50, 100])).toBeCloseTo(100, 5);
   });
 });

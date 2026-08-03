@@ -1,6 +1,16 @@
 import {describe, expect, it} from "vitest";
 
-import {getBoundTextMaxWidth, layoutBoundText, layoutText, measureText, wrapText,} from "../textMetrics";
+import {
+    containerSizeForText,
+    fitTextToContainer,
+    getBoundTextMaxHeight,
+    getBoundTextMaxWidth,
+    largestFittingFontSize,
+    layoutBoundText,
+    layoutText,
+    measureText,
+    wrapText,
+} from "../textMetrics";
 import {el} from "./factory";
 
 describe("measureText", () => {
@@ -86,5 +96,105 @@ describe("layoutBoundText", () => {
     const container = el({ type: "rectangle", x: 0, y: 0, width: 200, height: 100 });
     const bottom = layoutBoundText(container, "hi", 20, 5, "bottom");
     expect(bottom.y).toBeCloseTo(100 - bottom.height - 5, 5);
+  });
+});
+
+describe("containerSizeForText", () => {
+  it("is the exact inverse of the usable-area formula for every shape", () => {
+    for (const type of ["rectangle", "ellipse", "diamond"]) {
+      const box = containerSizeForText(type, 190, 60);
+      const container = el({ type, x: 0, y: 0, ...box });
+      expect(getBoundTextMaxWidth(container, 20)).toBeGreaterThanOrEqual(190);
+      expect(getBoundTextMaxHeight(container)).toBeGreaterThanOrEqual(60);
+    }
+  });
+
+  it("demands twice the box of a rectangle for a diamond", () => {
+    const rectangle = containerSizeForText("rectangle", 100, 40);
+    const diamond = containerSizeForText("diamond", 100, 40);
+    expect(diamond.width).toBe(rectangle.width * 2);
+    expect(diamond.height).toBe(rectangle.height * 2);
+  });
+});
+
+const DIAMOND_OVERFLOW_TEXT =
+  "one two three four five six seven eight nine ten eleven twelve";
+
+describe("fitTextToContainer", () => {
+  it("reports a diamond overflow on the height axis, not the width", () => {
+    const diamond = el({ type: "diamond", x: 0, y: 0, width: 400, height: 180 });
+    const fit = fitTextToContainer(diamond, DIAMOND_OVERFLOW_TEXT, 20, 5);
+    expect(fit.textWidth).toBeLessThanOrEqual(fit.usableWidth);
+    expect(fit.widthOverflow).toBe(false);
+    expect(fit.heightOverflow).toBe(true);
+  });
+
+  it("never proposes a fitted size that equals the current one", () => {
+    const diamond = el({ type: "diamond", x: 0, y: 0, width: 400, height: 180 });
+    const fit = fitTextToContainer(diamond, DIAMOND_OVERFLOW_TEXT, 20, 5);
+    expect(fit.fittedHeight).toBeGreaterThan(180);
+    const grown = el({ type: "diamond", x: 0, y: 0, width: 400, height: fit.fittedHeight });
+    expect(fitTextToContainer(grown, DIAMOND_OVERFLOW_TEXT, 20, 5).heightOverflow).toBe(false);
+  });
+
+  it("grows the width when a single glyph cannot fit, then rewraps before measuring height", () => {
+    const rect = el({ type: "rectangle", x: 0, y: 0, width: 14, height: 40 });
+    const fit = fitTextToContainer(rect, "Wide", 20, 5);
+    expect(fit.widthOverflow).toBe(true);
+    const grown = el({
+      type: "rectangle",
+      x: 0,
+      y: 0,
+      width: fit.fittedWidth,
+      height: fit.fittedHeight,
+    });
+    const refit = fitTextToContainer(grown, "Wide", 20, 5);
+    expect(refit.widthOverflow).toBe(false);
+    expect(refit.heightOverflow).toBe(false);
+  });
+
+  it("never reports height overflow on an arrow label", () => {
+    const arrow = el({
+      type: "arrow",
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 0,
+      points: [[0, 0], [200, 0]],
+    });
+    expect(fitTextToContainer(arrow, "yes", 20, 5).heightOverflow).toBe(false);
+  });
+});
+
+describe("largestFittingFontSize", () => {
+  it("finds a font size that actually fits, or null", () => {
+    const diamond = el({ type: "diamond", x: 0, y: 0, width: 400, height: 180 });
+    const text = DIAMOND_OVERFLOW_TEXT;
+    const size = largestFittingFontSize(diamond, text, 5, 20)!;
+    expect(size).toBeLessThan(20);
+    const fit = fitTextToContainer(diamond, text, size, 5);
+    expect(fit.widthOverflow || fit.heightOverflow).toBe(false);
+  });
+
+  it("returns null when nothing fits", () => {
+    const tiny = el({ type: "diamond", x: 0, y: 0, width: 20, height: 20 });
+    expect(largestFittingFontSize(tiny, "a very long label indeed", 5, 20)).toBeNull();
+  });
+});
+
+describe("layoutBoundText on a linear container", () => {
+  it("centres the label on the arrow and leaves its height alone", () => {
+    const arrow = el({
+      type: "arrow",
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 0,
+      points: [[0, 0], [200, 0]],
+    });
+    const layout = layoutBoundText(arrow, "yes", 16, 5);
+    expect(layout.containerHeight).toBe(0);
+    expect(layout.x + layout.width / 2).toBeCloseTo(100, 5);
+    expect(layout.y + layout.height / 2).toBeCloseTo(0, 5);
   });
 });

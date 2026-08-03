@@ -1,7 +1,8 @@
 import {describe, expect, it} from "vitest";
 
-import {applyUpdate, buildNewElement, planCreations, planReorder,} from "../elements";
-import {lineHeightForFamily} from "../verify/model";
+import {applyUpdate, buildNewElement, detachDeleted, markDeleted, planCreations, planReorder,} from "../elements";
+import {asLinear, asText, lineHeightForFamily} from "../verify/model";
+import {lintScene} from "../verify/lint";
 
 describe("buildNewElement text sizing", () => {
   it("auto-sizes a text element to its content instead of 100x100", () => {
@@ -266,5 +267,236 @@ describe("planReorder", () => {
     expect(() =>
       planReorder(elements, ["a", "b"], { to: "above", anchorId: "a" }),
     ).toThrow(/anchor cannot be one of the reordered/);
+  });
+});
+
+describe("label styling reaches the label, not the box", () => {
+  const createLabelled = (extra: Record<string, unknown>) =>
+    planCreations(
+      [{ type: "rectangle", id: "box", width: 200, height: 80, label: "Fresh", ...extra }],
+      [],
+    );
+
+  it("applies fontSize and fontFamily on a labelled shape to the bound text", () => {
+    const { created } = createLabelled({ fontSize: 14, fontFamily: 3 });
+    const text = created.find((element) => element.type === "text")!;
+    expect(asText(text).fontSize).toBe(14);
+    expect(asText(text).fontFamily).toBe(3);
+  });
+
+  it("does not leave text styling on the container", () => {
+    const { created } = createLabelled({ fontSize: 14, fontFamily: 3 });
+    const box = created.find((element) => element.id === "box")!;
+    expect(box.fontSize).toBeUndefined();
+    expect(box.fontFamily).toBeUndefined();
+  });
+
+  it("lets labelFontSize/labelFontFamily override fontSize/fontFamily", () => {
+    const { created } = createLabelled({
+      fontSize: 14,
+      fontFamily: 3,
+      labelFontSize: 28,
+      labelFontFamily: 5,
+    });
+    const text = created.find((element) => element.type === "text")!;
+    expect(asText(text).fontSize).toBe(28);
+    expect(asText(text).fontFamily).toBe(5);
+  });
+
+  it("still honours labelColor", () => {
+    const { created } = createLabelled({ labelColor: "#e03131" });
+    const text = created.find((element) => element.type === "text")!;
+    expect(text.strokeColor).toBe("#e03131");
+  });
+
+  it("sizes the bound text with the requested font, not the default", () => {
+    const small = createLabelled({ fontSize: 10 }).created.find((e) => e.type === "text")!;
+    const large = createLabelled({ fontSize: 30 }).created.find((e) => e.type === "text")!;
+    expect(small.height).toBeLessThan(large.height);
+  });
+});
+
+describe("planCreations labels map", () => {
+  it("maps each container id to the id of the label it created", () => {
+    const { created, labels } = planCreations(
+      [
+        { type: "rectangle", id: "gate", label: "Gate" },
+        { type: "diamond", id: "check", label: "Valid?" },
+      ],
+      [],
+    );
+    const textOf = (containerId: string) =>
+      created.find((element) => asText(element).containerId === containerId)!.id;
+    expect(labels).toEqual({ gate: textOf("gate"), check: textOf("check") });
+  });
+
+  it("maps an arrow to its own bound label", () => {
+    const { created, labels } = planCreations(
+      [
+        { type: "rectangle", id: "a", width: 60, height: 60 },
+        { type: "rectangle", id: "b", x: 400, width: 60, height: 60 },
+        { type: "arrow", id: "edge", fromId: "a", toId: "b", label: "yes" },
+      ],
+      [],
+    );
+    const text = created.find((element) => asText(element).containerId === "edge")!;
+    expect(labels.edge).toBe(text.id);
+    expect(asText(text).text).toBe("yes");
+  });
+});
+
+describe("planCreations arrow routing", () => {
+  const shapes = [
+    { type: "rectangle", id: "a", width: 60, height: 60 },
+    { type: "rectangle", id: "b", x: 400, width: 60, height: 60 },
+  ];
+
+  it("keeps both bindings when routed through waypoints", () => {
+    const { created } = planCreations(
+      [...shapes, { type: "arrow", id: "edge", fromId: "a", toId: "b", waypoints: [[230, -80]] }],
+      [],
+    );
+    const arrow = asLinear(created.find((element) => element.id === "edge")!);
+    expect(arrow.startBinding?.elementId).toBe("a");
+    expect(arrow.endBinding?.elementId).toBe("b");
+    expect(arrow.points).toHaveLength(3);
+  });
+});
+
+describe("lintIgnore is stowed in customData", () => {
+  it("moves the flat field into customData on create", () => {
+    const arrow = buildNewElement(
+      { type: "arrow", lintIgnore: ["arrow_unbound_endpoint"] },
+      [],
+    );
+    expect(arrow.customData).toEqual({ lintIgnore: ["arrow_unbound_endpoint"] });
+    expect(arrow.lintIgnore).toBeUndefined();
+  });
+
+  it("moves it on update too, preserving other customData", () => {
+    const arrow = buildNewElement({ type: "arrow", customData: { origin: "bot" } }, []);
+    const updated = applyUpdate(arrow, { lintIgnore: ["isolated"] } as never);
+    expect(updated.customData).toEqual({ origin: "bot", lintIgnore: ["isolated"] });
+  });
+});
+
+describe("detachDeleted", () => {
+  const shape = (id: string, boundElements: { id: string; type: string }[] | null) =>
+    buildNewElement({ type: "rectangle", id, boundElements }, []);
+
+  it("strips boundElements entries pointing at a deleted arrow", () => {
+    const from = shape("A", [{ id: "R", type: "arrow" }]);
+    const to = shape("B", [{ id: "R", type: "arrow" }]);
+    const detached = detachDeleted([from, to], new Set(["R"]));
+    expect(detached).toHaveLength(2);
+    expect(detached.every((element) => element.boundElements === null)).toBe(true);
+  });
+
+  it("keeps unrelated back-references", () => {
+    const from = shape("A", [{ id: "R", type: "arrow" }, { id: "T", type: "text" }]);
+    const [detached] = detachDeleted([from], new Set(["R"]));
+    expect(detached.boundElements).toEqual([{ id: "T", type: "text" }]);
+  });
+
+  it("nulls an arrow binding that pointed at a deleted shape", () => {
+    const arrow = buildNewElement(
+      {
+        type: "arrow",
+        id: "R",
+        startBinding: { elementId: "A", fixedPoint: [1, 0.5], mode: "orbit" },
+        endBinding: { elementId: "B", fixedPoint: [0, 0.5], mode: "orbit" },
+      },
+      [],
+    );
+    const [detached] = detachDeleted([arrow], new Set(["A"]));
+    expect(asLinear(detached).startBinding).toBeNull();
+    expect(asLinear(detached).endBinding).toEqual({
+      elementId: "B",
+      fixedPoint: [0, 0.5],
+      mode: "orbit",
+    });
+  });
+
+  it("leaves untouched elements out of the result", () => {
+    expect(detachDeleted([shape("A", null)], new Set(["R"]))).toEqual([]);
+  });
+
+  it("does not re-emit the deleted elements themselves", () => {
+    const arrow = buildNewElement({ type: "arrow", id: "R" }, []);
+    expect(detachDeleted([arrow], new Set(["R"]))).toEqual([]);
+  });
+});
+
+describe("deleting never leaves a dangling binding", () => {
+  const connectedScene = () => {
+    const { created } = planCreations(
+      [
+        { type: "rectangle", id: "a", width: 60, height: 60 },
+        { type: "rectangle", id: "b", x: 400, width: 60, height: 60 },
+        { type: "arrow", id: "hunt", fromId: "a", toId: "b" },
+      ],
+      [],
+    );
+    return created;
+  };
+
+  const deleteWithoutDetaching = (scene: ReturnType<typeof connectedScene>, ids: Set<string>) =>
+    scene.map((element) => (ids.has(element.id) ? markDeleted(element) : element));
+
+  const deleteAsServerDoes = (scene: ReturnType<typeof connectedScene>, ids: Set<string>) => {
+    const afterDelete = deleteWithoutDetaching(scene, ids);
+    const survivors = afterDelete.filter((element) => !element.isDeleted);
+    const detached = new Map(
+      detachDeleted(survivors, ids).map((element) => [element.id, element]),
+    );
+    return afterDelete.map((element) => detached.get(element.id) ?? element);
+  };
+
+  it("starts from a scene the linter already considers clean", () => {
+    expect(lintScene(connectedScene()).summary.errors).toBe(0);
+  });
+
+  it("regression guard: deleting the arrow without detaching leaves two errors", () => {
+    const scene = deleteWithoutDetaching(connectedScene(), new Set(["hunt"]));
+    const { findings } = lintScene(scene);
+    const backrefs = findings.filter((f) => f.code === "binding_backref_missing");
+    expect(backrefs).toHaveLength(2);
+  });
+
+  it("deleting the arrow strips the back-reference from both endpoints", () => {
+    const scene = deleteAsServerDoes(connectedScene(), new Set(["hunt"]));
+    expect(lintScene(scene).summary.errors).toBe(0);
+    for (const id of ["a", "b"]) {
+      const shape = scene.find((element) => element.id === id)!;
+      expect(shape.boundElements ?? []).toHaveLength(0);
+    }
+  });
+
+  it("deleting an endpoint unbinds the surviving arrow", () => {
+    const scene = deleteAsServerDoes(connectedScene(), new Set(["a"]));
+    expect(lintScene(scene).summary.errors).toBe(0);
+    const arrow = asLinear(scene.find((element) => element.id === "hunt")!);
+    expect(arrow.startBinding).toBeNull();
+    expect(arrow.endBinding?.elementId).toBe("b");
+  });
+});
+
+describe("buildNewElement image defaults", () => {
+  it("fills status saved and unit scale on image elements", () => {
+    const image = buildNewElement(
+      { type: "image", fileId: "abc123", width: 200, height: 100 },
+      [],
+    );
+    expect(image.fileId).toBe("abc123");
+    expect(image.status).toBe("saved");
+    expect(image.scale).toEqual([1, 1]);
+  });
+
+  it("keeps an explicit scale", () => {
+    const image = buildNewElement(
+      { type: "image", fileId: "abc123", scale: [2, 2] },
+      [],
+    );
+    expect(image.scale).toEqual([2, 2]);
   });
 });

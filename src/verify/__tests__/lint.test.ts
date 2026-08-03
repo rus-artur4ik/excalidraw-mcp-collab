@@ -1,6 +1,7 @@
 import {describe, expect, it} from "vitest";
 
-import {lintScene} from "../lint";
+import {lintElement, lintScene} from "../lint";
+import {segmentElementOverlap} from "../geometry";
 import {el} from "./factory";
 
 const codes = (findings: { code: string }[]) => findings.map((f) => f.code);
@@ -355,5 +356,140 @@ describe("scoped validate", () => {
     const result = lintScene([a, b], { codes: ["degenerate_size"] });
     expect(result.findings.every((f) => f.code === "degenerate_size")).toBe(true);
     expect(result.findings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("text_overflow names the axis that actually failed", () => {
+  const label = (containerId: string) =>
+    el({
+      type: "text",
+      id: "T",
+      containerId,
+      text: "one two three four five six seven eight nine ten eleven twelve",
+      fontSize: 20,
+      fontFamily: 5,
+      index: "a2",
+    });
+
+  it("reports the height axis for a diamond whose text fits horizontally", () => {
+    const diamond = el({ type: "diamond", id: "D", x: 0, y: 0, width: 400, height: 180, index: "a1" });
+    const { findings } = lintScene([diamond, label("D")]);
+    const overflow = findings.find((f) => f.code === "text_overflow")!;
+    expect(overflow.message).toContain("too TALL");
+    expect(overflow.message).not.toContain("too WIDE");
+  });
+
+  it("suggests a strictly larger container, never the current size", () => {
+    const diamond = el({ type: "diamond", id: "D", x: 0, y: 0, width: 400, height: 180, index: "a1" });
+    const { findings } = lintScene([diamond, label("D")]);
+    const suggestion = findings.find((f) => f.code === "text_overflow")!
+      .suggestion as { id: string; width?: number; height: number };
+    expect(suggestion.id).toBe("D");
+    expect(suggestion.height).toBeGreaterThan(180);
+    expect(suggestion.width).toBeUndefined();
+  });
+
+  it("offers shrinking the text as an alternative", () => {
+    const diamond = el({ type: "diamond", id: "D", x: 0, y: 0, width: 400, height: 180, index: "a1" });
+    const { findings } = lintScene([diamond, label("D")]);
+    const suggestion = findings.find((f) => f.code === "text_overflow")!
+      .suggestion as { alternative: { id: string; fontSize?: number } };
+    expect(suggestion.alternative.id).toBe("T");
+    expect(suggestion.alternative.fontSize).toBeLessThan(20);
+  });
+});
+
+describe("arrow_crosses_element", () => {
+  const from = el({ type: "rectangle", id: "A", x: 0, y: 0, width: 60, height: 60 });
+  const to = el({ type: "rectangle", id: "B", x: 400, y: 0, width: 60, height: 60 });
+  const blocker = el({ type: "rectangle", id: "X", x: 200, y: 0, width: 60, height: 60 });
+  const arrow = el({
+    type: "arrow",
+    id: "R",
+    x: 60,
+    y: 30,
+    width: 340,
+    height: 0,
+    points: [[0, 0], [340, 0]],
+    startBinding: { elementId: "A", fixedPoint: [1, 0.5001], mode: "orbit" },
+    endBinding: { elementId: "B", fixedPoint: [0, 0.5001], mode: "orbit" },
+  });
+  const bound = (element: typeof from, arrowId: string) =>
+    el({ ...element, boundElements: [{ id: arrowId, type: "arrow" }] });
+
+  it("flags an arrow running through an unrelated shape", () => {
+    const { findings } = lintScene([bound(from, "R"), bound(to, "R"), blocker, arrow]);
+    const crossing = findings.find((f) => f.code === "arrow_crosses_element")!;
+    expect(crossing.elementIds).toEqual(["R", "X"]);
+  });
+
+  it("does not flag the shapes the arrow is bound to", () => {
+    const { findings } = lintScene([bound(from, "R"), bound(to, "R"), arrow]);
+    expect(codes(findings)).not.toContain("arrow_crosses_element");
+  });
+
+  it("does not flag a cluster box that encloses the whole arrow", () => {
+    const cluster = el({ type: "rectangle", id: "C", x: -50, y: -50, width: 600, height: 200 });
+    const { findings } = lintScene([bound(from, "R"), bound(to, "R"), cluster, arrow]);
+    expect(codes(findings)).not.toContain("arrow_crosses_element");
+  });
+
+  it("suggests waypoints that actually clear the obstacle", () => {
+    const { findings } = lintScene([bound(from, "R"), bound(to, "R"), blocker, arrow]);
+    const suggestion = findings.find((f) => f.code === "arrow_crosses_element")!
+      .suggestion as { action: string; blockedBy: string; waypoints: [number, number][] };
+    expect(suggestion.action).toBe("reroute");
+    expect(suggestion.blockedBy).toBe("X");
+    const detour = suggestion.waypoints[0];
+    const start: [number, number] = [60, 30];
+    const end: [number, number] = [400, 30];
+    expect(segmentElementOverlap(blocker, start, detour)).toBe(0);
+    expect(segmentElementOverlap(blocker, detour, end)).toBe(0);
+  });
+
+  it("is reported inline when the arrow is created", () => {
+    const findings = lintElement(arrow, [bound(from, "R"), bound(to, "R"), blocker]);
+    expect(findings.map((f) => f.code)).toContain("arrow_crosses_element");
+  });
+
+  it("is reported inline when a shape is dropped onto an existing arrow", () => {
+    const findings = lintElement(blocker, [bound(from, "R"), bound(to, "R"), arrow]);
+    expect(findings.map((f) => f.code)).toContain("arrow_crosses_element");
+  });
+});
+
+describe("per-element lintIgnore", () => {
+  it("silences one rule on one element without hiding it elsewhere", () => {
+    const line = (id: string, customData?: Record<string, unknown>) =>
+      el({
+        type: "arrow",
+        id,
+        x: 0,
+        y: 120,
+        width: 40,
+        height: 0,
+        points: [[0, 0], [40, 0]],
+        ...(customData ? { customData } : {}),
+      });
+    const target = el({ type: "rectangle", id: "S", x: 42, y: 100, width: 60, height: 40 });
+    const quiet = line("quiet", { lintIgnore: ["arrow_unbound_endpoint"] });
+    const loud = line("loud");
+
+    const silenced = lintScene([target, quiet]);
+    expect(codes(silenced.findings)).not.toContain("arrow_unbound_endpoint");
+
+    const reported = lintScene([target, loud]);
+    expect(codes(reported.findings)).toContain("arrow_unbound_endpoint");
+  });
+
+  it("drops an opted-out node from graph.isolated", () => {
+    const legend = el({
+      type: "rectangle",
+      id: "L",
+      customData: { lintIgnore: ["isolated"] },
+    });
+    const orphan = el({ type: "rectangle", id: "O", x: 500 });
+    const { graph } = lintScene([legend, orphan]);
+    expect(graph.isolated).toEqual(["O"]);
   });
 });

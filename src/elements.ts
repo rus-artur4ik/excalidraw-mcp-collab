@@ -2,8 +2,15 @@ import {randomBytes, randomUUID} from "crypto";
 
 import {generateKeyBetween, generateNKeysBetween} from "fractional-indexing";
 
-import {CONTAINER_TYPES, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, isBindable,} from "./verify/model";
-import {planConnection} from "./verify/bindings";
+import {
+  asLinear,
+  CONTAINER_TYPES,
+  DEFAULT_FONT_FAMILY,
+  DEFAULT_FONT_SIZE,
+  isBindable,
+  isLinear,
+} from "./verify/model";
+import {planConnection, type RouteMode} from "./verify/bindings";
 import {layoutBoundText, layoutText} from "./verify/textMetrics";
 import {applyRole} from "./verify/styles";
 import type {ExcalidrawElement} from "./types";
@@ -13,7 +20,12 @@ export type CreateAttrs = Partial<ExcalidrawElement> & {
   role?: string;
   label?: string;
   labelColor?: string;
+  labelFontSize?: number;
+  labelFontFamily?: number;
+  lintIgnore?: string[];
   points?: [number, number][];
+  waypoints?: [number, number][];
+  route?: RouteMode;
   containerId?: string;
   frameId?: string | null;
   fromId?: string;
@@ -155,7 +167,29 @@ const deriveGeometry = (
   if (LINEAR.has(attrs.type)) {
     return shapeLinear(attrs);
   }
+  if (attrs.type === "image") {
+    return {
+      fileId: attrs.fileId ?? null,
+      status: attrs.status ?? "saved",
+      scale: Array.isArray(attrs.scale) ? attrs.scale : [1, 1],
+    };
+  }
   return {};
+};
+
+// customData is the only place Excalidraw preserves unknown data across a reload.
+const stowLintIgnore = (
+  attrs: Partial<ExcalidrawElement>,
+  base?: unknown,
+): Partial<ExcalidrawElement> => {
+  const { lintIgnore, ...rest } = attrs as Partial<ExcalidrawElement> & {
+    lintIgnore?: unknown;
+  };
+  if (!Array.isArray(lintIgnore)) {
+    return rest;
+  }
+  const customData = (rest.customData ?? base ?? {}) as Record<string, unknown>;
+  return { ...rest, customData: { ...customData, lintIgnore } };
 };
 
 export const buildNewElement = (
@@ -164,10 +198,11 @@ export const buildNewElement = (
 ): ExcalidrawElement => {
   const now = Date.now();
   const base = elementDefaults();
+  const stowed = { ...stowLintIgnore(attrs), type: attrs.type };
   return {
     ...base,
-    ...attrs,
-    ...deriveGeometry(attrs),
+    ...stowed,
+    ...deriveGeometry(stowed),
     id: typeof attrs.id === "string" ? attrs.id : randomUUID(),
     type: attrs.type,
     version: 1,
@@ -181,7 +216,10 @@ export const applyUpdate = (
   element: ExcalidrawElement,
   patch: Partial<ExcalidrawElement>,
 ): ExcalidrawElement => {
-  const { id, type, version, versionNonce, updated, ...mutable } = patch;
+  const { id, type, version, versionNonce, updated, ...mutable } = stowLintIgnore(
+    patch,
+    element.customData,
+  );
   return {
     ...element,
     ...mutable,
@@ -265,20 +303,61 @@ const buildBoundText = (
     text,
     container: applyUpdate(container, {
       boundElements: addBackref(container, text.id, "text"),
-      height: layout.containerHeight,
+      ...(isLinear(container) ? {} : { height: layout.containerHeight }),
     }),
   };
+};
+
+type LabelStyle = {
+  labelColor?: string;
+  fontSize?: number;
+  fontFamily?: number;
+  textAlign?: string;
+  verticalAlign?: string;
+};
+
+// A container carries no text of its own, so these style its label.
+const labelStyleOf = (raw: CreateAttrs): LabelStyle => ({
+  labelColor: raw.labelColor,
+  fontSize: raw.labelFontSize ?? (raw.fontSize as number | undefined),
+  fontFamily: raw.labelFontFamily ?? (raw.fontFamily as number | undefined),
+  textAlign: raw.textAlign as string | undefined,
+  verticalAlign: raw.verticalAlign as string | undefined,
+});
+
+const LABEL_KEYS = [
+  "label",
+  "labelColor",
+  "labelFontSize",
+  "labelFontFamily",
+  "fontSize",
+  "fontFamily",
+  "textAlign",
+  "verticalAlign",
+] as const;
+
+const withoutLabelKeys = (raw: CreateAttrs): CreateAttrs => {
+  const rest = { ...raw };
+  for (const key of LABEL_KEYS) {
+    delete rest[key];
+  }
+  return rest;
 };
 
 export const planCreations = (
   rawItems: CreateAttrs[],
   existing: readonly ExcalidrawElement[],
-): { created: ExcalidrawElement[]; containerUpdates: ExcalidrawElement[] } => {
+): {
+  created: ExcalidrawElement[];
+  containerUpdates: ExcalidrawElement[];
+  labels: Record<string, string>;
+} => {
   const items = rawItems.map((item) => applyRole(item) as CreateAttrs);
   const working = [...existing];
   const created: ExcalidrawElement[] = [];
   const createdIndex = new Map<string, number>();
   const containerUpdates = new Map<string, ExcalidrawElement>();
+  const labels: Record<string, string> = {};
   const replace = (element: ExcalidrawElement) => {
     const i = working.findIndex((w) => w.id === element.id);
     if (i >= 0) {
@@ -303,6 +382,21 @@ export const planCreations = (
   };
   const find = (id: string): ExcalidrawElement | undefined =>
     working.find((w) => w.id === id);
+
+  const attachLabel = (
+    container: ExcalidrawElement,
+    label: string,
+    style: LabelStyle,
+  ) => {
+    const bound = buildBoundText(
+      container,
+      { type: "text", text: label, ...style },
+      working,
+    );
+    recordContainerUpdate(bound.container);
+    pushCreated(bound.text);
+    labels[container.id] = bound.text.id;
+  };
 
   const isBindingArrow = (raw: CreateAttrs): boolean =>
     raw.type === "arrow" &&
@@ -337,6 +431,8 @@ export const planCreations = (
         mode: raw.bindMode,
         startArrowhead: raw.startArrowhead,
         endArrowhead: raw.endArrowhead,
+        waypoints: raw.waypoints,
+        route: raw.route,
       });
       const {
         fromId,
@@ -344,10 +440,12 @@ export const planCreations = (
         bindMode,
         startArrowhead,
         endArrowhead,
+        waypoints,
+        route,
         label,
-        labelColor,
-        ...arrowAttrs
+        ...rest
       } = raw;
+      const arrowAttrs = withoutLabelKeys(rest as CreateAttrs);
       const arrow = buildNewElement(
         { ...arrowAttrs, ...plan.arrow, id: arrowId },
         working,
@@ -359,6 +457,9 @@ export const planCreations = (
       recordContainerUpdate(
         applyUpdate(to, { boundElements: plan.toBoundElements }),
       );
+      if (typeof label === "string") {
+        attachLabel(arrow, label, labelStyleOf(raw));
+      }
       return;
     }
     if (raw.type === "text" && typeof raw.containerId === "string") {
@@ -366,25 +467,19 @@ export const planCreations = (
       if (!container || container.isDeleted) {
         throw new Error(`container not found: ${raw.containerId}`);
       }
-      if (!CONTAINER_TYPES.has(container.type)) {
+      if (!CONTAINER_TYPES.has(container.type) && !isLinear(container)) {
         throw new Error(`element ${container.id} is not a text container`);
       }
       const bound = buildBoundText(container, raw, working);
       pushCreated(bound.text);
       recordContainerUpdate(bound.container);
+      labels[container.id] = bound.text.id;
       return;
     }
     if (typeof raw.label === "string" && CONTAINER_TYPES.has(raw.type)) {
-      const { label, labelColor, verticalAlign, ...containerAttrs } = raw;
-      const container = buildNewElement(containerAttrs, working);
+      const container = buildNewElement(withoutLabelKeys(raw), working);
       pushCreated(container);
-      const bound = buildBoundText(
-        container,
-        { type: "text", text: label, labelColor, verticalAlign },
-        working,
-      );
-      recordContainerUpdate(bound.container);
-      pushCreated(bound.text);
+      attachLabel(container, raw.label, labelStyleOf(raw));
       return;
     }
     pushCreated(buildNewElement(raw, working));
@@ -404,7 +499,37 @@ export const planCreations = (
     processItem(raw);
   }
 
-  return { created, containerUpdates: [...containerUpdates.values()] };
+  return { created, containerUpdates: [...containerUpdates.values()], labels };
+};
+
+// A survivor still pointing at a deleted id is a `binding_backref_missing` error.
+export const detachDeleted = (
+  elements: readonly ExcalidrawElement[],
+  deletedIds: ReadonlySet<string>,
+): ExcalidrawElement[] => {
+  const detached: ExcalidrawElement[] = [];
+  for (const element of elements) {
+    if (deletedIds.has(element.id)) {
+      continue;
+    }
+    const patch: Partial<ExcalidrawElement> = {};
+    const refs = element.boundElements;
+    if (Array.isArray(refs) && refs.some((entry) => deletedIds.has(entry.id))) {
+      const kept = refs.filter((entry) => !deletedIds.has(entry.id));
+      patch.boundElements = kept.length ? kept : null;
+    }
+    const linear = asLinear(element);
+    if (linear.startBinding && deletedIds.has(linear.startBinding.elementId)) {
+      patch.startBinding = null;
+    }
+    if (linear.endBinding && deletedIds.has(linear.endBinding.elementId)) {
+      patch.endBinding = null;
+    }
+    if (Object.keys(patch).length) {
+      detached.push(applyUpdate(element, patch));
+    }
+  }
+  return detached;
 };
 
 export type ReorderPlacement =
