@@ -2,6 +2,7 @@ import {McpServer} from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v3";
 
 import {BotAccessDeniedError, type CollabBot, ReadOnlyError,} from "./bot/CollabBot";
+import {BoardCreationDeniedError} from "./bots";
 import {logError, logInfo, logWarn} from "./logger";
 import {type ArrangeOptions, containerSizeForText, measureText, ROLE_NAMES, wrapText,} from "./verify";
 import {DIAGRAM_GUIDE, PALETTE_JSON, SERVER_README} from "./guide";
@@ -13,6 +14,18 @@ const boardIdShape = {
   boardId: z
     .string()
     .describe("Target board id. Use list_boards to discover accessible boards."),
+};
+
+const createBoardShape = {
+  title: z
+    .string()
+    .describe("Board name as it appears in the app's board list. Keep it short and human-readable."),
+  visibility: z
+    .enum(["private", "team", "link"])
+    .optional()
+    .describe(
+      "Who can open the board (default private): private = the owner and people they invite; team = everyone on the shared team, and the owning account must be a team member; link = anyone with the link can view, never edit. Pick the narrowest that fits — the owner can widen it later in the board's Access dialog.",
+    ),
 };
 
 const elementFields = {
@@ -505,19 +518,7 @@ const runTool = async (name: string, fn: () => Promise<unknown>) => {
     });
     return textResult(result);
   } catch (error) {
-    if (error instanceof ReadOnlyError) {
-      logWarn("mcp.tool.read_only_denied", { tool: name });
-      return errorResult("read-only access on this board");
-    }
-    if (error instanceof BotAccessDeniedError) {
-      logWarn("mcp.tool.access_denied", { tool: name });
-      return errorResult(error.message);
-    }
-    logError("mcp.tool.failed", error, {
-      tool: name,
-      durationMs: Date.now() - startedAt,
-    });
-    return errorResult(error instanceof Error ? error.message : String(error));
+    return toolError(name, error, startedAt);
   }
 };
 
@@ -528,6 +529,12 @@ const toolError = (name: string, error: unknown, startedAt: number) => {
   }
   if (error instanceof BotAccessDeniedError) {
     logWarn("mcp.tool.access_denied", { tool: name });
+    return errorResult(error.message);
+  }
+  // A withheld permission is the owner's decision, not a fault: report it to
+  // the agent verbatim so it can tell the user how to grant it.
+  if (error instanceof BoardCreationDeniedError) {
+    logWarn("mcp.tool.board_creation_denied", { tool: name });
     return errorResult(error.message);
   }
   logError("mcp.tool.failed", error, {
@@ -598,9 +605,15 @@ After EVERY write: render_region the changed area, look at the image, validate_s
 
 Keep diagrams ≤20 nodes — split bigger content. Titles ≤6 words, no paragraphs on canvas. Emoji become tofu in PNG renders; use plain glyphs (✓ ★ × ·).`;
 
+export type CreateBoardInput = {
+  title: string;
+  visibility?: "private" | "team" | "link";
+};
+
 export type McpContext = {
   resolveBot: (boardId: string) => Promise<CollabBot>;
   listBoards: () => Promise<AccessibleBoard[]>;
+  createBoard: (input: CreateBoardInput) => Promise<unknown>;
 };
 
 export function buildMcpServer(ctx: McpContext): McpServer {
@@ -681,10 +694,23 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "list_boards",
     {
       description:
-        "List the boards this account can access through the bot, with the bot's access level (read or write) on each.",
+        "List the boards this account can access through the bot, with the bot's access level (read or write) on each. Start here: draw on an existing board whenever one fits, and only reach for create_board when the work genuinely needs a new one.",
       inputSchema: {},
     },
     async () => runTool("list_boards", () => ctx.listBoards()),
+  );
+
+  server.registerTool(
+    "create_board",
+    {
+      description:
+        "Create a new empty board, owned by the account this bot acts for, and grant this bot write access to it in the same step — the returned boardId is immediately usable by the drawing tools. Requires the per-bot \"Create boards\" permission (the owner turns it on in the bot's settings); without it the call fails with an explanation to relay, not something to retry. Check list_boards first and reuse a suitable board — one board per topic, not one per diagram. Returns { boardId, title, visibility, botAccess, url }.",
+      inputSchema: createBoardShape,
+    },
+    async (args) =>
+      runTool("create_board", () =>
+        ctx.createBoard({ title: args.title, visibility: args.visibility }),
+      ),
   );
 
   server.registerTool(

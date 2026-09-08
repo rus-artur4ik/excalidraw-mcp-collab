@@ -83,12 +83,17 @@ Style and layout advice lives in \`get_diagram_guide\`. This is the mechanical c
 
 | You want | Call |
 |---|---|
+| somewhere to draw | \`list_boards\` — and only if nothing fits, \`create_board\` |
 | flowchart / architecture / pipeline / dependency map | \`create_diagram\` (server lays it out) |
 | free-form shapes, legends, annotations | \`batch_create\` |
 | one arrow between two existing shapes | \`connect\` |
 | change anything that already exists | \`update_elements\` |
 | look at the result | \`render_region\` / \`render_scene\` |
 | prove the result | \`validate_scene\` |
+
+## Boards are the owner's, not yours
+
+\`list_boards\` is the source of truth: reuse an existing board whenever one fits — one board per topic, not one per diagram. \`create_board\` makes a new empty board owned by the account this bot acts for, grants this bot write access, and returns a \`boardId\` the drawing tools accept right away. It works only if the owner turned on this bot's "Create boards" permission; if the call comes back denied, relay that to the user instead of retrying. New boards are \`private\` unless you pass \`visibility\`.
 
 ## Text lives inside shapes, never on top of them
 

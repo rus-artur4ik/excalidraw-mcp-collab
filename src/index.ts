@@ -1,12 +1,19 @@
 import {StreamableHTTPServerTransport} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express, {type NextFunction, type Request, type RequestHandler, type Response,} from "express";
 
-import {config, getMcpUrl} from "./config";
+import {config, getBoardUrl, getMcpUrl} from "./config";
 import {authorize} from "./acl";
-import {listAccessibleBoards} from "./boards";
+import {createBoardForBot, listAccessibleBoards} from "./boards";
 import {auth} from "./firebase";
 import {createToken, getToken, listTokens, revokeToken, touchToken,} from "./tokens";
-import {bindingFor, decideBotBoardAccess, getBot, getOwnedBot} from "./bots";
+import {
+  BoardCreationDeniedError,
+  bindingFor,
+  decideBotBoardAccess,
+  decideBotBoardCreation,
+  getBot,
+  getOwnedBot,
+} from "./bots";
 import {
   BotAccessDeniedError,
   type CollabBot,
@@ -14,7 +21,8 @@ import {
   getOrCreateBot,
   statusForTokens,
 } from "./bot/CollabBot";
-import {buildMcpServer} from "./mcp";
+import {buildMcpServer, type CreateBoardInput} from "./mcp";
+import {createRateLimiter} from "./rateLimit";
 import {getFile, putFile} from "./files";
 import {
   logError,
@@ -29,6 +37,15 @@ import {
 
 const app = express();
 let processTerminationStarted = false;
+
+// A looping agent must not be able to bury its owner in fresh boards; the
+// permission decides *whether* a bot may create, this decides *how fast*.
+const BOARD_CREATE_LIMIT = 10;
+const BOARD_CREATE_WINDOW_MS = 60 * 60_000;
+const boardCreateLimiter = createRateLimiter({
+  limit: BOARD_CREATE_LIMIT,
+  windowMs: BOARD_CREATE_WINDOW_MS,
+});
 
 const terminateAfterLogging = (
   event: string,
@@ -345,9 +362,51 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     return bot;
   };
 
+  const createBoard = async (input: CreateBoardInput) => {
+    const decision = decideBotBoardCreation(!!doc.botId, botDoc);
+    if (!decision.allowed) {
+      logWarn("mcp.board.create_denied", {
+        botScoped: !!doc.botId,
+        reason: decision.reason,
+      });
+      throw new BoardCreationDeniedError(decision.reason);
+    }
+    // decideBotBoardCreation only allows bot-scoped tokens, so botId is set.
+    const botId = doc.botId as string;
+    const verdict = boardCreateLimiter.take(botId);
+    if (!verdict.allowed) {
+      const retryAfterMin = Math.max(1, Math.ceil(verdict.retryAfterMs / 60_000));
+      logWarn("mcp.board.create_rate_limited", {
+        botId,
+        retryAfterMs: verdict.retryAfterMs,
+      });
+      throw new BoardCreationDeniedError(
+        `this bot has hit its limit of ${BOARD_CREATE_LIMIT} new boards per hour; try again in ${retryAfterMin} min or draw on an existing board`,
+      );
+    }
+    const created = await createBoardForBot({
+      identity: account,
+      botId,
+      title: input.title,
+      visibility: input.visibility,
+    });
+    // The bot doc was read at the start of this request, so refresh the
+    // in-memory allow-list: a draw call in the same request must not be denied
+    // on a board this bot just created.
+    if (botDoc) {
+      botDoc.boards = [
+        ...(botDoc.boards ?? []),
+        { boardId: created.boardId, role: "write" },
+      ];
+    }
+    logInfo("mcp.board.created", { boardId: created.boardId, botId });
+    return { ...created, url: getBoardUrl(created.boardId) };
+  };
+
   const server = buildMcpServer({
     resolveBot,
     listBoards: () => listAccessibleBoards(account),
+    createBoard,
   });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,

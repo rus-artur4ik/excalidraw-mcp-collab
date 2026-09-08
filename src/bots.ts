@@ -30,10 +30,52 @@ export type BotDoc = {
   color?: string;
   avatar?: unknown;
   boards?: BotBoardBinding[];
+  // Per-bot permission, set by the owner in the bot's settings. Absent = off.
+  canCreateBoards?: boolean;
   disabled?: boolean;
   createdAt?: number;
   updatedAt?: number;
 };
+
+// Board creation is a permission the owner grants per bot, so a denial is a
+// normal, actionable outcome rather than a server fault: the message is handed
+// straight to the agent.
+export class BoardCreationDeniedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BoardCreationDeniedError";
+  }
+}
+
+export type BoardCreationDecision =
+  | { allowed: true }
+  | { allowed: false; reason: string };
+
+export function decideBotBoardCreation(
+  isFirstClass: boolean,
+  bot: BotDoc | null,
+): BoardCreationDecision {
+  // Legacy account-wide tokens carry no bot doc, so there is nowhere to grant
+  // the permission — and nowhere to bind the created board.
+  if (!isFirstClass || !bot) {
+    return {
+      allowed: false,
+      reason:
+        "this token is not bound to a bot, so it cannot create boards; mint a token for a bot on the Bots page",
+    };
+  }
+  if (bot.disabled) {
+    return { allowed: false, reason: "this bot is disabled" };
+  }
+  if (bot.canCreateBoards !== true) {
+    return {
+      allowed: false,
+      reason:
+        'this bot is not allowed to create boards; its owner can turn on "Create boards" in the bot\'s settings',
+    };
+  }
+  return { allowed: true };
+}
 
 const COLLECTION = "bots";
 

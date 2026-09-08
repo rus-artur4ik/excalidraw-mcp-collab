@@ -47,6 +47,8 @@ export type BoardDoc = {
   editors?: string[];
   viewers?: string[];
   botPolicy?: BotPolicy;
+  // Set when a bot created the board through the MCP `create_board` tool.
+  createdByBotId?: string;
   type?: "personal" | "team";
   teamId?: string;
   readPolicy?: "public" | "members";

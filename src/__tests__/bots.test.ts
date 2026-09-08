@@ -1,5 +1,11 @@
 import {beforeEach, describe, expect, it, vi} from "vitest";
-import {bindingFor, decideBotBoardAccess, getBot, getOwnedBot,} from "../bots";
+import {
+  bindingFor,
+  decideBotBoardAccess,
+  decideBotBoardCreation,
+  getBot,
+  getOwnedBot,
+} from "../bots";
 import {createToken, getToken, listTokens, revokeToken, touchToken,} from "../tokens";
 
 const { store } = vi.hoisted(() => ({
@@ -94,6 +100,40 @@ describe("decideBotBoardAccess", () => {
     expect(decideBotBoardAccess(false, undefined, rw)).toEqual({
       allowed: true,
       role: "editor",
+    });
+  });
+});
+
+describe("decideBotBoardCreation", () => {
+  const allowed = { ownerUid: "u", canCreateBoards: true };
+
+  it("allows a bot whose owner granted the permission", () => {
+    expect(decideBotBoardCreation(true, allowed)).toEqual({ allowed: true });
+  });
+
+  it("denies a bot without the permission, explaining how to grant it", () => {
+    const decision = decideBotBoardCreation(true, { ownerUid: "u" });
+    expect(decision.allowed).toBe(false);
+    expect(decision.allowed === false && decision.reason).toContain(
+      "Create boards",
+    );
+  });
+
+  it("denies an explicit false and a disabled bot", () => {
+    expect(
+      decideBotBoardCreation(true, { ownerUid: "u", canCreateBoards: false }),
+    ).toMatchObject({ allowed: false });
+    expect(
+      decideBotBoardCreation(true, { ...allowed, disabled: true }),
+    ).toMatchObject({ allowed: false });
+  });
+
+  it("denies legacy account-wide tokens, which have no bot to configure", () => {
+    expect(decideBotBoardCreation(false, null)).toMatchObject({
+      allowed: false,
+    });
+    expect(decideBotBoardCreation(true, null)).toMatchObject({
+      allowed: false,
     });
   });
 });
