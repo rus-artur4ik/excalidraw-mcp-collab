@@ -71,7 +71,7 @@ returns them verbatim.
 ### MCP tools
 
 - `list_boards` — boards the token's account can reach through the bot, with
-  the bot's access level on each.
+  the bot's access level on each and the board's `description` when it has one.
 - `create_board` — new empty board owned by the token's account, bound to the
   calling bot with `write` in the same batch (board doc + `boardKeys` + the
   bot's allow-list entry commit together). Gated by the per-bot
@@ -81,7 +81,16 @@ returns them verbatim.
   `folderId` files the new board into one of the owner's folders (needs the
   folders sub-permission below; the folder is resolved before the board is
   written, and a failed filing is reported as `folderWarning` next to the
-  created board rather than thrown).
+  created board rather than thrown). An optional `description` is stored with
+  the board.
+- `set_board_description` — sets (or, with `""`, removes) the short blurb the
+  app shows under a board's name in the board list. Allowed only when the bot
+  could write to the board (allow-list binding, bot policy, account ACL) **and**
+  the token's account may change the board's settings — its owner, or a team
+  admin on a team board — mirroring `firestore.rules`. Writes only the board
+  doc; no collab connection is opened. Descriptions from both tools are
+  normalized to one paragraph of at most 300 characters, the limit
+  `firestore.rules` enforces for browser writes.
 - `list_folders`, `create_folder` — the owner's personal home-page folders
   (`users/{uid}/folders`), which group boards without affecting access. Gated by
   the per-bot `canCreateFolders` flag, a sub-permission that only counts while

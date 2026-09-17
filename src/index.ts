@@ -3,7 +3,7 @@ import express, {type NextFunction, type Request, type RequestHandler, type Resp
 
 import {config, getBoardUrl, getMcpUrl} from "./config";
 import {authorize} from "./acl";
-import {createBoardForBot, listAccessibleBoards} from "./boards";
+import {createBoardForBot, listAccessibleBoards, setBoardDescriptionForBot} from "./boards";
 import {auth} from "./firebase";
 import {createToken, getToken, listTokens, revokeToken, touchToken,} from "./tokens";
 import {
@@ -468,6 +468,7 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
       identity: account,
       botId,
       title: input.title,
+      description: input.description,
       visibility: input.visibility,
     });
     // The bot doc was read at the start of this request, so refresh the
@@ -507,10 +508,27 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     }
   };
 
+  const setBoardDescription = async (input: {
+    boardId: string;
+    description: string;
+  }) => {
+    setLogContext({ boardId: input.boardId });
+    // Same allow-list the drawing tools go through, without opening a
+    // collab connection: this only touches the board document.
+    return setBoardDescriptionForBot({
+      identity: account,
+      boardId: input.boardId,
+      description: input.description,
+      isFirstClass: !!doc.botId,
+      binding: doc.botId ? bindingFor(botDoc, input.boardId) : undefined,
+    });
+  };
+
   const server = buildMcpServer({
     resolveBot,
     listBoards: () => listAccessibleBoards(account),
     createBoard,
+    setBoardDescription,
     listFolders: listBotFolders,
     createFolder,
   });

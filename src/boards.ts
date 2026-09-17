@@ -3,9 +3,10 @@ import {randomBytes} from "crypto";
 import {FieldValue} from "firebase-admin/firestore";
 
 import {db} from "./firebase";
-import {loadTeam} from "./acl";
-import {BoardCreationDeniedError} from "./bots";
-import {evaluateAccess, teamRoleOf} from "./policy";
+import {loadBoard, loadTeam} from "./acl";
+import {BotAccessDeniedError, ReadOnlyError} from "./bot/CollabBot";
+import {BoardCreationDeniedError, type BotBoardBinding, decideBotBoardAccess} from "./bots";
+import {evaluateAccess, needsTeam, teamRoleOf} from "./policy";
 import {logError, logInfo, opaqueRef} from "./logger";
 
 import type {BoardDoc, Identity, TeamDoc, Visibility} from "./types";
@@ -14,6 +15,8 @@ import {DEFAULT_BOT_POLICY, TEAM_ID} from "./types";
 export type AccessibleBoard = {
   boardId: string;
   title: string;
+  // Omitted when the board has none, to keep list_boards small.
+  description?: string;
   botAccess: "read" | "write";
 };
 
@@ -96,9 +99,11 @@ export async function listAccessibleBoards(
       if (!access.canRead) {
         continue;
       }
+      const description = normalizeBoardDescription(board.description);
       accessible.push({
         boardId,
         title: board.title ?? "Untitled",
+        ...(description ? { description } : {}),
         botAccess: access.canWrite ? "write" : "read",
       });
     }
@@ -123,6 +128,11 @@ const ROOM_ID_BYTES = 10;
 const ROOM_KEY_BYTES = 16;
 const MAX_TITLE_LENGTH = 120;
 const FALLBACK_TITLE = "Untitled";
+// Shared with the app (excalidraw-app/data/boards.ts) and enforced by
+// firestore.rules for browser writes — keep all three in step. A longer
+// description written here would make the owner's later edits from the
+// browser fail validation.
+export const BOARD_DESCRIPTION_MAX_LENGTH = 300;
 
 export const generateRoomId = (): string =>
   randomBytes(ROOM_ID_BYTES).toString("hex");
@@ -135,9 +145,18 @@ export const normalizeBoardTitle = (raw: string | undefined): string => {
   return collapsed ? collapsed.slice(0, MAX_TITLE_LENGTH) : FALLBACK_TITLE;
 };
 
+/** One short paragraph: whitespace (including newlines) collapses, runaway text is cut. */
+export const normalizeBoardDescription = (raw: string | undefined): string =>
+  (raw ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, BOARD_DESCRIPTION_MAX_LENGTH)
+    .trim();
+
 export type CreatedBoard = {
   boardId: string;
   title: string;
+  description?: string;
   visibility: Visibility;
   botAccess: "write";
 };
@@ -156,6 +175,7 @@ export async function createBoardForBot(params: {
   identity: Identity;
   botId: string;
   title?: string;
+  description?: string;
   visibility?: Visibility;
 }): Promise<CreatedBoard> {
   const { identity, botId } = params;
@@ -164,6 +184,7 @@ export async function createBoardForBot(params: {
   }
   const visibility = params.visibility ?? "private";
   const title = normalizeBoardTitle(params.title);
+  const description = normalizeBoardDescription(params.description);
 
   if (visibility === "team") {
     const team = await loadTeam().catch(() => null);
@@ -181,6 +202,7 @@ export async function createBoardForBot(params: {
     ownerUid: identity.uid,
     ownerEmail: identity.email,
     title,
+    ...(description ? { description } : {}),
     visibility,
     editors: [] as string[],
     viewers: [] as string[],
@@ -216,5 +238,133 @@ export async function createBoardForBot(params: {
     visibility,
     subjectRef: opaqueRef(identity.uid),
   });
-  return { boardId, title, visibility, botAccess: "write" };
+  return {
+    boardId,
+    title,
+    ...(description ? { description } : {}),
+    visibility,
+    botAccess: "write",
+  };
+}
+
+// Changing board details is the owner's call (or a team admin's on a team
+// board), exactly as in the app's board settings. A denial is handed to the
+// agent verbatim so it can tell the user who can make the change.
+export class BoardEditDeniedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BoardEditDeniedError";
+  }
+}
+
+export type BoardEditDecision =
+  | { allowed: true }
+  | { allowed: false; denial: "no_access" }
+  | { allowed: false; denial: "read_only" }
+  | { allowed: false; denial: "not_manager"; reason: string };
+
+/**
+ * A bot may edit a board's details only when it could also draw on it (write
+ * binding, bot policy, the account's ACL) AND the account it acts for is
+ * allowed to change the board's settings — so a bot never exceeds what its
+ * owner can do in the app.
+ */
+export function decideBoardEdit(params: {
+  identity: Identity;
+  board: BoardDoc | null;
+  team: TeamDoc | null;
+  isFirstClass: boolean;
+  binding: BotBoardBinding | undefined;
+}): BoardEditDecision {
+  const { identity, board, team, isFirstClass, binding } = params;
+  const access = evaluateAccess(identity, board, team, true);
+  const drawing = decideBotBoardAccess(isFirstClass, binding, access);
+  if (!board || !drawing.allowed) {
+    return { allowed: false, denial: "no_access" };
+  }
+  if (drawing.role !== "editor") {
+    return { allowed: false, denial: "read_only" };
+  }
+  const isOwner = !!identity.uid && identity.uid === board.ownerUid;
+  const teamBoard =
+    board.visibility === undefined
+      ? board.teamId != null
+      : board.visibility === "team";
+  const teamAdmin = teamBoard && teamRoleOf(team, identity.email) === "admin";
+  if (!isOwner && !teamAdmin) {
+    return {
+      allowed: false,
+      denial: "not_manager",
+      reason:
+        "only the board's owner (or a team admin, for a team board) can change its description, and this bot acts for an account that is neither; ask the owner to change it in the board's settings",
+    };
+  }
+  return { allowed: true };
+}
+
+export type BoardDescriptionResult = {
+  boardId: string;
+  title: string;
+  /** What was stored, after normalization; null when the description was cleared. */
+  description: string | null;
+};
+
+/** Sets (or, with an empty string, clears) a board's description. */
+export async function setBoardDescriptionForBot(params: {
+  identity: Identity;
+  boardId: string;
+  description: string;
+  isFirstClass: boolean;
+  binding: BotBoardBinding | undefined;
+}): Promise<BoardDescriptionResult> {
+  const { identity, boardId } = params;
+  const board = await loadBoard(boardId);
+  const team = needsTeam(board) ? await loadTeam() : null;
+  const decision = decideBoardEdit({
+    identity,
+    board,
+    team,
+    isFirstClass: params.isFirstClass,
+    binding: params.binding,
+  });
+  if (!decision.allowed) {
+    if (decision.denial === "no_access") {
+      throw new BotAccessDeniedError(boardId);
+    }
+    if (decision.denial === "read_only") {
+      throw new ReadOnlyError();
+    }
+    throw new BoardEditDeniedError(decision.reason);
+  }
+
+  const description = normalizeBoardDescription(params.description);
+  try {
+    // update (not set/merge): a board deleted mid-call fails instead of being
+    // resurrected as a doc with nothing but a description.
+    await db()
+      .collection("boards")
+      .doc(boardId)
+      .update({
+        // An emptied description is removed, like the app does.
+        description: description || FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+  } catch (error) {
+    logError("firestore.board.description_update_failed", error, {
+      boardId,
+      subjectRef: opaqueRef(identity.uid),
+    });
+    throw error;
+  }
+
+  logInfo("firestore.board.description_updated", {
+    boardId,
+    cleared: !description,
+    subjectRef: opaqueRef(identity.uid),
+  });
+  return {
+    boardId,
+    title: board?.title ?? FALLBACK_TITLE,
+    description: description || null,
+  };
 }

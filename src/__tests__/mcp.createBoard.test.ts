@@ -10,6 +10,11 @@ const connect = async (overrides: Partial<McpContext>) => {
     resolveBot: vi.fn(),
     listBoards: vi.fn(async () => []),
     createBoard: vi.fn(async () => ({ boardId: "b" })),
+    setBoardDescription: vi.fn(async () => ({
+      boardId: "b",
+      title: "B",
+      description: null,
+    })),
     listFolders: vi.fn(async () => []),
     createFolder: vi.fn(async () => ({
       folderId: "f",
@@ -36,7 +41,7 @@ const firstText = (result: unknown): string => {
 };
 
 describe("create_board tool", () => {
-  it("is advertised with a required title and an optional visibility", async () => {
+  it("is advertised with a required title and optional description, visibility and folder", async () => {
     const { client } = await connect({});
     const tool = (await client.listTools()).tools.find(
       (candidate) => candidate.name === "create_board",
@@ -45,6 +50,7 @@ describe("create_board tool", () => {
     expect(tool?.inputSchema.required).toEqual(["title"]);
     expect(Object.keys(tool?.inputSchema.properties ?? {})).toEqual([
       "title",
+      "description",
       "visibility",
       "folderId",
     ]);
@@ -62,11 +68,16 @@ describe("create_board tool", () => {
 
     const result = await client.callTool({
       name: "create_board",
-      arguments: { title: "Retro", visibility: "team" },
+      arguments: {
+        title: "Retro",
+        description: "What went well this sprint",
+        visibility: "team",
+      },
     });
 
     expect(createBoard).toHaveBeenCalledWith({
       title: "Retro",
+      description: "What went well this sprint",
       visibility: "team",
       folderId: undefined,
     });

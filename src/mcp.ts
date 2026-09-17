@@ -2,13 +2,14 @@ import {McpServer} from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v3";
 
 import {BotAccessDeniedError, type CollabBot, ReadOnlyError,} from "./bot/CollabBot";
+import {BOARD_DESCRIPTION_MAX_LENGTH, BoardEditDeniedError} from "./boards";
 import {BoardCreationDeniedError} from "./bots";
 import {FolderPermissionDeniedError, type CreatedFolder, type FolderSummary} from "./folders";
 import {logError, logInfo, logWarn} from "./logger";
 import {type ArrangeOptions, containerSizeForText, measureText, ROLE_NAMES, wrapText,} from "./verify";
 import {DIAGRAM_GUIDE, PALETTE_JSON, SERVER_README} from "./guide";
 
-import type {AccessibleBoard} from "./boards";
+import type {AccessibleBoard, BoardDescriptionResult} from "./boards";
 import type {ExcalidrawElement} from "./types";
 
 const boardIdShape = {
@@ -17,10 +18,17 @@ const boardIdShape = {
     .describe("Target board id. Use list_boards to discover accessible boards."),
 };
 
+const boardDescriptionField = z
+  .string()
+  .describe(
+    `One or two plain sentences on what the board is for, shown under its name in the app's board list (never on the board itself) and returned by list_boards. Up to ${BOARD_DESCRIPTION_MAX_LENGTH} characters; line breaks collapse into spaces and longer text is cut.`,
+  );
+
 const createBoardShape = {
   title: z
     .string()
     .describe("Board name as it appears in the app's board list. Keep it short and human-readable."),
+  description: boardDescriptionField.optional(),
   visibility: z
     .enum(["private", "team", "link"])
     .optional()
@@ -33,6 +41,13 @@ const createBoardShape = {
     .describe(
       "File the new board into this folder of the owner's home page (an id from list_folders or create_folder). Needs the bot's \"Create folders\" permission. Folders only organize the owner's board list; they never change who can open a board.",
     ),
+};
+
+const setBoardDescriptionShape = {
+  ...boardIdShape,
+  description: boardDescriptionField.describe(
+    `New description for the board, shown under its name in the app's board list (never on the board itself). Up to ${BOARD_DESCRIPTION_MAX_LENGTH} characters; line breaks collapse into spaces and longer text is cut. Pass an empty string to remove the description.`,
+  ),
 };
 
 const createFolderShape = {
@@ -552,6 +567,10 @@ const toolError = (name: string, error: unknown, startedAt: number) => {
     logWarn("mcp.tool.board_creation_denied", { tool: name });
     return errorResult(error.message);
   }
+  if (error instanceof BoardEditDeniedError) {
+    logWarn("mcp.tool.board_edit_denied", { tool: name });
+    return errorResult(error.message);
+  }
   if (error instanceof FolderPermissionDeniedError) {
     logWarn("mcp.tool.folder_permission_denied", { tool: name });
     return errorResult(error.message);
@@ -626,6 +645,7 @@ Keep diagrams ≤20 nodes — split bigger content. Titles ≤6 words, no paragr
 
 export type CreateBoardInput = {
   title: string;
+  description?: string;
   visibility?: "private" | "team" | "link";
   folderId?: string;
 };
@@ -634,6 +654,10 @@ export type McpContext = {
   resolveBot: (boardId: string) => Promise<CollabBot>;
   listBoards: () => Promise<AccessibleBoard[]>;
   createBoard: (input: CreateBoardInput) => Promise<unknown>;
+  setBoardDescription: (input: {
+    boardId: string;
+    description: string;
+  }) => Promise<BoardDescriptionResult>;
   listFolders: () => Promise<FolderSummary[]>;
   createFolder: (input: { name: string }) => Promise<CreatedFolder>;
 };
@@ -716,7 +740,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "list_boards",
     {
       description:
-        "List the boards this account can access through the bot, with the bot's access level (read or write) on each. Start here: draw on an existing board whenever one fits, and only reach for create_board when the work genuinely needs a new one.",
+        "List the boards this account can access through the bot as { boardId, title, description?, botAccess } — botAccess is the bot's access level (read or write); description is the owner's short note on what the board is for, when one is set. Start here: draw on an existing board whenever one fits, and only reach for create_board when the work genuinely needs a new one.",
       inputSchema: {},
     },
     async () => runTool("list_boards", () => ctx.listBoards()),
@@ -726,15 +750,32 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "create_board",
     {
       description:
-        "Create a new empty board, owned by the account this bot acts for, and grant this bot write access to it in the same step — the returned boardId is immediately usable by the drawing tools. Requires the per-bot \"Create boards\" permission (the owner turns it on in the bot's settings); without it the call fails with an explanation to relay, not something to retry. Check list_boards first and reuse a suitable board — one board per topic, not one per diagram. Pass folderId to file the board into one of the owner's folders. Returns { boardId, title, visibility, botAccess, url, folder? }.",
+        "Create a new empty board, owned by the account this bot acts for, and grant this bot write access to it in the same step — the returned boardId is immediately usable by the drawing tools. Requires the per-bot \"Create boards\" permission (the owner turns it on in the bot's settings); without it the call fails with an explanation to relay, not something to retry. Check list_boards first and reuse a suitable board — one board per topic, not one per diagram. Give it a description saying what the board is for, so people (and later list_boards calls) can tell boards apart. Pass folderId to file the board into one of the owner's folders. Returns { boardId, title, description?, visibility, botAccess, url, folder? }.",
       inputSchema: createBoardShape,
     },
     async (args) =>
       runTool("create_board", () =>
         ctx.createBoard({
           title: args.title,
+          description: args.description,
           visibility: args.visibility,
           folderId: args.folderId,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "set_board_description",
+    {
+      description:
+        "Set or replace the short description of an existing board — the note under its name in the app's board list (it is not drawn on the board). Pass an empty string to remove it. Needs write access to the board, and the account this bot acts for must be allowed to change the board's settings (its owner, or a team admin for a team board); otherwise the call fails with an explanation to relay, not something to retry. Returns { boardId, title, description } with the text as stored (null when removed).",
+      inputSchema: setBoardDescriptionShape,
+    },
+    async (args) =>
+      runTool("set_board_description", () =>
+        ctx.setBoardDescription({
+          boardId: args.boardId,
+          description: args.description,
         }),
       ),
   );

@@ -85,6 +85,7 @@ Style and layout advice lives in \`get_diagram_guide\`. This is the mechanical c
 |---|---|
 | somewhere to draw | \`list_boards\` — and only if nothing fits, \`create_board\` |
 | keep related new boards together | \`list_folders\` / \`create_folder\`, then \`create_board {folderId}\` |
+| say what a board is for | \`create_board {description}\`, or \`set_board_description\` on an existing one |
 | flowchart / architecture / pipeline / dependency map | \`create_diagram\` (server lays it out) |
 | free-form shapes, legends, annotations | \`batch_create\` |
 | one arrow between two existing shapes | \`connect\` |
@@ -95,6 +96,8 @@ Style and layout advice lives in \`get_diagram_guide\`. This is the mechanical c
 ## Boards are the owner's, not yours
 
 \`list_boards\` is the source of truth: reuse an existing board whenever one fits — one board per topic, not one per diagram. \`create_board\` makes a new empty board owned by the account this bot acts for, grants this bot write access, and returns a \`boardId\` the drawing tools accept right away. It works only if the owner turned on this bot's "Create boards" permission; if the call comes back denied, relay that to the user instead of retrying. New boards are \`private\` unless you pass \`visibility\`.
+
+A board's \`description\` is a one-paragraph note (≤ 300 characters) shown under its name in the owner's board list, never on the canvas — it is how people and \`list_boards\` tell boards apart. Give every board you create one. \`set_board_description {boardId, description}\` changes it later (\`""\` removes it); it needs write access and an account that owns the board (or is a team admin for a team board), so a denial is something to relay, not retry.
 
 Folders are the owner's personal grouping of boards on their home page — they never change who can open a board. With the "Create folders" sub-permission (the owner can only turn it on together with "Create boards") you can \`list_folders\`, \`create_folder {name}\` and pass \`folderId\` to \`create_board\`. \`create_folder\` is idempotent by name: reuse what comes back instead of inventing variants, and do not create a folder for a single board.
 

@@ -43,6 +43,8 @@ export type BoardDoc = {
   ownerUid?: string;
   ownerEmail?: string;
   title?: string;
+  // One-paragraph blurb shown under the title in the app's board list.
+  description?: string;
   visibility?: Visibility;
   editors?: string[];
   viewers?: string[];

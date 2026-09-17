@@ -10,6 +10,11 @@ const connect = async (overrides: Partial<McpContext>) => {
     resolveBot: vi.fn(),
     listBoards: vi.fn(async () => []),
     createBoard: vi.fn(async () => ({ boardId: "b" })),
+    setBoardDescription: vi.fn(async () => ({
+      boardId: "b",
+      title: "B",
+      description: null,
+    })),
     listFolders: vi.fn(async () => []),
     createFolder: vi.fn(async () => ({
       folderId: "f",
