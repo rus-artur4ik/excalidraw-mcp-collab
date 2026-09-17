@@ -21,6 +21,14 @@ import {
   getOrCreateBot,
   statusForTokens,
 } from "./bot/CollabBot";
+import {
+  createFolderForBot,
+  decideBotFolderAccess,
+  fileBoardInFolder,
+  FolderPermissionDeniedError,
+  getFolder,
+  listFolders,
+} from "./folders";
 import {buildMcpServer, type CreateBoardInput} from "./mcp";
 import {createRateLimiter} from "./rateLimit";
 import {getFile, putFile} from "./files";
@@ -45,6 +53,13 @@ const BOARD_CREATE_WINDOW_MS = 60 * 60_000;
 const boardCreateLimiter = createRateLimiter({
   limit: BOARD_CREATE_LIMIT,
   windowMs: BOARD_CREATE_WINDOW_MS,
+});
+
+const FOLDER_CREATE_LIMIT = 20;
+const FOLDER_CREATE_WINDOW_MS = 60 * 60_000;
+const folderCreateLimiter = createRateLimiter({
+  limit: FOLDER_CREATE_LIMIT,
+  windowMs: FOLDER_CREATE_WINDOW_MS,
 });
 
 const terminateAfterLogging = (
@@ -362,6 +377,59 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     return bot;
   };
 
+  const requireFolderAccess = (tool: string) => {
+    const decision = decideBotFolderAccess(!!doc.botId, botDoc);
+    if (!decision.allowed) {
+      logWarn("mcp.folder.denied", {
+        tool,
+        botScoped: !!doc.botId,
+        reason: decision.reason,
+      });
+      throw new FolderPermissionDeniedError(decision.reason);
+    }
+  };
+
+  const listBotFolders = async () => {
+    requireFolderAccess("list_folders");
+    // Folder contents are the owner's private board list: only echo back the
+    // boards this bot is already bound to.
+    const reachable = new Set(
+      (botDoc?.boards ?? []).map((binding) => binding.boardId),
+    );
+    return (await listFolders(account)).map((folder) => ({
+      ...folder,
+      boardIds: folder.boardIds.filter((boardId) => reachable.has(boardId)),
+    }));
+  };
+
+  const createFolder = async (input: { name: string }) => {
+    requireFolderAccess("create_folder");
+    // decideBotFolderAccess only allows bot-scoped tokens, so botId is set.
+    const botId = doc.botId as string;
+    const verdict = folderCreateLimiter.take(botId);
+    if (!verdict.allowed) {
+      const retryAfterMin = Math.max(1, Math.ceil(verdict.retryAfterMs / 60_000));
+      logWarn("mcp.folder.create_rate_limited", {
+        botId,
+        retryAfterMs: verdict.retryAfterMs,
+      });
+      throw new FolderPermissionDeniedError(
+        `this bot has hit its limit of ${FOLDER_CREATE_LIMIT} new folders per hour; try again in ${retryAfterMin} min or reuse a folder from list_folders`,
+      );
+    }
+    const folder = await createFolderForBot({
+      identity: account,
+      botId,
+      name: input.name,
+    });
+    logInfo("mcp.folder.created", {
+      folderId: folder.folderId,
+      botId,
+      reused: !folder.created,
+    });
+    return folder;
+  };
+
   const createBoard = async (input: CreateBoardInput) => {
     const decision = decideBotBoardCreation(!!doc.botId, botDoc);
     if (!decision.allowed) {
@@ -370,6 +438,18 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
         reason: decision.reason,
       });
       throw new BoardCreationDeniedError(decision.reason);
+    }
+    // Resolve the target folder before anything is written: a bad folderId or a
+    // missing folder permission must not leave a stray board behind.
+    let targetFolder: Awaited<ReturnType<typeof getFolder>> = null;
+    if (input.folderId) {
+      requireFolderAccess("create_board");
+      targetFolder = await getFolder(account, input.folderId);
+      if (!targetFolder) {
+        throw new FolderPermissionDeniedError(
+          `folder "${input.folderId}" does not exist on this account; pick an id from list_folders or make one with create_folder`,
+        );
+      }
     }
     // decideBotBoardCreation only allows bot-scoped tokens, so botId is set.
     const botId = doc.botId as string;
@@ -400,13 +480,39 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
       ];
     }
     logInfo("mcp.board.created", { boardId: created.boardId, botId });
-    return { ...created, url: getBoardUrl(created.boardId) };
+    const result = { ...created, url: getBoardUrl(created.boardId) };
+    if (!targetFolder) {
+      return result;
+    }
+    // The board exists and is usable either way; a failed filing is reported
+    // next to it rather than thrown, so the agent does not retry create_board
+    // and end up with a duplicate.
+    try {
+      await fileBoardInFolder(account, targetFolder.folderId, created.boardId);
+      return {
+        ...result,
+        folder: { folderId: targetFolder.folderId, name: targetFolder.name },
+      };
+    } catch (error) {
+      logError("mcp.board.folder_filing_failed", error, {
+        boardId: created.boardId,
+        folderId: targetFolder.folderId,
+      });
+      return {
+        ...result,
+        folder: null,
+        folderWarning:
+          "the board was created but could not be filed into the folder; do not call create_board again — the owner can move it on the home page",
+      };
+    }
   };
 
   const server = buildMcpServer({
     resolveBot,
     listBoards: () => listAccessibleBoards(account),
     createBoard,
+    listFolders: listBotFolders,
+    createFolder,
   });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,

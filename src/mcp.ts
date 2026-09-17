@@ -3,6 +3,7 @@ import * as z from "zod/v3";
 
 import {BotAccessDeniedError, type CollabBot, ReadOnlyError,} from "./bot/CollabBot";
 import {BoardCreationDeniedError} from "./bots";
+import {FolderPermissionDeniedError, type CreatedFolder, type FolderSummary} from "./folders";
 import {logError, logInfo, logWarn} from "./logger";
 import {type ArrangeOptions, containerSizeForText, measureText, ROLE_NAMES, wrapText,} from "./verify";
 import {DIAGRAM_GUIDE, PALETTE_JSON, SERVER_README} from "./guide";
@@ -25,6 +26,20 @@ const createBoardShape = {
     .optional()
     .describe(
       "Who can open the board (default private): private = the owner and people they invite; team = everyone on the shared team, and the owning account must be a team member; link = anyone with the link can view, never edit. Pick the narrowest that fits — the owner can widen it later in the board's Access dialog.",
+    ),
+  folderId: z
+    .string()
+    .optional()
+    .describe(
+      "File the new board into this folder of the owner's home page (an id from list_folders or create_folder). Needs the bot's \"Create folders\" permission. Folders only organize the owner's board list; they never change who can open a board.",
+    ),
+};
+
+const createFolderShape = {
+  name: z
+    .string()
+    .describe(
+      "Folder name as it appears on the owner's home page, up to 60 characters. Short topic names work best (e.g. \"Backend\", \"Q4 planning\").",
     ),
 };
 
@@ -537,6 +552,10 @@ const toolError = (name: string, error: unknown, startedAt: number) => {
     logWarn("mcp.tool.board_creation_denied", { tool: name });
     return errorResult(error.message);
   }
+  if (error instanceof FolderPermissionDeniedError) {
+    logWarn("mcp.tool.folder_permission_denied", { tool: name });
+    return errorResult(error.message);
+  }
   logError("mcp.tool.failed", error, {
     tool: name,
     durationMs: Date.now() - startedAt,
@@ -608,12 +627,15 @@ Keep diagrams ≤20 nodes — split bigger content. Titles ≤6 words, no paragr
 export type CreateBoardInput = {
   title: string;
   visibility?: "private" | "team" | "link";
+  folderId?: string;
 };
 
 export type McpContext = {
   resolveBot: (boardId: string) => Promise<CollabBot>;
   listBoards: () => Promise<AccessibleBoard[]>;
   createBoard: (input: CreateBoardInput) => Promise<unknown>;
+  listFolders: () => Promise<FolderSummary[]>;
+  createFolder: (input: { name: string }) => Promise<CreatedFolder>;
 };
 
 export function buildMcpServer(ctx: McpContext): McpServer {
@@ -704,13 +726,38 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "create_board",
     {
       description:
-        "Create a new empty board, owned by the account this bot acts for, and grant this bot write access to it in the same step — the returned boardId is immediately usable by the drawing tools. Requires the per-bot \"Create boards\" permission (the owner turns it on in the bot's settings); without it the call fails with an explanation to relay, not something to retry. Check list_boards first and reuse a suitable board — one board per topic, not one per diagram. Returns { boardId, title, visibility, botAccess, url }.",
+        "Create a new empty board, owned by the account this bot acts for, and grant this bot write access to it in the same step — the returned boardId is immediately usable by the drawing tools. Requires the per-bot \"Create boards\" permission (the owner turns it on in the bot's settings); without it the call fails with an explanation to relay, not something to retry. Check list_boards first and reuse a suitable board — one board per topic, not one per diagram. Pass folderId to file the board into one of the owner's folders. Returns { boardId, title, visibility, botAccess, url, folder? }.",
       inputSchema: createBoardShape,
     },
     async (args) =>
       runTool("create_board", () =>
-        ctx.createBoard({ title: args.title, visibility: args.visibility }),
+        ctx.createBoard({
+          title: args.title,
+          visibility: args.visibility,
+          folderId: args.folderId,
+        }),
       ),
+  );
+
+  server.registerTool(
+    "list_folders",
+    {
+      description:
+        "List the folders on the owning account's home page as { folderId, name, boardIds } — boardIds only names boards this bot can reach. Folders are the owner's personal grouping of boards; they never change access. Requires the per-bot \"Create folders\" permission (a sub-permission of \"Create boards\"); without it the call fails with an explanation to relay.",
+      inputSchema: {},
+    },
+    async () => runTool("list_folders", () => ctx.listFolders()),
+  );
+
+  server.registerTool(
+    "create_folder",
+    {
+      description:
+        "Create a folder on the owning account's home page so related boards can be kept together; pass the returned folderId to create_board to file a new board into it. Idempotent by name (case-insensitive): if the folder already exists it is returned with created:false, so check the result instead of inventing name variants. Requires the per-bot \"Create folders\" permission, which the owner can only turn on together with \"Create boards\"; a denial is an explanation to relay, not something to retry. Returns { folderId, name, created }.",
+      inputSchema: createFolderShape,
+    },
+    async (args) =>
+      runTool("create_folder", () => ctx.createFolder({ name: args.name })),
   );
 
   server.registerTool(

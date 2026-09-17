@@ -77,7 +77,20 @@ returns them verbatim.
   bot's allow-list entry commit together). Gated by the per-bot
   `canCreateBoards` flag the owner sets in the bot's settings; a `team`-visible
   board additionally requires the owning account to be a member of the shared
-  team. Rate-limited to 10 boards per hour per bot (in-memory).
+  team. Rate-limited to 10 boards per hour per bot (in-memory). An optional
+  `folderId` files the new board into one of the owner's folders (needs the
+  folders sub-permission below; the folder is resolved before the board is
+  written, and a failed filing is reported as `folderWarning` next to the
+  created board rather than thrown).
+- `list_folders`, `create_folder` — the owner's personal home-page folders
+  (`users/{uid}/folders`), which group boards without affecting access. Gated by
+  the per-bot `canCreateFolders` flag, a sub-permission that only counts while
+  `canCreateBoards` is also on. `create_folder` is idempotent by
+  case-insensitive name and returns `{ folderId, name, created }`; capped at 20
+  per hour per bot (in-memory) and 100 folders per account. `list_folders` only
+  echoes board ids the calling bot is bound to. Folder docs carry exactly the
+  keys `firestore.rules` allows (`name`, `boardIds`, `createdAt`, `updatedAt`) —
+  an extra field would make the owner's later edits from the browser fail.
 - `describe_scene`, `query_elements` — current elements (viewer + editor).
   `fields` projects the columns you need and `limit`/`offset` page a large scene.
 - `batch_create`, `update_elements`, `delete_elements`, `delete_region` —
@@ -165,7 +178,7 @@ The agent connecting with that config draws on the board as the token's user.
 - Firestore security rules must allow the service account to read `boards`,
   `boardKeys`, `teams` and read/write `scenes*` and `mcpTokens`. (The Admin SDK
   bypasses rules; `create_board` writes `boards`, `boardKeys` and the caller's
-  `bots` document.)
+  `bots` document, and the folder tools write `users/{uid}/folders`.)
 - `PUBLIC_APP_ORIGIN` — origin the Excalidraw app is served from, used to put an
   openable `url` in the `create_board` response. Falls back to
   `PUBLIC_BASE_URL`, which is the same origin in the default stack.

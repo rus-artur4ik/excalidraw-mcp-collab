@@ -10,6 +10,12 @@ const connect = async (overrides: Partial<McpContext>) => {
     resolveBot: vi.fn(),
     listBoards: vi.fn(async () => []),
     createBoard: vi.fn(async () => ({ boardId: "b" })),
+    listFolders: vi.fn(async () => []),
+    createFolder: vi.fn(async () => ({
+      folderId: "f",
+      name: "F",
+      created: true,
+    })),
     ...overrides,
   };
   const server = buildMcpServer(ctx);
@@ -40,6 +46,7 @@ describe("create_board tool", () => {
     expect(Object.keys(tool?.inputSchema.properties ?? {})).toEqual([
       "title",
       "visibility",
+      "folderId",
     ]);
   });
 
@@ -61,6 +68,7 @@ describe("create_board tool", () => {
     expect(createBoard).toHaveBeenCalledWith({
       title: "Retro",
       visibility: "team",
+      folderId: undefined,
     });
     expect(JSON.parse(firstText(result))).toMatchObject({
       boardId: "abc",

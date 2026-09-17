@@ -32,6 +32,8 @@ export type BotDoc = {
   boards?: BotBoardBinding[];
   // Per-bot permission, set by the owner in the bot's settings. Absent = off.
   canCreateBoards?: boolean;
+  // Sub-permission of canCreateBoards: only counts while the parent is on.
+  canCreateFolders?: boolean;
   disabled?: boolean;
   createdAt?: number;
   updatedAt?: number;
