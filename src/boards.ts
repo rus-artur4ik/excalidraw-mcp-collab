@@ -18,6 +18,9 @@ export type AccessibleBoard = {
   // Omitted when the board has none, to keep list_boards small.
   description?: string;
   botAccess: "read" | "write";
+  // The owner's home-page folder holding the board; only filled in for bots
+  // with the folders permission, and omitted for boards in no folder.
+  folder?: { folderId: string; name: string };
 };
 
 type BoardQuerySnapshot = {
@@ -296,7 +299,7 @@ export function decideBoardEdit(params: {
       allowed: false,
       denial: "not_manager",
       reason:
-        "only the board's owner (or a team admin, for a team board) can change its description, and this bot acts for an account that is neither; ask the owner to change it in the board's settings",
+        "only the board's owner (or a team admin, for a team board) can change its name or description, and this bot acts for an account that is neither; ask the owner to change it in the board's settings",
     };
   }
   return { allowed: true };
@@ -309,14 +312,15 @@ export type BoardDescriptionResult = {
   description: string | null;
 };
 
-/** Sets (or, with an empty string, clears) a board's description. */
-export async function setBoardDescriptionForBot(params: {
+type BoardEditParams = {
   identity: Identity;
   boardId: string;
-  description: string;
   isFirstClass: boolean;
   binding: BotBoardBinding | undefined;
-}): Promise<BoardDescriptionResult> {
+};
+
+/** Loads the board and throws the matching tool error unless the bot may edit its details. */
+async function loadEditableBoard(params: BoardEditParams): Promise<BoardDoc> {
   const { identity, boardId } = params;
   const board = await loadBoard(boardId);
   const team = needsTeam(board) ? await loadTeam() : null;
@@ -336,6 +340,54 @@ export async function setBoardDescriptionForBot(params: {
     }
     throw new BoardEditDeniedError(decision.reason);
   }
+  return board as BoardDoc;
+}
+
+export type BoardRenameResult = {
+  boardId: string;
+  /** The name as stored, after normalization. */
+  title: string;
+  previousTitle: string;
+};
+
+/** Renames a board — the name shown in the app's board list and header. */
+export async function renameBoardForBot(
+  params: BoardEditParams & { title: string },
+): Promise<BoardRenameResult> {
+  const { identity, boardId } = params;
+  const title = normalizeBoardTitle(params.title);
+  if (title === FALLBACK_TITLE && !params.title.trim()) {
+    throw new BoardEditDeniedError("a board needs a non-empty name");
+  }
+  const board = await loadEditableBoard(params);
+  try {
+    // update (not set/merge): a board deleted mid-call fails instead of being
+    // resurrected as a doc with nothing but a title.
+    await db().collection("boards").doc(boardId).update({
+      title,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  } catch (error) {
+    logError("firestore.board.rename_failed", error, {
+      boardId,
+      subjectRef: opaqueRef(identity.uid),
+    });
+    throw error;
+  }
+
+  logInfo("firestore.board.renamed", {
+    boardId,
+    subjectRef: opaqueRef(identity.uid),
+  });
+  return { boardId, title, previousTitle: board.title ?? FALLBACK_TITLE };
+}
+
+/** Sets (or, with an empty string, clears) a board's description. */
+export async function setBoardDescriptionForBot(
+  params: BoardEditParams & { description: string },
+): Promise<BoardDescriptionResult> {
+  const { identity, boardId } = params;
+  const board = await loadEditableBoard(params);
 
   const description = normalizeBoardDescription(params.description);
   try {
@@ -364,7 +416,7 @@ export async function setBoardDescriptionForBot(params: {
   });
   return {
     boardId,
-    title: board?.title ?? FALLBACK_TITLE,
+    title: board.title ?? FALLBACK_TITLE,
     description: description || null,
   };
 }

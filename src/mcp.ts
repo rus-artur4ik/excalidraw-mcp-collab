@@ -9,7 +9,7 @@ import {logError, logInfo, logWarn} from "./logger";
 import {type ArrangeOptions, containerSizeForText, measureText, ROLE_NAMES, wrapText,} from "./verify";
 import {DIAGRAM_GUIDE, PALETTE_JSON, SERVER_README} from "./guide";
 
-import type {AccessibleBoard, BoardDescriptionResult} from "./boards";
+import type {AccessibleBoard, BoardDescriptionResult, BoardRenameResult} from "./boards";
 import type {ExcalidrawElement} from "./types";
 
 const boardIdShape = {
@@ -48,6 +48,25 @@ const setBoardDescriptionShape = {
   description: boardDescriptionField.describe(
     `New description for the board, shown under its name in the app's board list (never on the board itself). Up to ${BOARD_DESCRIPTION_MAX_LENGTH} characters; line breaks collapse into spaces and longer text is cut. Pass an empty string to remove the description.`,
   ),
+};
+
+const renameBoardShape = {
+  ...boardIdShape,
+  title: z
+    .string()
+    .describe(
+      "New board name as it appears in the app's board list and header, up to 120 characters. Keep it short and human-readable; line breaks collapse into spaces.",
+    ),
+};
+
+const moveBoardToFolderShape = {
+  ...boardIdShape,
+  folderId: z
+    .string()
+    .nullable()
+    .describe(
+      "Target folder on the owner's home page (an id from list_folders or create_folder). Pass null to take the board out of its folder. A board sits in at most one folder, so it leaves its previous one.",
+    ),
 };
 
 const createFolderShape = {
@@ -658,8 +677,23 @@ export type McpContext = {
     boardId: string;
     description: string;
   }) => Promise<BoardDescriptionResult>;
+  renameBoard: (input: {
+    boardId: string;
+    title: string;
+  }) => Promise<BoardRenameResult>;
   listFolders: () => Promise<FolderSummary[]>;
   createFolder: (input: { name: string }) => Promise<CreatedFolder>;
+  moveBoardToFolder: (input: {
+    boardId: string;
+    folderId: string | null;
+  }) => Promise<MovedBoard>;
+};
+
+export type MovedBoard = {
+  boardId: string;
+  title: string;
+  /** Where the board is filed now; null when it is in no folder. */
+  folder: { folderId: string; name: string } | null;
 };
 
 export function buildMcpServer(ctx: McpContext): McpServer {
@@ -740,7 +774,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     "list_boards",
     {
       description:
-        "List the boards this account can access through the bot as { boardId, title, description?, botAccess } — botAccess is the bot's access level (read or write); description is the owner's short note on what the board is for, when one is set. Start here: draw on an existing board whenever one fits, and only reach for create_board when the work genuinely needs a new one.",
+        "List the boards this account can access through the bot as { boardId, title, description?, botAccess, folder? } — botAccess is the bot's access level (read or write); description is the owner's short note on what the board is for, when one is set; folder is { folderId, name } of the owner's home-page folder holding the board (only shown to bots with the \"Create folders\" permission, omitted for boards in no folder). Start here: draw on an existing board whenever one fits, and only reach for create_board when the work genuinely needs a new one.",
       inputSchema: {},
     },
     async () => runTool("list_boards", () => ctx.listBoards()),
@@ -781,6 +815,19 @@ export function buildMcpServer(ctx: McpContext): McpServer {
   );
 
   server.registerTool(
+    "rename_board",
+    {
+      description:
+        "Rename an existing board — the name shown in the app's board list and header (nothing on the canvas changes). Needs write access to the board, and the account this bot acts for must be allowed to change the board's settings (its owner, or a team admin for a team board); otherwise the call fails with an explanation to relay, not something to retry. Returns { boardId, title, previousTitle } with the name as stored.",
+      inputSchema: renameBoardShape,
+    },
+    async (args) =>
+      runTool("rename_board", () =>
+        ctx.renameBoard({ boardId: args.boardId, title: args.title }),
+      ),
+  );
+
+  server.registerTool(
     "list_folders",
     {
       description:
@@ -799,6 +846,22 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     },
     async (args) =>
       runTool("create_folder", () => ctx.createFolder({ name: args.name })),
+  );
+
+  server.registerTool(
+    "move_board_to_folder",
+    {
+      description:
+        "File an existing board into one of the owner's home-page folders, or pass folderId null to take it out of its folder. A board sits in at most one folder, so it leaves its previous one. Folders only organize the owner's board list; they never change who can open a board. The bot must be able to reach the board, and needs the per-bot \"Create folders\" permission; a denial is an explanation to relay, not something to retry. Returns { boardId, title, folder } where folder is { folderId, name } or null.",
+      inputSchema: moveBoardToFolderShape,
+    },
+    async (args) =>
+      runTool("move_board_to_folder", () =>
+        ctx.moveBoardToFolder({
+          boardId: args.boardId,
+          folderId: args.folderId,
+        }),
+      ),
   );
 
   server.registerTool(

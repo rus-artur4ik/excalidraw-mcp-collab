@@ -72,6 +72,9 @@ returns them verbatim.
 
 - `list_boards` — boards the token's account can reach through the bot, with
   the bot's access level on each and the board's `description` when it has one.
+  For bots with the folders permission each entry also carries
+  `folder: { folderId, name }` when the board sits in one of the owner's
+  folders (a failed folder lookup degrades to the plain list).
 - `create_board` — new empty board owned by the token's account, bound to the
   calling bot with `write` in the same batch (board doc + `boardKeys` + the
   bot's allow-list entry commit together). Gated by the per-bot
@@ -91,6 +94,9 @@ returns them verbatim.
   doc; no collab connection is opened. Descriptions from both tools are
   normalized to one paragraph of at most 300 characters, the limit
   `firestore.rules` enforces for browser writes.
+- `rename_board` — renames a board (`title`, normalized to one line of at most
+  120 characters; an empty name is refused). Same permission check as
+  `set_board_description`; returns `{ boardId, title, previousTitle }`.
 - `list_folders`, `create_folder` — the owner's personal home-page folders
   (`users/{uid}/folders`), which group boards without affecting access. Gated by
   the per-bot `canCreateFolders` flag, a sub-permission that only counts while
@@ -100,6 +106,10 @@ returns them verbatim.
   echoes board ids the calling bot is bound to. Folder docs carry exactly the
   keys `firestore.rules` allows (`name`, `boardIds`, `createdAt`, `updatedAt`) —
   an extra field would make the owner's later edits from the browser fail.
+- `move_board_to_folder` — files a board the bot can reach (read is enough)
+  into one of the owner's folders, or with `folderId: null` takes it out of
+  every folder; a board sits in at most one folder, so the move is one batch.
+  Needs the same folders permission. Returns `{ boardId, title, folder }`.
 - `describe_scene`, `query_elements` — current elements (viewer + editor).
   `fields` projects the columns you need and `limit`/`offset` page a large scene.
 - `batch_create`, `update_elements`, `delete_elements`, `delete_region` —

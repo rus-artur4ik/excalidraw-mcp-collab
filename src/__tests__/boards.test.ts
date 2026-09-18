@@ -10,6 +10,7 @@ import {
   generateRoomKey,
   normalizeBoardDescription,
   normalizeBoardTitle,
+  renameBoardForBot,
   setBoardDescriptionForBot,
 } from "../boards";
 import {BotAccessDeniedError, ReadOnlyError} from "../bot/CollabBot";
@@ -407,6 +408,66 @@ describe("setBoardDescriptionForBot", () => {
         binding: { boardId: "b1", role: "read" },
       }),
     ).rejects.toBeInstanceOf(ReadOnlyError);
+    expect(state.updates).toHaveLength(0);
+  });
+
+  it("refuses without writing when the account does not manage the board", async () => {
+    state.boards.set("b1", {
+      ownerUid: "someone-else",
+      title: "Theirs",
+      visibility: "private",
+      editors: ["owner@x.io"],
+      viewers: [],
+    });
+    await expect(call("x")).rejects.toBeInstanceOf(BoardEditDeniedError);
+    expect(state.updates).toHaveLength(0);
+  });
+});
+
+describe("renameBoardForBot", () => {
+  const call = (title: string, boardId = "b1") =>
+    renameBoardForBot({
+      identity: owner,
+      boardId,
+      title,
+      isFirstClass: true,
+      binding: { boardId, role: "write" },
+    });
+
+  beforeEach(() => {
+    state.boards.set("b1", {
+      ownerUid: "u1",
+      title: "Retro",
+      visibility: "private",
+      editors: [],
+      viewers: [],
+    });
+  });
+
+  it("writes the normalized title and reports the previous one", async () => {
+    const result = await call("  Retro\n Q4 ");
+    expect(result).toEqual({
+      boardId: "b1",
+      title: "Retro Q4",
+      previousTitle: "Retro",
+    });
+    expect(state.updates).toHaveLength(1);
+    expect(state.updates[0]).toMatchObject({
+      collection: "boards",
+      id: "b1",
+      data: { title: "Retro Q4" },
+    });
+  });
+
+  it("refuses an empty name without writing", async () => {
+    await expect(call("   ")).rejects.toBeInstanceOf(BoardEditDeniedError);
+    expect(state.updates).toHaveLength(0);
+  });
+
+  it("refuses without writing when the bot cannot reach the board", async () => {
+    await expect(call("x", "missing")).rejects.toBeInstanceOf(
+      BotAccessDeniedError,
+    );
     expect(state.updates).toHaveLength(0);
   });
 

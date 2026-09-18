@@ -15,11 +15,21 @@ const connect = async (overrides: Partial<McpContext>) => {
       title: "B",
       description: null,
     })),
+    renameBoard: vi.fn(async () => ({
+      boardId: "b",
+      title: "B",
+      previousTitle: "A",
+    })),
     listFolders: vi.fn(async () => []),
     createFolder: vi.fn(async () => ({
       folderId: "f",
       name: "F",
       created: true,
+    })),
+    moveBoardToFolder: vi.fn(async () => ({
+      boardId: "b",
+      title: "B",
+      folder: null,
     })),
     ...overrides,
   };
@@ -108,5 +118,57 @@ describe("folder tools", () => {
       visibility: undefined,
       folderId: "f1",
     });
+  });
+
+  it("moves a board into a folder and back out with null", async () => {
+    const moveBoardToFolder = vi.fn(async (input: { folderId: string | null }) => ({
+      boardId: "b1",
+      title: "Retro",
+      folder: input.folderId ? { folderId: input.folderId, name: "Backend" } : null,
+    }));
+    const { client } = await connect({ moveBoardToFolder });
+
+    const filed = await client.callTool({
+      name: "move_board_to_folder",
+      arguments: { boardId: "b1", folderId: "f1" },
+    });
+    expect(JSON.parse(firstText(filed))).toEqual({
+      boardId: "b1",
+      title: "Retro",
+      folder: { folderId: "f1", name: "Backend" },
+    });
+
+    const unfiled = await client.callTool({
+      name: "move_board_to_folder",
+      arguments: { boardId: "b1", folderId: null },
+    });
+    expect(moveBoardToFolder).toHaveBeenLastCalledWith({
+      boardId: "b1",
+      folderId: null,
+    });
+    expect(JSON.parse(firstText(unfiled)).folder).toBeNull();
+  });
+
+  it("requires both boardId and folderId on move_board_to_folder", async () => {
+    const { client } = await connect({});
+    const tool = (await client.listTools()).tools.find(
+      (candidate) => candidate.name === "move_board_to_folder",
+    );
+    expect(tool?.inputSchema.required).toEqual(["boardId", "folderId"]);
+  });
+
+  it("passes the folder of each board through list_boards", async () => {
+    const boards = [
+      {
+        boardId: "b1",
+        title: "Retro",
+        botAccess: "write" as const,
+        folder: { folderId: "f1", name: "Backend" },
+      },
+      { boardId: "b2", title: "Loose", botAccess: "read" as const },
+    ];
+    const { client } = await connect({ listBoards: vi.fn(async () => boards) });
+    const result = await client.callTool({ name: "list_boards", arguments: {} });
+    expect(JSON.parse(firstText(result))).toEqual(boards);
   });
 });

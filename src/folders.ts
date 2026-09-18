@@ -197,12 +197,13 @@ export async function getFolder(
 }
 
 /**
- * Files a board into a folder. A board sits in at most one folder, so it is
- * pulled out of every other folder in the same batch.
+ * Files a board into a folder, or with `folderId: null` takes it out of every
+ * folder (back to the loose boards on the home page). A board sits in at most
+ * one folder, so it is pulled out of every other folder in the same batch.
  */
 export async function fileBoardInFolder(
   identity: Identity,
-  folderId: string,
+  folderId: string | null,
   boardId: string,
 ): Promise<void> {
   const uid = requireUid(identity);
@@ -217,15 +218,17 @@ export async function fileBoardInFolder(
       });
     }
   }
-  // update (not set/merge): a folder deleted mid-call fails the batch instead
-  // of being resurrected as a nameless doc.
-  batch.update(foldersOf(uid).doc(folderId), {
-    boardIds: FieldValue.arrayUnion(boardId),
-    updatedAt: now,
-  });
+  if (folderId) {
+    // update (not set/merge): a folder deleted mid-call fails the batch
+    // instead of being resurrected as a nameless doc.
+    batch.update(foldersOf(uid).doc(folderId), {
+      boardIds: FieldValue.arrayUnion(boardId),
+      updatedAt: now,
+    });
+  }
   await batch.commit();
-  logInfo("firestore.folder.board_filed", {
-    folderId,
+  logInfo(folderId ? "firestore.folder.board_filed" : "firestore.folder.board_unfiled", {
+    ...(folderId ? { folderId } : {}),
     boardId,
     subjectRef: opaqueRef(uid),
   });

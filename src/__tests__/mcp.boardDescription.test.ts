@@ -16,11 +16,21 @@ const connect = async (overrides: Partial<McpContext>) => {
       title: "B",
       description: null,
     })),
+    renameBoard: vi.fn(async () => ({
+      boardId: "b",
+      title: "B",
+      previousTitle: "A",
+    })),
     listFolders: vi.fn(async () => []),
     createFolder: vi.fn(async () => ({
       folderId: "f",
       name: "F",
       created: true,
+    })),
+    moveBoardToFolder: vi.fn(async () => ({
+      boardId: "b",
+      title: "B",
+      folder: null,
     })),
     ...overrides,
   };
@@ -128,5 +138,48 @@ describe("set_board_description tool", () => {
     });
     expect(isError(result)).toBe(true);
     expect(setBoardDescription).not.toHaveBeenCalled();
+  });
+});
+
+describe("rename_board tool", () => {
+  it("is advertised with a required boardId and title", async () => {
+    const { client } = await connect({});
+    const tool = (await client.listTools()).tools.find(
+      (candidate) => candidate.name === "rename_board",
+    );
+    expect(tool?.inputSchema.required).toEqual(["boardId", "title"]);
+  });
+
+  it("forwards the arguments and returns the stored name", async () => {
+    const renameBoard = vi.fn(async () => ({
+      boardId: "abc",
+      title: "Retro Q4",
+      previousTitle: "Retro",
+    }));
+    const { client } = await connect({ renameBoard });
+    const result = await client.callTool({
+      name: "rename_board",
+      arguments: { boardId: "abc", title: "Retro Q4" },
+    });
+    expect(renameBoard).toHaveBeenCalledWith({ boardId: "abc", title: "Retro Q4" });
+    expect(JSON.parse(firstText(result))).toEqual({
+      boardId: "abc",
+      title: "Retro Q4",
+      previousTitle: "Retro",
+    });
+  });
+
+  it("relays a settings denial", async () => {
+    const { client } = await connect({
+      renameBoard: vi.fn(async () => {
+        throw new BoardEditDeniedError("only the board's owner can change its name");
+      }),
+    });
+    const result = await client.callTool({
+      name: "rename_board",
+      arguments: { boardId: "abc", title: "x" },
+    });
+    expect(isError(result)).toBe(true);
+    expect(firstText(result)).toContain("owner");
   });
 });

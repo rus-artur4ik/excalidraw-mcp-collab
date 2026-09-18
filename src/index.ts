@@ -2,8 +2,14 @@ import {StreamableHTTPServerTransport} from "@modelcontextprotocol/sdk/server/st
 import express, {type NextFunction, type Request, type RequestHandler, type Response,} from "express";
 
 import {config, getBoardUrl, getMcpUrl} from "./config";
-import {authorize} from "./acl";
-import {createBoardForBot, listAccessibleBoards, setBoardDescriptionForBot} from "./boards";
+import {authorize, loadBoard} from "./acl";
+import {
+  createBoardForBot,
+  listAccessibleBoards,
+  normalizeBoardTitle,
+  renameBoardForBot,
+  setBoardDescriptionForBot,
+} from "./boards";
 import {auth} from "./firebase";
 import {createToken, getToken, listTokens, revokeToken, touchToken,} from "./tokens";
 import {
@@ -524,13 +530,95 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     });
   };
 
+  const renameBoard = async (input: { boardId: string; title: string }) => {
+    setLogContext({ boardId: input.boardId });
+    return renameBoardForBot({
+      identity: account,
+      boardId: input.boardId,
+      title: input.title,
+      isFirstClass: !!doc.botId,
+      binding: doc.botId ? bindingFor(botDoc, input.boardId) : undefined,
+    });
+  };
+
+  const moveBoardToFolder = async (input: {
+    boardId: string;
+    folderId: string | null;
+  }) => {
+    requireFolderAccess("move_board_to_folder");
+    setLogContext({ boardId: input.boardId });
+    // Only boards this bot can already reach may be (re)filed; read access is
+    // enough, since folders never change who can open a board.
+    const access = await authorize(input.boardId, account, { asBot: true });
+    const decision = decideBotBoardAccess(
+      !!doc.botId,
+      bindingFor(botDoc, input.boardId),
+      access,
+    );
+    if (!decision.allowed) {
+      logWarn("mcp.board.access_denied", {
+        boardId: input.boardId,
+        tool: "move_board_to_folder",
+        canRead: access.canRead,
+      });
+      throw new BotAccessDeniedError(input.boardId);
+    }
+    const folderId = input.folderId || null;
+    const target = folderId ? await getFolder(account, folderId) : null;
+    if (folderId && !target) {
+      throw new FolderPermissionDeniedError(
+        `folder "${folderId}" does not exist on this account; pick an id from list_folders or make one with create_folder`,
+      );
+    }
+    await fileBoardInFolder(account, folderId, input.boardId);
+    const board = await loadBoard(input.boardId);
+    logInfo("mcp.board.moved_to_folder", {
+      boardId: input.boardId,
+      folderId: folderId ?? undefined,
+    });
+    return {
+      boardId: input.boardId,
+      title: normalizeBoardTitle(board?.title),
+      folder: target ? { folderId: target.folderId, name: target.name } : null,
+    };
+  };
+
+  const listBoards = async () => {
+    const boards = await listAccessibleBoards(account);
+    // Folder names are the owner's private organization: only bots allowed to
+    // work with folders get to see which folder holds each board.
+    if (!decideBotFolderAccess(!!doc.botId, botDoc).allowed) {
+      return boards;
+    }
+    let folders: Awaited<ReturnType<typeof listFolders>>;
+    try {
+      folders = await listFolders(account);
+    } catch (error) {
+      // The board list is what the agent needs; folders are a bonus.
+      logError("mcp.list_boards.folders_failed", error);
+      return boards;
+    }
+    const folderOf = new Map<string, { folderId: string; name: string }>();
+    for (const folder of folders) {
+      for (const boardId of folder.boardIds) {
+        folderOf.set(boardId, { folderId: folder.folderId, name: folder.name });
+      }
+    }
+    return boards.map((board) => {
+      const folder = folderOf.get(board.boardId);
+      return folder ? { ...board, folder } : board;
+    });
+  };
+
   const server = buildMcpServer({
     resolveBot,
-    listBoards: () => listAccessibleBoards(account),
+    listBoards,
     createBoard,
     setBoardDescription,
+    renameBoard,
     listFolders: listBotFolders,
     createFolder,
+    moveBoardToFolder,
   });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,

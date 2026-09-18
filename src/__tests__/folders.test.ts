@@ -229,4 +229,16 @@ describe("fileBoardInFolder", () => {
       ["users/u1/folders/f2", { __union: ["b1"] }],
     ]);
   });
+
+  it("takes the board out of every folder when the target is null", async () => {
+    state.folders.set("f1", { name: "A", boardIds: ["b1"] });
+    state.folders.set("f2", { name: "B", boardIds: [] });
+
+    await fileBoardInFolder(identity, null, "b1");
+
+    expect(state.committed).toBe(1);
+    expect(
+      state.ops.map((op) => [op.path, op.data.boardIds]),
+    ).toEqual([["users/u1/folders/f1", { __remove: ["b1"] }]]);
+  });
 });

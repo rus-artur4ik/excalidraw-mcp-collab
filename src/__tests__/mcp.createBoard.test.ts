@@ -15,11 +15,21 @@ const connect = async (overrides: Partial<McpContext>) => {
       title: "B",
       description: null,
     })),
+    renameBoard: vi.fn(async () => ({
+      boardId: "b",
+      title: "B",
+      previousTitle: "A",
+    })),
     listFolders: vi.fn(async () => []),
     createFolder: vi.fn(async () => ({
       folderId: "f",
       name: "F",
       created: true,
+    })),
+    moveBoardToFolder: vi.fn(async () => ({
+      boardId: "b",
+      title: "B",
+      folder: null,
     })),
     ...overrides,
   };
