@@ -1,3 +1,5 @@
+import {randomBytes} from "crypto";
+
 import {reassertElement} from "./elements";
 
 import type {ExcalidrawElement} from "./types";
@@ -21,6 +23,52 @@ export const mergeByVersion = (
     }
   }
   return [...byId.values()];
+};
+
+export type PersistMerge = {
+  merged: ExcalidrawElement[];
+  // Stored copies that beat ours (a newer version we never saw): adopt them.
+  storedWins: ExcalidrawElement[];
+  // Our creations re-versioned above a stored tombstone so they are not lost.
+  bumped: ExcalidrawElement[];
+};
+
+// mergeByVersion for a persist, with one exception: an element this commit
+// just created (or revived) must win over a stored copy of the same id — a
+// tombstone left by an earlier delete would otherwise swallow it silently.
+export const mergeForPersist = (
+  mine: readonly ExcalidrawElement[],
+  stored: readonly ExcalidrawElement[],
+  reviveIds: ReadonlySet<string> = new Set(),
+): PersistMerge => {
+  const storedById = new Map(stored.map((element) => [element.id, element] as const));
+  const bumped: ExcalidrawElement[] = [];
+  const adjusted = mine.map((element) => {
+    if (!reviveIds.has(element.id) || element.isDeleted) {
+      return element;
+    }
+    const other = storedById.get(element.id);
+    if (!other || other.version < element.version) {
+      return element;
+    }
+    const lifted = {
+      ...element,
+      version: other.version + 1,
+      versionNonce: randomBytes(4).readUInt32BE(0),
+    };
+    bumped.push(lifted);
+    return lifted;
+  });
+  const merged = mergeByVersion(adjusted, stored);
+  const mergedById = new Map(merged.map((element) => [element.id, element] as const));
+  const storedWins: ExcalidrawElement[] = [];
+  for (const element of adjusted) {
+    const winner = mergedById.get(element.id);
+    if (winner && winner !== element) {
+      storedWins.push(winner);
+    }
+  }
+  return { merged, storedWins, bumped };
 };
 
 export type ConflictKind =

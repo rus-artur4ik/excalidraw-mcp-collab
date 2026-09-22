@@ -2,6 +2,7 @@ import {describe, expect, it} from "vitest";
 
 import {lintElement, lintScene} from "../lint";
 import {segmentElementOverlap} from "../geometry";
+import {planArrowPath} from "../bindings";
 import {el} from "./factory";
 
 const codes = (findings: { code: string }[]) => findings.map((f) => f.code);
@@ -108,23 +109,31 @@ describe("text overflow", () => {
 });
 
 describe("binding integrity", () => {
-  it("flags a dangling binding", () => {
-    const { findings } = lintScene([
-      el({
-        type: "arrow",
-        x: 0,
-        y: 0,
-        width: 50,
-        height: 0,
-        points: [
-          [0, 0],
-          [50, 0],
-        ],
-        startBinding: { elementId: "missing", fixedPoint: [1, 0.5], mode: "orbit" },
-        endBinding: null,
-      }),
-    ]);
-    expect(codes(findings)).toContain("arrow_dangling_binding");
+  const dangling = (customData?: Record<string, unknown>) =>
+    el({
+      type: "arrow",
+      x: 0,
+      y: 0,
+      width: 50,
+      height: 0,
+      points: [
+        [0, 0],
+        [50, 0],
+      ],
+      startBinding: { elementId: "missing", fixedPoint: [1, 0.5], mode: "orbit" },
+      endBinding: null,
+      ...(customData ? { customData } : {}),
+    });
+
+  it("flags a binding to a missing element as binding_target_missing", () => {
+    const { findings } = lintScene([dangling()]);
+    expect(codes(findings)).toContain("binding_target_missing");
+    expect(codes(findings)).not.toContain("arrow_dangling_binding");
+  });
+
+  it("still honours a lintIgnore of the old arrow_dangling_binding code", () => {
+    const { findings } = lintScene([dangling({ lintIgnore: ["arrow_dangling_binding"] })]);
+    expect(codes(findings)).not.toContain("binding_target_missing");
   });
 
   it("flags a missing back-reference", () => {
@@ -163,7 +172,7 @@ describe("binding integrity", () => {
     expect(codes(findings)).toContain("binding_invalid");
   });
 
-  it("flags an unbound endpoint touching a shape", () => {
+  it("flags an unbound arrowhead touching a shape", () => {
     const rect = el({ type: "rectangle", id: "R", x: 0, y: 0, width: 100, height: 60 });
     const arrow = el({
       type: "arrow",
@@ -178,6 +187,7 @@ describe("binding integrity", () => {
       ],
       startBinding: null,
       endBinding: null,
+      endArrowhead: "arrow",
     });
     const { findings } = lintScene([rect, arrow]);
     expect(codes(findings)).toContain("arrow_unbound_endpoint");
@@ -286,43 +296,55 @@ describe("overlap treats contained text as a label", () => {
   });
 });
 
+// alignment_near_miss only compares elements that share a frame, group or
+// table, so these pairs are grouped.
 describe("alignment near-miss noise reduction", () => {
+  const grouped = { groupIds: ["g"] };
+
   it("stays quiet when already centered on an axis", () => {
-    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
-    const b = el({ type: "rectangle", x: 300, y: 2, width: 100, height: 96 });
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100, ...grouped });
+    const b = el({ type: "rectangle", x: 300, y: 2, width: 100, height: 96, ...grouped });
     const { findings } = lintScene([a, b]);
     expect(codes(findings)).not.toContain("alignment_near_miss");
   });
 
   it("still flags a genuine few-px misalignment", () => {
-    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
-    const b = el({ type: "rectangle", x: 2, y: 300, width: 100, height: 100 });
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100, ...grouped });
+    const b = el({ type: "rectangle", x: 2, y: 300, width: 100, height: 100, ...grouped });
     const { findings } = lintScene([a, b]);
     expect(codes(findings)).toContain("alignment_near_miss");
   });
 
   it("stays quiet for a row of different-radius circles sharing centerY", () => {
-    const a = el({ type: "ellipse", x: 0, y: 100, width: 100, height: 100 });
-    const b = el({ type: "ellipse", x: 200, y: 102, width: 96, height: 96 });
+    const a = el({ type: "ellipse", x: 0, y: 100, width: 100, height: 100, ...grouped });
+    const b = el({ type: "ellipse", x: 200, y: 102, width: 96, height: 96, ...grouped });
     const { findings } = lintScene([a, b]);
     expect(codes(findings)).not.toContain("alignment_near_miss");
   });
 
   it("points at the center, not the edges, when near-centered with unequal sizes", () => {
-    const a = el({ type: "ellipse", x: 0, y: 100, width: 100, height: 100 });
-    const b = el({ type: "ellipse", x: 200, y: 105, width: 96, height: 96 });
+    const a = el({ type: "ellipse", x: 0, y: 100, width: 100, height: 100, ...grouped });
+    const b = el({ type: "ellipse", x: 200, y: 105, width: 96, height: 96, ...grouped });
     const { findings } = lintScene([a, b]);
-    const near = findings.find((finding) => finding.code === "alignment_near_miss");
-    expect(near?.message).toContain("centerY");
-    expect(near?.suggestion).toMatchObject({ action: "align", edge: "centerY" });
+    const near = findings.filter((finding) => finding.code === "alignment_near_miss");
+    expect(near).toHaveLength(1);
+    expect(near[0].message).toContain("centerY");
+    expect(near[0].kind).toBe("centerY");
   });
 
   it("still flags an edge alignment when centers are far apart", () => {
-    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
-    const b = el({ type: "rectangle", x: 2, y: 300, width: 200, height: 100 });
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100, ...grouped });
+    const b = el({ type: "rectangle", x: 2, y: 300, width: 200, height: 100, ...grouped });
     const { findings } = lintScene([a, b]);
     const near = findings.find((finding) => finding.code === "alignment_near_miss");
-    expect(near?.suggestion).toMatchObject({ action: "align", edge: "left" });
+    expect(near?.kind).toBe("left");
+  });
+
+  it("does not compare elements that share nothing", () => {
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
+    const b = el({ type: "rectangle", x: 2, y: 300, width: 100, height: 100 });
+    const { findings } = lintScene([a, b]);
+    expect(codes(findings)).not.toContain("alignment_near_miss");
   });
 });
 
@@ -344,10 +366,12 @@ describe("scoped validate", () => {
   });
 
   it("minSeverity drops lower-severity findings", () => {
-    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100 });
-    const b = el({ type: "rectangle", x: 2, y: 300, width: 100, height: 100 });
+    const a = el({ type: "rectangle", x: 0, y: 0, width: 100, height: 100, strokeColor: "#123456" });
+    const b = el({ type: "rectangle", x: 0, y: 300, width: 100, height: 100 });
+    expect(lintScene([a, b]).findings.some((f) => f.severity === "info")).toBe(true);
     const result = lintScene([a, b], { minSeverity: "warning" });
     expect(result.findings.some((f) => f.severity === "info")).toBe(false);
+    expect(result.summary.coverage).not.toContain("style_off_palette_color");
   });
 
   it("codes keeps only the requested rule", () => {
@@ -379,23 +403,28 @@ describe("text_overflow names the axis that actually failed", () => {
     expect(overflow.message).not.toContain("too WIDE");
   });
 
+  const patchOf = (suggestion: unknown) =>
+    ((suggestion as { args: { elements: Array<Record<string, unknown>> } }).args.elements)[0];
+
   it("suggests a strictly larger container, never the current size", () => {
     const diamond = el({ type: "diamond", id: "D", x: 0, y: 0, width: 400, height: 180, index: "a1" });
     const { findings } = lintScene([diamond, label("D")]);
-    const suggestion = findings.find((f) => f.code === "text_overflow")!
-      .suggestion as { id: string; width?: number; height: number };
-    expect(suggestion.id).toBe("D");
-    expect(suggestion.height).toBeGreaterThan(180);
-    expect(suggestion.width).toBeUndefined();
+    const overflow = findings.find((f) => f.code === "text_overflow")!;
+    expect(overflow.kind).toBe("overflow");
+    expect(overflow.severity).toBe("error");
+    expect(overflow.suggestion).toMatchObject({ tool: "update_elements" });
+    const patch = patchOf(overflow.suggestion);
+    expect(patch.id).toBe("D");
+    expect(patch.height as number).toBeGreaterThan(180);
+    expect(patch.width).toBeUndefined();
   });
 
   it("offers shrinking the text as an alternative", () => {
     const diamond = el({ type: "diamond", id: "D", x: 0, y: 0, width: 400, height: 180, index: "a1" });
     const { findings } = lintScene([diamond, label("D")]);
-    const suggestion = findings.find((f) => f.code === "text_overflow")!
-      .suggestion as { alternative: { id: string; fontSize?: number } };
-    expect(suggestion.alternative.id).toBe("T");
-    expect(suggestion.alternative.fontSize).toBeLessThan(20);
+    const alternative = patchOf(findings.find((f) => f.code === "text_overflow")!.alternative);
+    expect(alternative.id).toBe("T");
+    expect(alternative.fontSize as number).toBeLessThan(20);
   });
 });
 
@@ -434,17 +463,20 @@ describe("arrow_crosses_element", () => {
     expect(codes(findings)).not.toContain("arrow_crosses_element");
   });
 
-  it("suggests waypoints that actually clear the obstacle", () => {
+  it("suggests waypoints whose re-planned path clears the obstacle", () => {
     const { findings } = lintScene([bound(from, "R"), bound(to, "R"), blocker, arrow]);
-    const suggestion = findings.find((f) => f.code === "arrow_crosses_element")!
-      .suggestion as { action: string; blockedBy: string; waypoints: [number, number][] };
-    expect(suggestion.action).toBe("reroute");
-    expect(suggestion.blockedBy).toBe("X");
-    const detour = suggestion.waypoints[0];
-    const start: [number, number] = [60, 30];
-    const end: [number, number] = [400, 30];
-    expect(segmentElementOverlap(blocker, start, detour)).toBe(0);
-    expect(segmentElementOverlap(blocker, detour, end)).toBe(0);
+    const suggestion = findings.find((f) => f.code === "arrow_crosses_element")!.suggestion as unknown as {
+      tool: string;
+      args: { elements: Array<{ id: string; waypoints: [number, number][] }> };
+    };
+    expect(suggestion.tool).toBe("update_elements");
+    const [patch] = suggestion.args.elements;
+    expect(patch.id).toBe("R");
+    const planned = planArrowPath(from, to, { waypoints: patch.waypoints });
+    const path = planned.points.map(([px, py]) => [planned.x + px, planned.y + py] as [number, number]);
+    for (let i = 0; i < path.length - 1; i++) {
+      expect(segmentElementOverlap(blocker, path[i], path[i + 1])).toBe(0);
+    }
   });
 
   it("is reported inline when the arrow is created", () => {
@@ -469,6 +501,7 @@ describe("per-element lintIgnore", () => {
         width: 40,
         height: 0,
         points: [[0, 0], [40, 0]],
+        endArrowhead: "arrow",
         ...(customData ? { customData } : {}),
       });
     const target = el({ type: "rectangle", id: "S", x: 42, y: 100, width: 60, height: 40 });
@@ -489,7 +522,21 @@ describe("per-element lintIgnore", () => {
       customData: { lintIgnore: ["isolated"] },
     });
     const orphan = el({ type: "rectangle", id: "O", x: 500 });
-    const { graph } = lintScene([legend, orphan]);
+    // isolated only counts where arrows exist at all.
+    const a = el({ type: "rectangle", id: "A", x: 0, y: 400, width: 60, height: 60, boundElements: [{ id: "E", type: "arrow" }] });
+    const b = el({ type: "rectangle", id: "B", x: 300, y: 400, width: 60, height: 60, boundElements: [{ id: "E", type: "arrow" }] });
+    const edge = el({
+      type: "arrow",
+      id: "E",
+      x: 65,
+      y: 430,
+      width: 230,
+      height: 0,
+      points: [[0, 0], [230, 0]],
+      startBinding: { elementId: "A", fixedPoint: [1, 0.5001], mode: "orbit" },
+      endBinding: { elementId: "B", fixedPoint: [0, 0.5001], mode: "orbit" },
+    });
+    const { graph } = lintScene([legend, orphan, a, b, edge]);
     expect(graph.isolated).toEqual(["O"]);
   });
 });

@@ -113,18 +113,6 @@ export const FONT_LINE_HEIGHTS: Record<number, number> = {
   10: 1.25,
 };
 
-export const FONT_CSS_FAMILIES: Record<number, string> = {
-  1: "Virgil, Segoe UI Emoji",
-  2: "Helvetica, Arial, sans-serif",
-  3: "Cascadia, monospace",
-  5: "Excalifont, Segoe UI Emoji, sans-serif",
-  6: "Nunito, sans-serif",
-  7: "Lilita One, sans-serif",
-  8: "Comic Shanns, monospace",
-  9: "Liberation Sans, Arial, sans-serif",
-  10: "Assistant, sans-serif",
-};
-
 export const MONOSPACE_FAMILIES = new Set([3, 8]);
 
 export const FILL_STYLES = new Set(["hachure", "cross-hatch", "solid", "zigzag"]);
@@ -153,10 +141,6 @@ export const ARROWHEADS = new Set([
 
 export const lineHeightForFamily = (fontFamily?: number): number =>
   FONT_LINE_HEIGHTS[fontFamily ?? DEFAULT_FONT_FAMILY] ?? 1.25;
-
-export const cssFamilyFor = (fontFamily?: number): string =>
-  FONT_CSS_FAMILIES[fontFamily ?? DEFAULT_FONT_FAMILY] ??
-  FONT_CSS_FAMILIES[DEFAULT_FONT_FAMILY];
 
 export const isTransparent = (color: string | undefined): boolean =>
   !color || color === "transparent" || color === "" || color === "none";

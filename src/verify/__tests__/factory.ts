@@ -1,4 +1,5 @@
 import type {ExcalidrawElement} from "../../types";
+import {measureText} from "../textMetrics";
 
 let counter = 0;
 
@@ -37,4 +38,24 @@ export const el = (
     ...overrides,
     id: overrides.id ?? `el-${counter}`,
   } as ExcalidrawElement;
+};
+
+/** A text element sized with measureText, like the server creates them. */
+export const textEl = (
+  overrides: Partial<ExcalidrawElement> & { text: string },
+): ExcalidrawElement => {
+  const fontSize = typeof overrides.fontSize === "number" ? overrides.fontSize : 20;
+  const fontFamily = typeof overrides.fontFamily === "number" ? overrides.fontFamily : 5;
+  const size = measureText(overrides.text, fontSize, fontFamily);
+  return el({
+    type: "text",
+    width: size.width,
+    height: size.height,
+    fontSize,
+    fontFamily,
+    textAlign: "left",
+    verticalAlign: "top",
+    containerId: null,
+    ...overrides,
+  });
 };

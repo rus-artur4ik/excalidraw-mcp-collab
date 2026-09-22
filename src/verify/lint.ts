@@ -1,51 +1,27 @@
 import type {ExcalidrawElement} from "../types";
+import type {BoardProfile} from "../profile";
+import {kindOf, lintIgnoreEntries, roleOf} from "../customData";
+import {asLinear, type Bounds, isBindable, isFrameLike, isLinear} from "./model";
+import {boundsContain, getElementBounds} from "./geometry";
+import {boundsIntersect, buildLintContext, isDivider, type LintFinding, NON_NODE_KINDS, tableIdOf,} from "./lintContext";
 import {
-    ARROWHEADS,
-    asLinear,
-    asText,
-    type Bounds,
-    FILL_STYLES,
-    FONT_LINE_HEIGHTS,
-    isBindable,
-    isLinear,
-    isTransparent,
-    MAX_BINDING_DISTANCE,
-    type Point,
-    ROUGHNESS_VALUES,
-    STROKE_STYLES,
-} from "./model";
-import {
-    boundsArea,
-    boundsContain,
-    distanceToElement,
-    getCommonBounds,
-    getElementBounds,
-    globalLinearPoints,
-    intersectionArea,
-    pointInElement,
-    segmentElementOverlap,
-} from "./geometry";
-import {bindingGap} from "./bindings";
-import {contrastRatio, parseColor, suggestReadableColor} from "./colors";
-import {PALETTE_STROKES} from "./styles";
-import {
-    type ContainerTextFit,
-    fitTextToContainer,
-    largestFittingFontSize,
-    measureText,
-    OVERFLOW_EPSILON,
-    wrapText,
-} from "./textMetrics";
+    canonicalLintCode,
+    LINT_RULE_CODES,
+    LINT_RULES,
+    lintCodesForProfile,
+    type LintProfile,
+    type Severity,
+    SEVERITY_RANK,
+} from "./lintProfiles";
+import {elementRules} from "./lintElementRules";
+import {arrowRules} from "./lintArrowRules";
+import {layoutRules} from "./lintLayoutRules";
+import {tableRules} from "./lintTableRules";
+import {profileRules} from "./lintProfileRules";
 
-export type Severity = "error" | "warning" | "info";
-
-export type LintFinding = {
-  code: string;
-  severity: Severity;
-  elementIds: string[];
-  message: string;
-  suggestion?: Record<string, unknown>;
-};
+export type {LintFinding} from "./lintContext";
+export type {LintProfile, LintRuleCode, LintRuleSpec, Severity} from "./lintProfiles";
+export {canonicalLintCode, LINT_CODE_ALIASES, LINT_PROFILES, LINT_RULES, lintCodesForProfile,} from "./lintProfiles";
 
 export type LintOptions = {
   disabledRules?: string[];
@@ -55,38 +31,218 @@ export type LintOptions = {
 export type LintScopeOptions = LintOptions & {
   ids?: string[];
   region?: Bounds;
+  // Selects rules directly, from any profile.
   codes?: string[];
   minSeverity?: Severity;
   summaryOnly?: boolean;
+  profile?: LintProfile;
+  // Free space a label must keep inside its container (text_overflow tight).
+  minPadding?: number;
+  // The persisted scene; enables not_persisted.
+  stored?: readonly ExcalidrawElement[];
+  // The board's (or its folder's) style profile; enables the type-scale and
+  // semantic rules, which have nothing to check against without it.
+  boardProfile?: BoardProfile;
 };
 
-const SEVERITY_RANK: Record<Severity, number> = {
-  error: 3,
-  warning: 2,
-  info: 1,
+export type LintSummary = {
+  errors: number;
+  warnings: number;
+  infos: number;
+  // Every rule code evaluated in this run: "0 findings" for a code listed
+  // here means clean, a code missing here was not checked.
+  coverage: string[];
+  // Findings hidden by lintIgnore entries without `with` (bare codes).
+  suppressedBroadly: number;
 };
 
-const boundsIntersect = (a: Bounds, b: Bounds): boolean =>
-  a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+export type ConnectivityGraph = {
+  nodeCount: number;
+  edgeCount: number;
+  isolated: string[];
+};
 
-const SEPARATION_MARGIN = 20;
+export type LintResult = {
+  findings: LintFinding[];
+  summary: LintSummary;
+  graph: ConnectivityGraph;
+  scope?: { kind: "ids" | "region"; matched: number };
+  profile: LintProfile;
+};
 
-const smallestSingleAxisSeparation = (
-  move: Bounds,
-  fixed: Bounds,
-): { dx: number; dy: number } => {
-  const pushes: Array<{ dx: number; dy: number }> = [
-    { dx: Math.ceil(fixed[2] - move[0] + SEPARATION_MARGIN), dy: 0 },
-    { dx: -Math.ceil(move[2] - fixed[0] + SEPARATION_MARGIN), dy: 0 },
-    { dx: 0, dy: Math.ceil(fixed[3] - move[1] + SEPARATION_MARGIN) },
-    { dx: 0, dy: -Math.ceil(move[3] - fixed[1] + SEPARATION_MARGIN) },
-  ];
-  return pushes.reduce((best, push) =>
-    Math.abs(push.dx + push.dy) < Math.abs(best.dx + best.dy) ? push : best,
+export const DEFAULT_MIN_PADDING = 8;
+export const ISOLATED_RULE = "isolated";
+
+const MAX_PAIRWISE_ELEMENTS = 1500;
+
+// Identity of a finding across two runs, so a write can report only the
+// findings it introduced.
+export const findingKey = (finding: LintFinding): string =>
+  `${finding.code}|${[...new Set(finding.elementIds)].sort().join(",")}|${finding.kind ?? ""}`;
+
+// ---- lintIgnore -------------------------------------------------------------
+
+type IgnoreEntry = { code: string; with?: string[] };
+
+// An element's effective lintIgnore: its own entries, its frame's, and those
+// of every element it shares a group with (one member opts the group out).
+const ignoreResolver = (
+  live: readonly ExcalidrawElement[],
+  byId: Map<string, ExcalidrawElement>,
+): ((element: ExcalidrawElement) => IgnoreEntry[]) => {
+  const byGroup = new Map<string, IgnoreEntry[]>();
+  for (const element of live) {
+    const entries = lintIgnoreEntries(element);
+    if (!entries.length) {
+      continue;
+    }
+    for (const groupId of element.groupIds ?? []) {
+      byGroup.set(groupId, [...(byGroup.get(groupId) ?? []), ...entries]);
+    }
+  }
+  const cache = new Map<string, IgnoreEntry[]>();
+  return (element) => {
+    let entries = cache.get(element.id);
+    if (!entries) {
+      const frame = typeof element.frameId === "string" ? byId.get(element.frameId) : undefined;
+      entries = [
+        ...lintIgnoreEntries(element),
+        ...(frame ? lintIgnoreEntries(frame) : []),
+        ...(element.groupIds ?? []).flatMap((groupId) => byGroup.get(groupId) ?? []),
+      ];
+      cache.set(element.id, entries);
+    }
+    return entries;
+  };
+};
+
+const suppressionOf = (
+  finding: LintFinding,
+  byId: Map<string, ExcalidrawElement>,
+  resolve: (element: ExcalidrawElement) => IgnoreEntry[],
+): "broad" | "narrow" | null => {
+  let broad = false;
+  for (const id of finding.elementIds) {
+    const element = byId.get(id);
+    if (!element) {
+      continue;
+    }
+    for (const entry of resolve(element)) {
+      if (canonicalLintCode(entry.code) !== finding.code) {
+        continue;
+      }
+      if (!entry.with) {
+        broad = true;
+      } else if (entry.with.some((other) => other !== id && finding.elementIds.includes(other))) {
+        return "narrow";
+      }
+    }
+  }
+  return broad ? "broad" : null;
+};
+
+export const ignoresRule = (element: ExcalidrawElement, code: string): boolean =>
+  lintIgnoreEntries(element).some(
+    (entry) => !entry.with && canonicalLintCode(entry.code) === canonicalLintCode(code),
   );
+
+// ---- connectivity graph ---------------------------------------------------
+
+const COMPOSITE_FRAME_KINDS = new Set(["legend", "table", "code"]);
+const CENTER_CELL = 400;
+
+// A shape that fully contains another node is a cluster box, not a node,
+// even without a kind (boards drawn before kinds existed).
+const withoutContainers = (nodes: ExcalidrawElement[]): ExcalidrawElement[] => {
+  const bounds = new Map(nodes.map((node) => [node.id, getElementBounds(node)]));
+  const cells = new Map<string, ExcalidrawElement[]>();
+  const cellOf = (x: number, y: number) => `${Math.floor(x / CENTER_CELL)}:${Math.floor(y / CENTER_CELL)}`;
+  for (const node of nodes) {
+    const [x1, y1, x2, y2] = bounds.get(node.id)!;
+    const key = cellOf((x1 + x2) / 2, (y1 + y2) / 2);
+    cells.set(key, [...(cells.get(key) ?? []), node]);
+  }
+  return nodes.filter((node) => {
+    const outer = bounds.get(node.id)!;
+    for (let cx = Math.floor(outer[0] / CENTER_CELL); cx <= Math.floor(outer[2] / CENTER_CELL); cx++) {
+      for (let cy = Math.floor(outer[1] / CENTER_CELL); cy <= Math.floor(outer[3] / CENTER_CELL); cy++) {
+        for (const other of cells.get(`${cx}:${cy}`) ?? []) {
+          const inner = bounds.get(other.id)!;
+          const larger = (outer[2] - outer[0]) * (outer[3] - outer[1]) > (inner[2] - inner[0]) * (inner[3] - inner[1]);
+          if (other.id !== node.id && larger && boundsContain(outer, inner)) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  });
 };
 
-const CONTRAST_CANDIDATES = ["#1e1e1e", "#ffffff", ...PALETTE_STROKES];
+const connectivity = (
+  live: readonly ExcalidrawElement[],
+  byId: Map<string, ExcalidrawElement>,
+  resolve: (element: ExcalidrawElement) => IgnoreEntry[],
+): ConnectivityGraph => {
+  const isNode = (element: ExcalidrawElement): boolean => {
+    if (!isBindable(element) || element.type === "text" || isFrameLike(element) || tableIdOf(element)) {
+      return false;
+    }
+    const kind = kindOf(element);
+    // The palette's "note" role is an annotation, not part of the graph.
+    if ((kind && NON_NODE_KINDS.has(kind)) || roleOf(element) === "note") {
+      return false;
+    }
+    const frame = typeof element.frameId === "string" ? byId.get(element.frameId) : undefined;
+    const frameKind = frame ? kindOf(frame) : undefined;
+    return !(frameKind && COMPOSITE_FRAME_KINDS.has(frameKind));
+  };
+  const nodes = withoutContainers(live.filter(isNode));
+  const connected = new Set<string>();
+  // Frames (and the frameless pseudo-frame "") that hold at least one arrow:
+  // only there is an unconnected node suspicious.
+  const withArrows = new Set<string>();
+  let edgeCount = 0;
+  for (const element of live) {
+    if (!isLinear(element) || isDivider(element)) {
+      continue;
+    }
+    const linear = asLinear(element);
+    withArrows.add(element.frameId ?? "");
+    const ends = [linear.startBinding?.elementId, linear.endBinding?.elementId].filter(
+      (id): id is string => typeof id === "string" && byId.has(id),
+    );
+    for (const id of ends) {
+      connected.add(id);
+      withArrows.add(byId.get(id)!.frameId ?? "");
+    }
+    if (ends.length === 2) {
+      edgeCount++;
+    }
+  }
+  return {
+    nodeCount: nodes.length,
+    edgeCount,
+    isolated: nodes
+      .filter(
+        (node) =>
+          !connected.has(node.id) &&
+          withArrows.has(node.frameId ?? "") &&
+          !resolve(node).some((entry) => !entry.with && canonicalLintCode(entry.code) === ISOLATED_RULE),
+      )
+      .map((node) => node.id),
+  };
+};
+
+export const buildConnectivityGraph = (
+  elements: readonly ExcalidrawElement[],
+): ConnectivityGraph => {
+  const live = elements.filter((element) => !element.isDeleted);
+  const byId = new Map(live.map((element) => [element.id, element]));
+  return connectivity(live, byId, ignoreResolver(live, byId));
+};
+
+// ---- entry point ------------------------------------------------------------
 
 const scopeIdSet = (
   live: readonly ExcalidrawElement[],
@@ -107,1061 +263,101 @@ const scopeIdSet = (
   return null;
 };
 
-const OVERLAP_RATIO = 0.15;
-const DUP_POS = 1.5;
-const DUP_SIZE = 1.5;
-const ALIGN_SNAP = 4;
-const ALIGN_MIN = 1;
-const OPAQUE_OCCLUSION_OPACITY = 90;
-const SOLID_BACKING_OPACITY = 60;
-const OUTLIER_ABS_GAP = 4000;
-const MAX_FONTS = 2;
-const MAX_STROKE_COLORS = 6;
-const MAX_PAIRWISE_ELEMENTS = 1500;
-const MAX_ALIGNMENT_FINDINGS = 25;
-
-const OVERLAP_TYPES = new Set(["rectangle", "ellipse", "diamond", "image"]);
-
-const notDeleted = (element: ExcalidrawElement): boolean => !element.isDeleted;
-
-const sharesGroup = (a: ExcalidrawElement, b: ExcalidrawElement): boolean => {
-  const ga = a.groupIds ?? [];
-  const gb = new Set(b.groupIds ?? []);
-  return ga.some((id) => gb.has(id));
-};
-
-const textContent = (element: ExcalidrawElement): string =>
-  typeof asText(element).text === "string" ? (asText(element).text as string) : "";
-
-const fontSizeOf = (element: ExcalidrawElement): number =>
-  typeof asText(element).fontSize === "number"
-    ? (asText(element).fontSize as number)
-    : 20;
-
-const fontFamilyOf = (element: ExcalidrawElement): number | undefined =>
-  typeof asText(element).fontFamily === "number"
-    ? (asText(element).fontFamily as number)
-    : undefined;
-
-const globalEndpoint = (
-  arrow: ExcalidrawElement,
-  which: "start" | "end",
-): Point | null => {
-  const points = asLinear(arrow).points;
-  if (!Array.isArray(points) || points.length === 0) {
-    return null;
-  }
-  const p = which === "start" ? points[0] : points[points.length - 1];
-  return [arrow.x + p[0], arrow.y + p[1]];
-};
-
-const INSCRIBED_TYPES = new Set(["diamond", "ellipse"]);
-
-const overflowMessage = (
-  container: ExcalidrawElement,
-  fit: ContainerTextFit,
-): string => {
-  const shape = container.type;
-  const inscribed = INSCRIBED_TYPES.has(shape)
-    ? ` A ${shape} inscribes its label, so its ${Math.round(container.width || 0)}×${Math.round(container.height || 0)} box only offers a ${fit.usableWidth}×${fit.usableHeight} label area.`
-    : "";
-  if (fit.widthOverflow && fit.heightOverflow) {
-    return `Text does not fit its ${shape}: ${fit.textWidth}×${fit.textHeight} of text against a ${fit.usableWidth}×${fit.usableHeight} label area.${inscribed}`;
-  }
-  if (fit.widthOverflow) {
-    return `Text is too WIDE for its ${shape}: needs ${fit.textWidth}, the label area is ${fit.usableWidth}.${inscribed}`;
-  }
-  return `Text is too TALL for its ${shape}: it wraps to ${fit.textHeight} high, the label area is ${fit.usableHeight}.${inscribed}`;
-};
-
-const overflowSuggestion = (
-  text: ExcalidrawElement,
-  container: ExcalidrawElement,
-  fit: ContainerTextFit,
-  fontSize: number,
-  fontFamily: number | undefined,
-): Record<string, unknown> => {
-  const smaller = largestFittingFontSize(container, textContent(text), fontFamily, fontSize);
-  const shrinkText = smaller
-    ? { alternative: { action: "restyle", id: text.id, fontSize: smaller } }
-    : { alternative: { action: "shorten", id: text.id } };
-  if (isLinear(container)) {
-    return { action: "restyle", id: text.id, ...(smaller ? { fontSize: smaller } : {}) };
-  }
-  return {
-    action: "resize",
-    id: container.id,
-    ...(fit.widthOverflow ? { width: fit.fittedWidth } : {}),
-    ...(fit.heightOverflow ? { height: fit.fittedHeight } : {}),
-    ...shrinkText,
-  };
-};
-
-const overflowChecks = (
-  element: ExcalidrawElement,
-  byId: Map<string, ExcalidrawElement>,
-): LintFinding[] => {
-  if (element.type !== "text") {
-    return [];
-  }
-  const text = textContent(element);
-  if (!text.trim()) {
-    return [];
-  }
-  const fontSize = fontSizeOf(element);
-  const fontFamily = fontFamilyOf(element);
-  const containerId = asText(element).containerId;
-
-  if (typeof containerId === "string") {
-    const container = byId.get(containerId);
-    if (!container) {
-      return [];
-    }
-    const fit = fitTextToContainer(container, text, fontSize, fontFamily);
-    if (!fit.widthOverflow && !fit.heightOverflow) {
-      return [];
-    }
-    return [
-      {
-        code: "text_overflow",
-        severity: "warning",
-        elementIds: [element.id, container.id],
-        message: overflowMessage(container, fit),
-        suggestion: overflowSuggestion(element, container, fit, fontSize, fontFamily),
-      },
-    ];
-  }
-
-  if (asText(element).autoResize === false && (element.width || 0) > 0) {
-    const wrapped = wrapText(text, fontSize, fontFamily, element.width || 0);
-    const measured = measureText(wrapped, fontSize, fontFamily);
-    if (measured.height > (element.height || 0) + OVERFLOW_EPSILON) {
-      return [
-        {
-          code: "text_overflow",
-          severity: "warning",
-          elementIds: [element.id],
-          message: `Wrapped text is taller (${Math.ceil(measured.height)}) than the text box height (${Math.round(element.height || 0)}).`,
-          suggestion: {
-            action: "resize",
-            id: element.id,
-            height: Math.ceil(measured.height),
-          },
-        },
-      ];
-    }
-  }
-  return [];
-};
-
-const stackingChecks = (
-  element: ExcalidrawElement,
-  byId: Map<string, ExcalidrawElement>,
-): LintFinding[] => {
-  if (element.type !== "text") {
-    return [];
-  }
-  const containerId = asText(element).containerId;
-  if (typeof containerId !== "string") {
-    return [];
-  }
-  const container = byId.get(containerId);
-  if (!container) {
-    return [];
-  }
-  if (
-    typeof element.index === "string" &&
-    typeof container.index === "string" &&
-    element.index <= container.index
-  ) {
-    return [
-      {
-        code: "bound_text_below_container",
-        severity: "error",
-        elementIds: [element.id, container.id],
-        message: `Bound text is stacked below its ${container.type} container, so the fill hides the label. Raise the text above the container in z-order (bring_to_front the text).`,
-        suggestion: { action: "bring_to_front", ids: [element.id] },
-      },
-    ];
-  }
-  return [];
-};
-
-const structuralChecks = (
-  element: ExcalidrawElement,
-  byId: Map<string, ExcalidrawElement>,
-): LintFinding[] => {
-  const findings: LintFinding[] = [];
-  const sized = new Set([
-    "rectangle",
-    "ellipse",
-    "diamond",
-    "image",
-    "frame",
-    "magicframe",
-    "text",
-  ]);
-
-  if (sized.has(element.type) && ((element.width || 0) <= 0 || (element.height || 0) <= 0)) {
-    findings.push({
-      code: "degenerate_size",
-      severity: "error",
-      elementIds: [element.id],
-      message: `${element.type} has non-positive size (${element.width}×${element.height}).`,
-    });
-  }
-
-  if (element.type === "text" && !textContent(element).trim()) {
-    findings.push({
-      code: "empty_text",
-      severity: "error",
-      elementIds: [element.id],
-      message: "Text element has no visible text.",
-      suggestion: { action: "delete", id: element.id },
-    });
-  }
-
-  if ((element.opacity ?? 100) <= 0) {
-    findings.push({
-      code: "invisible_opacity",
-      severity: "warning",
-      elementIds: [element.id],
-      message: "Element opacity is 0 (invisible).",
-    });
-  }
-
-  const opacity = element.opacity ?? 100;
-  if (opacity < 0 || opacity > 100) {
-    findings.push({
-      code: "out_of_range",
-      severity: "warning",
-      elementIds: [element.id],
-      message: `opacity ${opacity} is outside 0–100.`,
-    });
-  }
-  if (!ROUGHNESS_VALUES.has(element.roughness)) {
-    findings.push({
-      code: "out_of_range",
-      severity: "warning",
-      elementIds: [element.id],
-      message: `roughness ${element.roughness} is not one of 0, 1, 2.`,
-    });
-  }
-  if ((element.strokeWidth || 0) <= 0 && !isTransparent(element.strokeColor)) {
-    findings.push({
-      code: "out_of_range",
-      severity: "warning",
-      elementIds: [element.id],
-      message: "strokeWidth is non-positive.",
-    });
-  }
-  if (element.type === "text" && fontSizeOf(element) <= 0) {
-    findings.push({
-      code: "out_of_range",
-      severity: "warning",
-      elementIds: [element.id],
-      message: "fontSize is non-positive.",
-    });
-  }
-
-  if (!FILL_STYLES.has(element.fillStyle)) {
-    findings.push({
-      code: "invalid_enum",
-      severity: "warning",
-      elementIds: [element.id],
-      message: `Unknown fillStyle "${element.fillStyle}".`,
-    });
-  }
-  if (!STROKE_STYLES.has(element.strokeStyle)) {
-    findings.push({
-      code: "invalid_enum",
-      severity: "warning",
-      elementIds: [element.id],
-      message: `Unknown strokeStyle "${element.strokeStyle}".`,
-    });
-  }
-  if (element.type === "text") {
-    const family = fontFamilyOf(element);
-    if (family !== undefined && !(family in FONT_LINE_HEIGHTS)) {
-      findings.push({
-        code: "invalid_enum",
-        severity: "warning",
-        elementIds: [element.id],
-        message: `Unknown fontFamily ${family}.`,
-      });
-    }
-  }
-
-  if (isLinear(element)) {
-    findings.push(...arrowChecks(element, byId));
-  }
-
-  findings.push(...overflowChecks(element, byId));
-  findings.push(...stackingChecks(element, byId));
-  return findings;
-};
-
-const arrowChecks = (
-  arrow: ExcalidrawElement,
-  byId: Map<string, ExcalidrawElement>,
-): LintFinding[] => {
-  const findings: LintFinding[] = [];
-  const linear = asLinear(arrow);
-
-  const bounds = getElementBounds(arrow);
-  const points = linear.points;
-  const zeroLength =
-    (bounds[2] - bounds[0] === 0 && bounds[3] - bounds[1] === 0) ||
-    !Array.isArray(points) ||
-    points.length < 2;
-  if (zeroLength) {
-    findings.push({
-      code: "arrow_zero_length",
-      severity: "warning",
-      elementIds: [arrow.id],
-      message: `${arrow.type} has zero length and will not be visible.`,
-    });
-  }
-
-  for (const arrowhead of [linear.startArrowhead, linear.endArrowhead]) {
-    if (arrowhead && !ARROWHEADS.has(arrowhead)) {
-      findings.push({
-        code: "invalid_enum",
-        severity: "warning",
-        elementIds: [arrow.id],
-        message: `Unknown arrowhead "${arrowhead}".`,
-      });
-    }
-  }
-
-  const sides: Array<["start" | "end", typeof linear.startBinding]> = [
-    ["start", linear.startBinding],
-    ["end", linear.endBinding],
-  ];
-
-  for (const [side, binding] of sides) {
-    if (binding) {
-      if (!binding.mode || !binding.fixedPoint) {
-        findings.push({
-          code: "binding_invalid",
-          severity: "error",
-          elementIds: [arrow.id],
-          message: `${side} binding is missing mode/fixedPoint and will be dropped on load.`,
-        });
-        continue;
-      }
-      const target = byId.get(binding.elementId);
-      if (!target || target.isDeleted) {
-        findings.push({
-          code: "arrow_dangling_binding",
-          severity: "error",
-          elementIds: [arrow.id],
-          message: `${side} binding references a missing element (${binding.elementId}).`,
-          suggestion: { action: "unbind", id: arrow.id, side },
-        });
-        continue;
-      }
-      const backref = Array.isArray(target.boundElements)
-        ? target.boundElements.some((entry) => entry.id === arrow.id)
-        : false;
-      if (!backref) {
-        findings.push({
-          code: "binding_backref_missing",
-          severity: "error",
-          elementIds: [arrow.id, target.id],
-          message: `${target.type} is missing a boundElements back-reference to this arrow; the arrow will not follow it when moved.`,
-          suggestion: { action: "rebind", arrowId: arrow.id, targetId: target.id },
-        });
-      }
-    } else {
-      const endpoint = globalEndpoint(arrow, side);
-      if (!endpoint) {
-        continue;
-      }
-      let nearest: { id: string; distance: number } | null = null;
-      for (const candidate of byId.values()) {
-        if (candidate.id === arrow.id || candidate.isDeleted) {
-          continue;
-        }
-        if (!isBindable(candidate) || candidate.type === "text") {
-          continue;
-        }
-        const distance = distanceToElement(candidate, endpoint[0], endpoint[1]);
-        if (!nearest || distance < nearest.distance) {
-          nearest = { id: candidate.id, distance };
-        }
-      }
-      if (nearest) {
-        const target = byId.get(nearest.id);
-        const gap = target ? bindingGap(target) + 1 : 6;
-        if (nearest.distance <= gap) {
-          findings.push({
-            code: "arrow_unbound_endpoint",
-            severity: "warning",
-            elementIds: [arrow.id, nearest.id],
-            message: `${side} of the arrow touches an element but is not bound; it will not stay attached when that element moves.`,
-            suggestion: { action: "connect", arrowId: arrow.id, side, targetId: nearest.id },
-          });
-        } else if (nearest.distance <= MAX_BINDING_DISTANCE) {
-          findings.push({
-            code: "arrow_unbound_endpoint",
-            severity: "info",
-            elementIds: [arrow.id, nearest.id],
-            message: `${side} of the arrow is within binding range of an element but not bound.`,
-            suggestion: { action: "connect", arrowId: arrow.id, side, targetId: nearest.id },
-          });
-        }
-      }
-    }
-  }
-  return findings;
-};
-
-const CROSSING_MIN_CHORD = 4;
-const REROUTE_MARGIN = 24;
-const CROSSING_OBSTACLE_TYPES = new Set(["rectangle", "ellipse", "diamond", "image"]);
-
-const arrowExemptIds = (arrow: ExcalidrawElement): Set<string> => {
-  const linear = asLinear(arrow);
-  const exempt = new Set<string>([arrow.id]);
-  if (linear.startBinding) {
-    exempt.add(linear.startBinding.elementId);
-  }
-  if (linear.endBinding) {
-    exempt.add(linear.endBinding.elementId);
-  }
-  for (const entry of arrow.boundElements ?? []) {
-    exempt.add(entry.id);
-  }
-  return exempt;
-};
-
-const rerouteWaypoint = (
-  obstacle: ExcalidrawElement,
-  start: Point,
-  end: Point,
-): Point | null => {
-  const [x1, y1, x2, y2] = getElementBounds(obstacle);
-  const margin = bindingGap(obstacle) + REROUTE_MARGIN;
-  const cx = (x1 + x2) / 2;
-  const cy = (y1 + y2) / 2;
-  const detours: Point[] = [
-    [x1 - margin, cy],
-    [x2 + margin, cy],
-    [cx, y1 - margin],
-    [cx, y2 + margin],
-  ];
-  let best: { point: Point; length: number } | null = null;
-  for (const point of detours) {
-    if (
-      segmentElementOverlap(obstacle, start, point) > 0 ||
-      segmentElementOverlap(obstacle, point, end) > 0
-    ) {
-      continue;
-    }
-    const length =
-      Math.hypot(point[0] - start[0], point[1] - start[1]) +
-      Math.hypot(end[0] - point[0], end[1] - point[1]);
-    if (!best || length < best.length) {
-      best = { point, length };
-    }
-  }
-  return best?.point ?? null;
-};
-
-const crossingChecksFor = (
-  arrow: ExcalidrawElement,
-  obstacles: readonly ExcalidrawElement[],
-): LintFinding[] => {
-  const path = globalLinearPoints(arrow);
-  if (path.length < 2) {
-    return [];
-  }
-  const findings: LintFinding[] = [];
-  const exempt = arrowExemptIds(arrow);
-  const arrowBounds = getElementBounds(arrow);
-  const start = path[0];
-  const end = path[path.length - 1];
-
-  for (const obstacle of obstacles) {
-    if (
-      obstacle.isDeleted ||
-      exempt.has(obstacle.id) ||
-      !CROSSING_OBSTACLE_TYPES.has(obstacle.type) ||
-      (obstacle.boundElements ?? []).some((entry) => entry.id === arrow.id)
-    ) {
-      continue;
-    }
-    // A shape enclosing the whole arrow is a backdrop or cluster box, not an
-    // obstacle; and an endpoint sitting inside a shape is arrow_unbound_endpoint's job.
-    if (
-      boundsContain(getElementBounds(obstacle), arrowBounds) ||
-      pointInElement(obstacle, start[0], start[1]) ||
-      pointInElement(obstacle, end[0], end[1])
-    ) {
-      continue;
-    }
-    let chord = 0;
-    for (let i = 0; i < path.length - 1; i++) {
-      chord += segmentElementOverlap(obstacle, path[i], path[i + 1]);
-    }
-    if (chord < CROSSING_MIN_CHORD) {
-      continue;
-    }
-    const waypoint = rerouteWaypoint(obstacle, start, end);
-    findings.push({
-      code: "arrow_crosses_element",
-      severity: "warning",
-      elementIds: [arrow.id, obstacle.id],
-      message: `${arrow.type} runs through ${obstacle.type} ${obstacle.id} for ~${Math.round(chord)}px; route it around instead of across.`,
-      suggestion: waypoint
-        ? {
-            action: "reroute",
-            id: arrow.id,
-            blockedBy: obstacle.id,
-            waypoints: [waypoint],
-          }
-        : { action: "review", id: arrow.id, blockedBy: obstacle.id },
-    });
-  }
-  return findings;
-};
-
-const staleBackrefChecks = (
-  elements: readonly ExcalidrawElement[],
-  byId: Map<string, ExcalidrawElement>,
-): LintFinding[] => {
-  const findings: LintFinding[] = [];
-  for (const element of elements) {
-    if (!Array.isArray(element.boundElements)) {
-      continue;
-    }
-    for (const entry of element.boundElements) {
-      if (entry.type !== "arrow") {
-        continue;
-      }
-      const arrow = byId.get(entry.id);
-      if (!arrow || arrow.isDeleted) {
-        findings.push({
-          code: "binding_backref_missing",
-          severity: "error",
-          elementIds: [element.id],
-          message: `boundElements lists arrow ${entry.id} which no longer exists.`,
-          suggestion: { action: "rebind", targetId: element.id, arrowId: entry.id },
-        });
-        continue;
-      }
-      const linear = asLinear(arrow);
-      const boundHere =
-        linear.startBinding?.elementId === element.id ||
-        linear.endBinding?.elementId === element.id;
-      if (!boundHere) {
-        findings.push({
-          code: "binding_backref_missing",
-          severity: "error",
-          elementIds: [element.id, arrow.id],
-          message: `${element.type} references arrow ${entry.id} but the arrow has no binding back to it.`,
-          suggestion: { action: "rebind", targetId: element.id, arrowId: arrow.id },
-        });
-      }
-    }
-  }
-  return findings;
-};
-
-const isBoundTextOf = (
-  text: ExcalidrawElement,
-  container: ExcalidrawElement,
-): boolean => asText(text).containerId === container.id;
-
-const eligibleForOverlap = (element: ExcalidrawElement): boolean =>
-  OVERLAP_TYPES.has(element.type) ||
-  (element.type === "text" && typeof asText(element).containerId !== "string");
-
-const isContainedLabel = (
-  a: ExcalidrawElement,
-  b: ExcalidrawElement,
-  aBounds: ReturnType<typeof getElementBounds>,
-  bBounds: ReturnType<typeof getElementBounds>,
-): boolean => {
-  if ((a.type === "text") === (b.type === "text")) {
-    return false;
-  }
-  const [text, shape, textBounds, shapeBounds] =
-    a.type === "text" ? [a, b, aBounds, bBounds] : [b, a, bBounds, aBounds];
-  return OVERLAP_TYPES.has(shape.type) && boundsContain(shapeBounds, textBounds);
-};
-
-const pairwiseChecks = (
-  elements: readonly ExcalidrawElement[],
-): LintFinding[] => {
-  const findings: LintFinding[] = [];
-  const overlapCandidates = elements.filter(eligibleForOverlap);
-  const boundsById = new Map<string, ReturnType<typeof getElementBounds>>();
-  for (const element of elements) {
-    boundsById.set(element.id, getElementBounds(element));
-  }
-
-  let alignmentCount = 0;
-
-  for (let i = 0; i < overlapCandidates.length; i++) {
-    for (let j = i + 1; j < overlapCandidates.length; j++) {
-      const a = overlapCandidates[i];
-      const b = overlapCandidates[j];
-      if (sharesGroup(a, b)) {
-        continue;
-      }
-      if (a.frameId === b.id || b.frameId === a.id) {
-        continue;
-      }
-      if (isBoundTextOf(a, b) || isBoundTextOf(b, a)) {
-        continue;
-      }
-      const ba = boundsById.get(a.id)!;
-      const bb = boundsById.get(b.id)!;
-      const inter = intersectionArea(ba, bb);
-      if (inter > 0 && !isContainedLabel(a, b, ba, bb)) {
-        const ratio = inter / Math.max(1, Math.min(boundsArea(ba), boundsArea(bb)));
-        if (ratio > OVERLAP_RATIO) {
-          findings.push({
-            code: "overlap",
-            severity: "warning",
-            elementIds: [a.id, b.id],
-            message: `${a.type} and ${b.type} overlap by ${Math.round(ratio * 100)}% of the smaller element.`,
-            suggestion: {
-              action: "move",
-              id: b.id,
-              ...smallestSingleAxisSeparation(bb, ba),
-            },
-          });
-        }
-      }
-
-      if (
-        a.type === b.type &&
-        Math.abs(a.x - b.x) <= DUP_POS &&
-        Math.abs(a.y - b.y) <= DUP_POS &&
-        Math.abs((a.width || 0) - (b.width || 0)) <= DUP_SIZE &&
-        Math.abs((a.height || 0) - (b.height || 0)) <= DUP_SIZE &&
-        a.strokeColor === b.strokeColor &&
-        a.backgroundColor === b.backgroundColor &&
-        textContent(a) === textContent(b)
-      ) {
-        findings.push({
-          code: "duplicate",
-          severity: "warning",
-          elementIds: [a.id, b.id],
-          message: `${a.type} appears duplicated (near-identical position, size and style).`,
-          suggestion: { action: "delete", id: b.id },
-        });
-      }
-
-      if (alignmentCount < MAX_ALIGNMENT_FINDINGS) {
-        const near = nearMissAlignment(a, b);
-        if (near) {
-          alignmentCount++;
-          findings.push(near);
-        }
-      }
-    }
-  }
-
-  findings.push(...occlusionChecks(elements, boundsById));
-  return findings;
-};
-
-const alignFinding = (
-  edge: string,
-  label: string,
-  diff: number,
-  ids: [string, string],
-  patch: Record<string, unknown>,
-): LintFinding => ({
-  code: "alignment_near_miss",
-  severity: "info",
-  elementIds: ids,
-  message: `${label} are ${diff.toFixed(1)}px apart — likely meant to align.`,
-  suggestion: { action: "align", edge, ids, patch },
-});
-
-// Coords are [edge1, center, edge2]. Edges of differently-sized elements
-// diverge by the size difference, so flagging them when the pair is already
-// centred is noise: talk about the centre when centres align, edges only when
-// centres are far apart.
-const nearMissOnAxis = (
-  aCoords: readonly number[],
-  bCoords: readonly number[],
-  edges: readonly string[],
-  ids: [string, string],
-  axis: "x" | "y",
-): LintFinding | null => {
-  const diffs = aCoords.map((v, i) => Math.abs(v - bCoords[i]));
-  const patchFor = (k: number): Record<string, unknown> => ({
-    id: ids[1],
-    [axis]: bCoords[0] + (aCoords[k] - bCoords[k]),
-  });
-  const centerDiff = diffs[1];
-  if (centerDiff < ALIGN_MIN) {
-    return null;
-  }
-  if (centerDiff <= ALIGN_SNAP) {
-    return alignFinding(edges[1], edges[1], centerDiff, ids, patchFor(1));
-  }
-  const edgeIndices = [0, 2];
-  if (edgeIndices.some((k) => diffs[k] < ALIGN_MIN)) {
-    return null;
-  }
-  for (const k of edgeIndices) {
-    if (diffs[k] <= ALIGN_SNAP) {
-      return alignFinding(edges[k], `${edges[k]} edges`, diffs[k], ids, patchFor(k));
-    }
-  }
-  return null;
-};
-
-const nearMissAlignment = (
-  a: ExcalidrawElement,
-  b: ExcalidrawElement,
-): LintFinding | null => {
-  const ids: [string, string] = [a.id, b.id];
-  const horizontal = nearMissOnAxis(
-    [a.x, a.x + (a.width || 0) / 2, a.x + (a.width || 0)],
-    [b.x, b.x + (b.width || 0) / 2, b.x + (b.width || 0)],
-    ["left", "centerX", "right"],
-    ids,
-    "x",
-  );
-  if (horizontal) {
-    return horizontal;
-  }
-  return nearMissOnAxis(
-    [a.y, a.y + (a.height || 0) / 2, a.y + (a.height || 0)],
-    [b.y, b.y + (b.height || 0) / 2, b.y + (b.height || 0)],
-    ["top", "centerY", "bottom"],
-    ids,
-    "y",
-  );
-};
-
-const occlusionChecks = (
-  elements: readonly ExcalidrawElement[],
-  boundsById: Map<string, ReturnType<typeof getElementBounds>>,
-): LintFinding[] => {
-  const findings: LintFinding[] = [];
-  const order = new Map<string, number>();
-  elements.forEach((element, i) => order.set(element.id, i));
-
-  const isAbove = (a: ExcalidrawElement, b: ExcalidrawElement): boolean => {
-    if (typeof a.index === "string" && typeof b.index === "string") {
-      return a.index > b.index;
-    }
-    return (order.get(a.id) ?? 0) > (order.get(b.id) ?? 0);
-  };
-
-  const opaque = elements.filter(
-    (e) =>
-      !isTransparent(e.backgroundColor) &&
-      e.fillStyle === "solid" &&
-      (e.opacity ?? 100) >= OPAQUE_OCCLUSION_OPACITY &&
-      OVERLAP_TYPES.has(e.type),
-  );
-  for (const cover of opaque) {
-    for (const under of elements) {
-      if (under.id === cover.id || under.isDeleted || isLinear(under)) {
-        continue;
-      }
-      if (under.frameId === cover.id || sharesGroup(cover, under)) {
-        continue;
-      }
-      if (isBoundTextOf(under, cover)) {
-        continue;
-      }
-      if (!isAbove(cover, under)) {
-        continue;
-      }
-      const coverBounds = boundsById.get(cover.id)!;
-      const underBounds = boundsById.get(under.id)!;
-      if (!boundsContain(coverBounds, underBounds)) {
-        continue;
-      }
-      if (cover.type === "ellipse" || cover.type === "diamond") {
-        const corners: Array<[number, number]> = [
-          [underBounds[0], underBounds[1]],
-          [underBounds[2], underBounds[1]],
-          [underBounds[2], underBounds[3]],
-          [underBounds[0], underBounds[3]],
-        ];
-        if (!corners.every(([cx, cy]) => pointInElement(cover, cx, cy))) {
-          continue;
-        }
-      }
-      findings.push({
-        code: "occlusion",
-        severity: "warning",
-        elementIds: [cover.id, under.id],
-        message: `${cover.type} fully covers ${under.type} on top of it; the lower element is hidden.`,
-        suggestion: { action: "send_back", id: cover.id },
-      });
-    }
-  }
-  return findings;
-};
-
-const outlierChecks = (
-  elements: readonly ExcalidrawElement[],
-): LintFinding[] => {
-  if (elements.length < 3) {
-    return [];
-  }
-  const findings: LintFinding[] = [];
-  const bounds = elements.map((e) => getElementBounds(e));
-  for (let i = 0; i < elements.length; i++) {
-    const common = getCommonBounds(
-      elements.filter((_, idx) => idx !== i),
-    );
-    const me = bounds[i];
-    const gapX = Math.max(common[0] - me[2], me[0] - common[2], 0);
-    const gapY = Math.max(common[1] - me[3], me[1] - common[3], 0);
-    const gap = Math.max(gapX, gapY);
-    const diag = Math.hypot(common[2] - common[0], common[3] - common[1]);
-    if (gap > Math.max(OUTLIER_ABS_GAP, diag * 2)) {
-      findings.push({
-        code: "off_canvas_outlier",
-        severity: "warning",
-        elementIds: [elements[i].id],
-        message: `${elements[i].type} is ${Math.round(gap)}px away from every other element; likely misplaced.`,
-        suggestion: { action: "review", id: elements[i].id },
-      });
-    }
-  }
-  return findings;
-};
-
-const isAboveByZ = (
-  a: ExcalidrawElement,
-  b: ExcalidrawElement,
-): boolean =>
-  typeof a.index === "string" && typeof b.index === "string"
-    ? a.index > b.index
-    : false;
-
-const backingColor = (
-  text: ExcalidrawElement,
-  scene: readonly ExcalidrawElement[],
-  boundsById: Map<string, ReturnType<typeof getElementBounds>>,
-  fallback: string,
-): string => {
-  const textBounds = boundsById.get(text.id) ?? getElementBounds(text);
-  let best: ExcalidrawElement | null = null;
-  for (const candidate of scene) {
-    if (
-      candidate.id === text.id ||
-      !OVERLAP_TYPES.has(candidate.type) ||
-      isTransparent(candidate.backgroundColor) ||
-      candidate.fillStyle !== "solid" ||
-      (candidate.opacity ?? 100) < SOLID_BACKING_OPACITY ||
-      !isAboveByZ(text, candidate)
-    ) {
-      continue;
-    }
-    const candidateBounds = boundsById.get(candidate.id) ?? getElementBounds(candidate);
-    if (!boundsContain(candidateBounds, textBounds)) {
-      continue;
-    }
-    if (!best || (typeof candidate.index === "string" && candidate.index > (best.index ?? ""))) {
-      best = candidate;
-    }
-  }
-  return best ? best.backgroundColor : fallback;
-};
-
-const contrastChecks = (
-  texts: readonly ExcalidrawElement[],
-  scene: readonly ExcalidrawElement[],
-  viewBackgroundColor: string,
-): LintFinding[] => {
-  const findings: LintFinding[] = [];
-  const boundsById = new Map<string, ReturnType<typeof getElementBounds>>();
-  for (const element of scene) {
-    boundsById.set(element.id, getElementBounds(element));
-  }
-  for (const element of texts) {
-    if (element.type !== "text" || !textContent(element).trim()) {
-      continue;
-    }
-    const fg = parseColor(element.strokeColor);
-    if (!fg) {
-      continue;
-    }
-    const bg = parseColor(
-      backingColor(element, scene, boundsById, viewBackgroundColor),
-    );
-    if (!bg) {
-      continue;
-    }
-    const ratio = contrastRatio(fg, bg);
-    const threshold = fontSizeOf(element) >= 24 ? 3 : 4.5;
-    if (ratio < threshold) {
-      const readable = suggestReadableColor(fg, bg, threshold, CONTRAST_CANDIDATES);
-      findings.push({
-        code: "low_contrast",
-        severity: "warning",
-        elementIds: [element.id],
-        message: `Text contrast ${ratio.toFixed(2)}:1 against its background is below the ${threshold}:1 readability threshold.`,
-        suggestion: {
-          action: "recolor",
-          id: element.id,
-          ...(readable ? { strokeColor: readable } : {}),
-        },
-      });
-    }
-  }
-  return findings;
-};
-
-const styleChecks = (
-  elements: readonly ExcalidrawElement[],
-): LintFinding[] => {
-  const findings: LintFinding[] = [];
-  const texts = elements.filter((e) => e.type === "text");
-  const fonts = new Set(texts.map((e) => fontFamilyOf(e) ?? 5));
-  if (fonts.size > MAX_FONTS) {
-    findings.push({
-      code: "style_many_fonts",
-      severity: "info",
-      elementIds: texts.map((e) => e.id),
-      message: `${fonts.size} different font families are used; consider unifying for a consistent look.`,
-    });
-  }
-  const strokes = new Set(
-    elements
-      .filter((e) => !isTransparent(e.strokeColor))
-      .map((e) => e.strokeColor),
-  );
-  if (strokes.size > MAX_STROKE_COLORS) {
-    findings.push({
-      code: "style_many_stroke_colors",
-      severity: "info",
-      elementIds: [],
-      message: `${strokes.size} distinct stroke colors are used; a tighter palette usually reads better.`,
-      suggestion: { action: "recolor", palette: PALETTE_STROKES },
-    });
-  }
-  return findings;
-};
-
-export const ISOLATED_RULE = "isolated";
-
-const lintIgnoreCodes = (element: ExcalidrawElement): string[] => {
-  const custom = element.customData as { lintIgnore?: unknown } | undefined | null;
-  const codes = custom?.lintIgnore ?? (element as { lintIgnore?: unknown }).lintIgnore;
-  return Array.isArray(codes)
-    ? codes.filter((code): code is string => typeof code === "string")
-    : [];
-};
-
-export const ignoresRule = (
-  element: ExcalidrawElement,
-  code: string,
-): boolean => lintIgnoreCodes(element).includes(code);
-
-const suppressedByElement = (
-  finding: LintFinding,
-  byId: Map<string, ExcalidrawElement>,
-): boolean =>
-  finding.elementIds.some((id) => {
-    const element = byId.get(id);
-    return !!element && ignoresRule(element, finding.code);
-  });
-
-export const buildConnectivityGraph = (
-  elements: readonly ExcalidrawElement[],
-): { nodeCount: number; edgeCount: number; isolated: string[] } => {
-  const nodes = elements.filter(
-    (e) => isBindable(e) && e.type !== "text",
-  );
-  const nodeIds = new Set(nodes.map((e) => e.id));
-  const connected = new Set<string>();
-  let edgeCount = 0;
-  for (const element of elements) {
-    if (!isLinear(element)) {
-      continue;
-    }
-    const linear = asLinear(element);
-    const from = linear.startBinding?.elementId;
-    const to = linear.endBinding?.elementId;
-    if (from && to && nodeIds.has(from) && nodeIds.has(to)) {
-      edgeCount++;
-      connected.add(from);
-      connected.add(to);
-    }
-  }
-  return {
-    nodeCount: nodes.length,
-    edgeCount,
-    isolated: nodes
-      .filter((n) => !connected.has(n.id) && !ignoresRule(n, ISOLATED_RULE))
-      .map((n) => n.id),
-  };
-};
-
 export const lintScene = (
   elements: readonly ExcalidrawElement[],
   options: LintScopeOptions = {},
-): {
-  findings: LintFinding[];
-  summary: { errors: number; warnings: number; infos: number };
-  graph: { nodeCount: number; edgeCount: number; isolated: string[] };
-  scope?: { kind: "ids" | "region"; matched: number };
-} => {
-  const disabled = new Set(options.disabledRules ?? []);
-  const live = elements.filter(notDeleted);
-  const byId = new Map(live.map((e) => [e.id, e]));
-  const viewBackgroundColor = options.viewBackgroundColor ?? "#ffffff";
+): LintResult => {
+  const profile = options.profile ?? "default";
+  const disabled = new Set((options.disabledRules ?? []).map(canonicalLintCode));
+  const requested = options.codes?.length ? new Set(options.codes.map(canonicalLintCode)) : null;
+  const floor = options.minSeverity ? SEVERITY_RANK[options.minSeverity] : 0;
+  const live = elements.filter((element) => !element.isDeleted);
+  const scope = scopeIdSet(live, options);
+  const pairwise = scope
+    ? live.length * Math.max(1, scope.size) <= MAX_PAIRWISE_ELEMENTS * MAX_PAIRWISE_ELEMENTS
+    : live.length <= MAX_PAIRWISE_ELEMENTS;
 
-  let findings: LintFinding[] = [];
-  for (const element of live) {
-    findings.push(...structuralChecks(element, byId));
-  }
-  findings.push(...staleBackrefChecks(live, byId));
-
-  if (live.length <= MAX_PAIRWISE_ELEMENTS) {
-    findings.push(...pairwiseChecks(live));
-    findings.push(...outlierChecks(live));
-    for (const element of live) {
-      if (isLinear(element)) {
-        findings.push(...crossingChecksFor(element, live));
-      }
+  const selected = requested
+    ? LINT_RULE_CODES.filter((code) => requested.has(code))
+    : lintCodesForProfile(profile);
+  const skipped: string[] = [];
+  const active = new Set<string>();
+  for (const code of selected) {
+    const spec: { severity: Severity; pairwise?: boolean; needsStored?: boolean; needsProfile?: boolean } =
+      LINT_RULES[code];
+    if (disabled.has(code) || SEVERITY_RANK[spec.severity] < floor) {
+      continue;
     }
-  } else {
+    if (spec.needsStored && !options.stored) {
+      continue;
+    }
+    if (spec.needsProfile && !options.boardProfile) {
+      continue;
+    }
+    if (spec.pairwise && !pairwise) {
+      skipped.push(code);
+      continue;
+    }
+    active.add(code);
+  }
+
+  const raw: LintFinding[] = [];
+  const ctx = buildLintContext(elements, {
+    scope,
+    active,
+    minPadding: options.minPadding ?? DEFAULT_MIN_PADDING,
+    viewBackgroundColor: options.viewBackgroundColor ?? "#ffffff",
+    stored: options.stored,
+    ...(options.boardProfile ? { boardProfile: options.boardProfile } : {}),
+    sink: raw,
+  });
+  elementRules(ctx);
+  arrowRules(ctx);
+  const headerKeys = tableRules(ctx);
+  layoutRules(ctx, headerKeys);
+  profileRules(ctx);
+
+  const resolve = ignoreResolver(ctx.live, ctx.byId);
+  const seen = new Set<string>();
+  const findings: LintFinding[] = [];
+  let suppressedBroadly = 0;
+  for (const finding of raw) {
+    if (!active.has(finding.code) || SEVERITY_RANK[finding.severity] < floor) {
+      continue;
+    }
+    if (scope && !finding.elementIds.some((id) => scope.has(id))) {
+      continue;
+    }
+    const key = findingKey(finding);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const suppressed = suppressionOf(finding, ctx.byId, resolve);
+    if (suppressed === "broad") {
+      suppressedBroadly++;
+    }
+    if (!suppressed) {
+      findings.push(finding);
+    }
+  }
+  if (skipped.length && floor <= SEVERITY_RANK.info) {
     findings.push({
       code: "scene_too_large",
       severity: "info",
       elementIds: [],
-      message: `Scene has ${live.length} elements; pairwise checks (overlap, duplicate, occlusion, alignment, outlier, arrow_crosses_element) were skipped.`,
+      message: `Scene has ${live.length} elements; pairwise checks (${skipped.join(", ")}) were skipped. Scope the run with ids or region to include them.`,
+      suggestion: { reason: "Validate a smaller scope (ids or region) to run the pairwise checks." },
     });
   }
-  findings.push(...contrastChecks(live, live, viewBackgroundColor));
-  findings.push(...styleChecks(live));
 
-  findings = findings.filter(
-    (f) => !disabled.has(f.code) && !suppressedByElement(f, byId),
-  );
-
-  const scope = scopeIdSet(live, options);
-  if (scope) {
-    findings = findings.filter((f) => f.elementIds.some((id) => scope.has(id)));
-  }
-  if (options.codes && options.codes.length) {
-    const allow = new Set(options.codes);
-    findings = findings.filter((f) => allow.has(f.code));
-  }
-  if (options.minSeverity) {
-    const floor = SEVERITY_RANK[options.minSeverity];
-    findings = findings.filter((f) => SEVERITY_RANK[f.severity] >= floor);
-  }
-
-  const summary = { errors: 0, warnings: 0, infos: 0 };
+  const summary: LintSummary = {
+    errors: 0,
+    warnings: 0,
+    infos: 0,
+    coverage: LINT_RULE_CODES.filter((code) => active.has(code)),
+    suppressedBroadly,
+  };
   for (const finding of findings) {
     if (finding.severity === "error") {
       summary.errors++;
@@ -1175,74 +371,40 @@ export const lintScene = (
   return {
     findings: options.summaryOnly ? [] : findings,
     summary,
-    graph: buildConnectivityGraph(live),
+    graph: connectivity(ctx.live, ctx.byId, resolve),
+    profile,
     ...(scope
       ? { scope: { kind: options.ids?.length ? "ids" : "region", matched: scope.size } as const }
       : {}),
   };
 };
 
+// Rules that judge the scene as a whole; inline per-element lint skips them.
+const SCENE_LEVEL_RULES = new Set([
+  "alignment_near_miss",
+  "off_canvas_outlier",
+  "style_many_fonts",
+  "style_off_palette_color",
+  "duplicate",
+  "occlusion",
+  "gap_irregular",
+  "frame_padding_asymmetric",
+  "style_font_size_outlier",
+  "table_column_without_header",
+  "table_row_height_inconsistent",
+  "table_header_style_mismatch",
+  "table_too_dense",
+]);
+
+// Kept for the old inline-warning path; the write pipeline now runs a scoped
+// lintScene before and after a write and diffs findingKey.
 export const lintElement = (
   element: ExcalidrawElement,
   scene: readonly ExcalidrawElement[],
   options: LintOptions = {},
-): LintFinding[] => {
-  const disabled = new Set(options.disabledRules ?? []);
-  const live = scene.filter(notDeleted);
-  const byId = new Map(live.map((e) => [e.id, e]));
-  byId.set(element.id, element);
-  const viewBackgroundColor = options.viewBackgroundColor ?? "#ffffff";
-
-  const findings: LintFinding[] = [];
-  findings.push(...structuralChecks(element, byId));
-
-  const context = [...byId.values()];
-  findings.push(
-    ...(isLinear(element)
-      ? crossingChecksFor(element, context)
-      : context
-          .filter((other) => other.id !== element.id && isLinear(other))
-          .flatMap((arrow) => crossingChecksFor(arrow, [element]))),
-  );
-
-  const myBounds = getElementBounds(element);
-  if (eligibleForOverlap(element)) {
-    for (const other of live) {
-      if (
-        other.id === element.id ||
-        !eligibleForOverlap(other) ||
-        sharesGroup(element, other) ||
-        other.frameId === element.id ||
-        element.frameId === other.id ||
-        isBoundTextOf(element, other) ||
-        isBoundTextOf(other, element)
-      ) {
-        continue;
-      }
-      const otherBounds = getElementBounds(other);
-      const inter = intersectionArea(myBounds, otherBounds);
-      if (inter > 0 && !isContainedLabel(element, other, myBounds, otherBounds)) {
-        const ratio =
-          inter / Math.max(1, Math.min(boundsArea(myBounds), boundsArea(otherBounds)));
-        if (ratio > OVERLAP_RATIO) {
-          findings.push({
-            code: "overlap",
-            severity: "warning",
-            elementIds: [element.id, other.id],
-            message: `Overlaps ${other.type} by ${Math.round(ratio * 100)}% of the smaller element.`,
-            suggestion: {
-              action: "move",
-              id: element.id,
-              ...smallestSingleAxisSeparation(myBounds, otherBounds),
-            },
-          });
-        }
-      }
-    }
-  }
-
-  findings.push(...contrastChecks([element], context, viewBackgroundColor));
-  return findings.filter(
-    (f) => !disabled.has(f.code) && !suppressedByElement(f, byId),
-  );
-};
+): LintFinding[] =>
+  lintScene([...scene.filter((other) => other.id !== element.id), element], {
+    ...options,
+    ids: [element.id],
+    codes: lintCodesForProfile("default").filter((code) => !SCENE_LEVEL_RULES.has(code)),
+  }).findings;

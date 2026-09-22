@@ -2,7 +2,6 @@ import {randomUUID} from "crypto";
 
 import {io, type Socket} from "socket.io-client";
 
-import {config} from "../config";
 import {auth, db} from "../firebase";
 import {getBot} from "../bots";
 import {
@@ -12,50 +11,75 @@ import {
   writeRoomFile,
 } from "../binaryFiles";
 import {decryptJSON, encryptJSON} from "../encryption";
-import {appendSceneHistory, getSceneVersion, loadScene, persistScene,} from "../scene";
 import {
-  applyUpdate,
-  bottomFractionalIndex,
-  buildNewElement,
-  type CreateAttrs,
-  detachDeleted,
-  markDeleted,
-  planCreations,
-  planReorder,
-  type ReorderPlacement,
-} from "../elements";
+  appendSceneHistory,
+  appendSceneLogEntry,
+  getSceneVersion,
+  listSceneHistory,
+  getSceneLogEntry,
+  listSceneLog,
+  loadScene,
+  loadSceneHistoryEntry,
+  loadSceneLogBefore,
+  persistScene,
+  type PersistOutcome,
+  type SceneHistoryEntry,
+  type SceneLogEntry,
+  type SceneLogInput,
+  type SceneLogOp,
+} from "../scene";
+import {applyUpdate, bottomFractionalIndex, planReorder, type ReorderPlacement,} from "../elements";
 import {type ConflictKind, decideIncoming} from "../reconcile";
 import {
   type ArrangeOptions,
   arrangePositions,
-  asLinear,
   asText,
   type Bounds,
-  CONTAINER_TYPES,
-  DEFAULT_FONT_FAMILY,
-  DEFAULT_FONT_SIZE,
   type DiagramInput,
   elementAtPoint,
   getCommonBounds,
   getElementBounds,
-  isBindable,
-  isLinear,
-  layoutBoundText,
-  layoutText,
-  lintElement,
-  type LintFinding,
-  lintScene,
   type LintScopeOptions,
-  planArrowPath,
-  planConnection,
+  lintScene,
   planDiagram,
   type RenderOptions,
-  reshapeArrowPath,
-  type RouteMode,
+  type RenderResult,
   renderSvg,
   svgToPngBase64,
 } from "../verify";
+import type {Target} from "../toolSchemas";
+import type {Anchor, RouteKind} from "../engine/arrows";
+import {putNewElement} from "../engine/common";
+import {createItems, type CreateContext, type CreateItem, type OnExisting} from "../engine/create";
+import {invalidArgs, notFound} from "../engine/errors";
+import {CORE_REPAIR_CODES, deleteTargets, repairCore, restoreFrom} from "../engine/lifecycle";
+import {planRepairs, REPAIRABLE_CODES} from "../verify/repair";
+import {canonicalLintCode} from "../verify/lintProfiles";
+import {type Carry, moveElements} from "../engine/move";
+import {createStack, type CreateStackInput} from "../engine/stack";
+import {type QueryOptions, type QueryResult, runQuery} from "../engine/query";
+import {pushBelow, reflowAfterGrowth, type ReflowOptions} from "../engine/reflow";
+import {hasConditions, resolveTarget} from "../engine/selector";
+import type {SceneTxn} from "../engine/txn";
+import {fitFrameToChildren, type Patch, updateItems} from "../engine/update";
+import {checkExpected, type ExpectedScene} from "../engine/expected";
+import {type FrameLayoutOptions, layoutFrames} from "../engine/frames";
+import {patchFromItem, upsertItems} from "../engine/upsert";
+import {buildEnvelope, type ChangeSummary, type Envelope, planWrite, type WriteOptions} from "../engine/write";
+import {type BoardProfile, resolveProfile} from "../profile";
+import {
+  type ComposePlan,
+  type LegendInput,
+  planBadge,
+  planCallout,
+  planCodeCard,
+  planLegend,
+  planTable,
+  type TablePlan,
+  type TableSpecInput,
+} from "../compose";
 import {currentRequestId, logError, logInfo, logWarn, opaqueRef, safeUrl,} from "../logger";
+import {config, getBoardUrl} from "../config";
 
 import type {ExcalidrawElement, Role} from "../types";
 
@@ -106,14 +130,67 @@ export type ConflictRecord = {
   sceneVersion: number;
 };
 
-export type ElementWriteResult = {
-  element: ExcalidrawElement;
-  sceneVersion: number;
-  readback: { found: boolean; version?: number };
-  warnings: LintFinding[];
-  owned: boolean;
-  conflicts: ConflictRecord[];
-  related?: ExcalidrawElement[];
+export type WriteCallOptions = WriteOptions;
+
+const COMPOSITE_TYPES = new Set(["code", "callout", "badge"]);
+
+// batch_create {type:"code"|"callout"|"badge"} → the composite planner.
+const planComposite = (
+  item: CreateItem,
+  live: readonly ExcalidrawElement[],
+  profile?: BoardProfile | null,
+): ComposePlan => {
+  const raw = item as Record<string, unknown>;
+  if (typeof raw.id !== "string" || !raw.id) {
+    throw invalidArgs(`a ${item.type} needs an id (its parts get ids derived from it)`, { field: "id" });
+  }
+  try {
+    switch (item.type) {
+      case "code":
+        return planCodeCard(
+          {
+            id: raw.id,
+            x: Number(raw.x ?? 0),
+            y: Number(raw.y ?? 0),
+            code: String(raw.code ?? raw.text ?? ""),
+            title: raw.title as string | undefined,
+            source: raw.source as string | undefined,
+            fontSize: raw.fontSize as number | undefined,
+            width: raw.width as number | "auto" | undefined,
+            frameId: raw.frameId as string | undefined,
+          },
+          live,
+          profile,
+        );
+      case "callout":
+        return planCallout(
+          {
+            id: raw.id,
+            anchorId: String(raw.anchorId ?? ""),
+            text: String(raw.text ?? raw.label ?? ""),
+            side: raw.side as "auto" | "top" | "right" | "bottom" | "left" | undefined,
+            maxDistance: raw.maxDistance as number | undefined,
+            role: raw.role as string | undefined,
+            frameId: raw.frameId as string | undefined,
+          },
+          live,
+          profile,
+        );
+      default:
+        return planBadge(
+          {
+            id: raw.id,
+            anchorId: String(raw.anchorId ?? ""),
+            text: String(raw.text ?? raw.label ?? ""),
+            corner: raw.corner as "top-left" | "top-right" | "bottom-left" | "bottom-right" | undefined,
+            role: raw.role as string | undefined,
+          },
+          live,
+        );
+    }
+  } catch (error) {
+    throw invalidArgs(error instanceof Error ? error.message : String(error));
+  }
 };
 
 export class ReadOnlyError extends Error {
@@ -152,6 +229,9 @@ export class CollabBot {
   private lastPointer = { x: 0, y: 0 };
 
   private static readonly MAX_WRITE_LOG = 1000;
+  // Bigger commits skip the "before" snapshot rather than push a Firestore doc
+  // toward its 1 MiB limit; the entry itself is still written.
+  private static readonly MAX_JOURNAL_SNAPSHOT = 400;
   private static readonly MAX_RESURRECTIONS = 3;
   // Re-assertion only defends a freshly bot-written element for this long. After
   // it, an incoming deletion/overwrite is the human's deliberate edit and wins.
@@ -173,7 +253,26 @@ export class CollabBot {
   private botDeletedIds = new Set<string>();
   private resurrections = new Map<string, number>();
   private conflicts = new Map<string, ConflictRecord>();
+  // Every commit and resurrection flush runs through this queue, one at a
+  // time, so a persist never snapshots another write half-way through.
   private persistQueue: Promise<void> = Promise.resolve();
+  // Ids that some planned-but-not-yet-persisted write (re)creates: every
+  // persist must lift them above stored tombstones, whichever write's
+  // snapshot happens to carry them to the store first.
+  private pendingForceWin = new Map<string, number>();
+  // The board's style profile (typeScale, spacing, role meanings, nowrap). The
+  // MCP layer sets it per request; writes and lint use it unless a call passes
+  // its own.
+  private profile: BoardProfile | null = null;
+
+  useProfile(profile: BoardProfile | null): void {
+    this.profile = profile;
+  }
+
+  // The profile a call should use: what it passed, else the board's.
+  private profileFor(options: { boardProfile?: BoardProfile | null }): BoardProfile | null {
+    return options.boardProfile ?? this.profile;
+  }
 
   constructor(identity: BotIdentity) {
     this.uid = identity.uid;
@@ -196,24 +295,6 @@ export class CollabBot {
 
   private get presenceName(): string {
     return `${this.presenceEmoji} ${this.displayName || "Bot"}`;
-  }
-
-  async createDiagram(
-    input: DiagramInput,
-    opts: { returnIds?: boolean } = {},
-  ): Promise<{
-    created: ExcalidrawElement[] | string[];
-    labels: Record<string, string>;
-    nodes: Record<string, string>;
-    bounds: { x: number; y: number; width: number; height: number };
-    sceneVersion: number;
-    warnings: LintFinding[];
-    conflicts: ConflictRecord[];
-  }> {
-    this.requireEditor();
-    const plan = await planDiagram(input, randomUUID);
-    const result = await this.createElements(plan.items, opts);
-    return { ...result, nodes: plan.nodeElementIds, bounds: plan.bounds };
   }
 
   private async showActivity(
@@ -379,6 +460,7 @@ export class CollabBot {
         boardId: this.boardId,
         elementCount: this.elements.size,
       });
+      void this.logReload();
     } catch (error) {
       logError("collab.scene_initialization.failed", error, {
         boardId: this.boardId,
@@ -552,179 +634,6 @@ export class CollabBot {
     });
   }
 
-  async updateElements(
-    patches: Array<{ id: string } & Partial<ExcalidrawElement>>,
-    opts: { returnIds?: boolean } = {},
-  ): Promise<{
-    updated: ExcalidrawElement[] | string[];
-    labels: Record<string, string>;
-    missing: string[];
-    sceneVersion: number;
-    warnings: LintFinding[];
-  }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const { updates, creations } = this.splitLabelPatches(patches);
-    let labels: Record<string, string> = {};
-
-    const finalById = new Map<string, ExcalidrawElement>();
-    // Apply plain patches first so a container resized in the same call is at its
-    // final size before a new bound label is laid out inside it.
-    const missing: string[] = [];
-    for (const { id, ...patch } of updates) {
-      const current = this.elements.get(id);
-      if (!current || current.isDeleted) {
-        missing.push(id);
-        continue;
-      }
-      const { patch: routed, rerouted } = this.withArrowRouting(current, patch);
-      const next = applyUpdate(current, this.withTextSizing(current, routed));
-      this.elements.set(id, next);
-      finalById.set(id, next);
-      const relabelled = rerouted ? this.relayoutBoundText(next) : undefined;
-      if (relabelled) {
-        this.elements.set(relabelled.id, relabelled);
-        finalById.set(relabelled.id, relabelled);
-      }
-    }
-
-    if (creations.length) {
-      const plan = planCreations(creations, [...this.elements.values()]);
-      for (const container of plan.containerUpdates) {
-        this.elements.set(container.id, container);
-        finalById.set(container.id, container);
-      }
-      for (const element of plan.created) {
-        this.elements.set(element.id, element);
-        finalById.set(element.id, element);
-      }
-      this.claimOwnership(plan.created);
-      labels = plan.labels;
-    }
-
-    const changed = [...finalById.values()];
-    if (changed.length) {
-      await this.commit(changed, { targets: changed, select: true });
-      this.recordWrites(changed, "bot");
-    }
-    const live = this.liveElements();
-    return {
-      updated: opts.returnIds ? changed.map((element) => element.id) : changed,
-      labels,
-      missing,
-      sceneVersion: this.currentSceneVersion(),
-      warnings: changed.flatMap((element) => lintElement(element, live)),
-    };
-  }
-
-  async createFrame(opts: {
-    x?: number;
-    y?: number;
-    width?: number;
-    height?: number;
-    name?: string;
-    childIds?: string[];
-  }): Promise<{ frame: ExcalidrawElement; children: string[]; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const children = opts.childIds
-      ? this.resolveTargets({ ids: opts.childIds })
-      : [];
-    let bounds: Bounds;
-    if (
-      typeof opts.x === "number" &&
-      typeof opts.y === "number" &&
-      typeof opts.width === "number" &&
-      typeof opts.height === "number"
-    ) {
-      bounds = [opts.x, opts.y, opts.x + opts.width, opts.y + opts.height];
-    } else if (children.length) {
-      const [x1, y1, x2, y2] = getCommonBounds(children);
-      const pad = 24;
-      bounds = [x1 - pad, y1 - pad, x2 + pad, y2 + pad];
-    } else {
-      throw new Error("createFrame needs explicit x/y/width/height or childIds");
-    }
-    const allElements = [...this.elements.values()];
-    const frame: ExcalidrawElement = {
-      ...buildNewElement(
-        {
-          type: "frame",
-          x: bounds[0],
-          y: bounds[1],
-          width: bounds[2] - bounds[0],
-          height: bounds[3] - bounds[1],
-          name: opts.name ?? null,
-          backgroundColor: "transparent",
-        },
-        allElements,
-      ),
-      index: bottomFractionalIndex(allElements),
-    };
-    const changed: ExcalidrawElement[] = [frame];
-    for (const child of children) {
-      const updated = applyUpdate(child, { frameId: frame.id });
-      this.elements.set(child.id, updated);
-      changed.push(updated);
-    }
-    this.elements.set(frame.id, frame);
-    this.claimOwnership([frame]);
-    await this.commit(changed, { targets: [frame], select: true });
-    this.recordWrites(changed, "bot");
-    return {
-      frame,
-      children: children.map((child) => child.id),
-      sceneVersion: this.currentSceneVersion(),
-    };
-  }
-
-  async reorder(
-    ids: string[],
-    placement: ReorderPlacement,
-  ): Promise<{ reordered: string[]; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const changed = planReorder([...this.elements.values()], ids, placement);
-    if (changed.length) {
-      for (const element of changed) {
-        this.elements.set(element.id, element);
-      }
-      await this.commit(changed, { targets: changed, select: true });
-      this.recordWrites(changed, "bot");
-    }
-    return {
-      reordered: changed.map((element) => element.id),
-      sceneVersion: this.currentSceneVersion(),
-    };
-  }
-
-  async createElements(
-    items: CreateAttrs[],
-    opts: { returnIds?: boolean } = {},
-  ): Promise<{
-    created: ExcalidrawElement[] | string[];
-    labels: Record<string, string>;
-    sceneVersion: number;
-    warnings: LintFinding[];
-    conflicts: ConflictRecord[];
-  }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const { created, containerUpdates, labels } = planCreations(items, [
-      ...this.elements.values(),
-    ]);
-    await this.commitCreations(created, containerUpdates, { select: true });
-    const live = this.liveElements();
-    const warnings = created.flatMap((element) => lintElement(element, live));
-    return {
-      created: opts.returnIds ? created.map((element) => element.id) : created,
-      labels,
-      sceneVersion: this.currentSceneVersion(),
-      warnings,
-      conflicts: this.conflictsFor(created.map((element) => element.id)),
-    };
-  }
-
   private async loadBotPresence(): Promise<void> {
     if (!this.botId) {
       return;
@@ -753,57 +662,6 @@ export class CollabBot {
     }
   }
 
-  async deleteElements(selector: {
-    ids?: string[];
-    groupId?: string;
-  }): Promise<{ deleted: string[]; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    return this.deleteResolved(this.resolveTargets(selector));
-  }
-
-  async deleteRegion(
-    region: Bounds,
-    opts: { mode?: "intersect" | "contain"; type?: string } = {},
-  ): Promise<{ deleted: string[]; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const mode = opts.mode ?? "intersect";
-    const targets = this.liveElements().filter((element) => {
-      if (opts.type && element.type !== opts.type) {
-        return false;
-      }
-      const [x1, y1, x2, y2] = getElementBounds(element);
-      return mode === "contain"
-        ? x1 >= region[0] && y1 >= region[1] && x2 <= region[2] && y2 <= region[3]
-        : x1 <= region[2] && x2 >= region[0] && y1 <= region[3] && y2 >= region[1];
-    });
-    return this.deleteResolved(targets);
-  }
-
-  async groupElements(
-    ids: string[],
-  ): Promise<{ groupId: string; updated: string[]; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const targets = this.resolveTargets({ ids });
-    if (targets.length < 2) {
-      throw new Error("need at least two existing elements to group");
-    }
-    const groupId = randomUUID();
-    const changed = await this.patchMany(
-      targets.map((element) => ({
-        id: element.id,
-        patch: { groupIds: [...(element.groupIds ?? []), groupId] },
-      })),
-    );
-    return {
-      groupId,
-      updated: changed.map((element) => element.id),
-      sceneVersion: this.currentSceneVersion(),
-    };
-  }
-
   private requireEditor(): void {
     if (this.role !== "editor") {
       throw new ReadOnlyError();
@@ -827,479 +685,6 @@ export class CollabBot {
     );
     const { reused } = await writeRoomFile(this.boardId, fileId, encoded);
     return { fileId, size: bytes.length, mimeType, reused };
-  }
-
-  async ungroupElements(selector: {
-    ids?: string[];
-    groupId?: string;
-  }): Promise<{ updated: string[]; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const targets = this.resolveTargets(selector);
-    const changed = await this.patchMany(
-      targets.map((element) => ({
-        id: element.id,
-        patch: {
-          groupIds: selector.groupId
-            ? (element.groupIds ?? []).filter((g) => g !== selector.groupId)
-            : (element.groupIds ?? []).slice(0, -1),
-        },
-      })),
-    );
-    return {
-      updated: changed.map((element) => element.id),
-      sceneVersion: this.currentSceneVersion(),
-    };
-  }
-
-  async bringToFront(
-    ids: string[],
-  ): Promise<{ reordered: string[]; sceneVersion: number }> {
-    return this.reorder(ids, { to: "front" });
-  }
-
-  async sendToBack(
-    ids: string[],
-  ): Promise<{ reordered: string[]; sceneVersion: number }> {
-    return this.reorder(ids, { to: "back" });
-  }
-
-  async frameAddChildren(
-    frameId: string,
-    childIds: string[],
-  ): Promise<{ frame: string; children: string[]; sceneVersion: number }> {
-    this.requireEditor();
-    await this.ensureConnected();
-    const frameElement = this.elements.get(frameId);
-    if (!frameElement || frameElement.isDeleted || frameElement.type !== "frame") {
-      throw new Error(`frame not found: ${frameId}`);
-    }
-    const ids = new Set(this.resolveTargets({ ids: childIds }).map((t) => t.id));
-    for (const element of this.liveElements()) {
-      const containerId = asText(element).containerId;
-      if (typeof containerId === "string" && ids.has(containerId)) {
-        ids.add(element.id);
-      }
-    }
-    const changed: ExcalidrawElement[] = [];
-    for (const id of ids) {
-      const current = this.elements.get(id);
-      if (!current || current.isDeleted) {
-        continue;
-      }
-      const updated = applyUpdate(current, { frameId });
-      this.elements.set(id, updated);
-      changed.push(updated);
-    }
-    if (changed.length) {
-      await this.commit(changed, { targets: changed, select: true });
-      this.recordWrites(changed, "bot");
-    }
-    return {
-      frame: frameId,
-      children: changed.map((element) => element.id),
-      sceneVersion: this.currentSceneVersion(),
-    };
-  }
-
-  async render(
-    options: RenderOptions & { format?: "png" | "svg"; groupId?: string },
-  ): Promise<{
-    format: "png" | "svg";
-    png?: string;
-    svg?: string;
-    transform: ReturnType<typeof renderSvg>["transform"];
-    legend: ReturnType<typeof renderSvg>["legend"];
-    legendOrder: ReturnType<typeof renderSvg>["legendOrder"];
-    width: number;
-    height: number;
-    sceneVersion: number;
-  }> {
-    await this.ensureConnected();
-    const ids = options.groupId
-      ? this.resolveTargets({ groupId: options.groupId }).map((element) => element.id)
-      : options.ids;
-    const rendered = renderSvg([...this.elements.values()], { ...options, ids });
-    const png =
-      options.format === "svg" ? null : svgToPngBase64(rendered.svg);
-    return {
-      format: png ? "png" : "svg",
-      ...(png ? { png } : { svg: rendered.svg }),
-      transform: rendered.transform,
-      legend: rendered.legend,
-      legendOrder: rendered.legendOrder,
-      width: rendered.width,
-      height: rendered.height,
-      sceneVersion: this.currentSceneVersion(),
-    };
-  }
-
-  private boundTextOf(
-    container: ExcalidrawElement,
-  ): ExcalidrawElement | undefined {
-    const refs = Array.isArray(container.boundElements)
-      ? container.boundElements
-      : [];
-    for (const ref of refs) {
-      if (ref.type === "text") {
-        const text = this.elements.get(ref.id);
-        if (text && !text.isDeleted) {
-          return text;
-        }
-      }
-    }
-    for (const element of this.elements.values()) {
-      if (
-        !element.isDeleted &&
-        element.type === "text" &&
-        asText(element).containerId === container.id
-      ) {
-        return element;
-      }
-    }
-    return undefined;
-  }
-
-  async queryElements(filter?: {
-    type?: string;
-    ids?: string[];
-    groupId?: string;
-  }): Promise<ExcalidrawElement[]> {
-    const all = await this.describeScene();
-    return all.filter((element) => {
-      if (filter?.type && element.type !== filter.type) {
-        return false;
-      }
-      if (filter?.ids && !filter.ids.includes(element.id)) {
-        return false;
-      }
-      return !(
-        filter?.groupId && !(element.groupIds ?? []).includes(filter.groupId)
-      );
-    });
-  }
-
-  async validateScene(
-    options?: LintScopeOptions,
-  ): Promise<ReturnType<typeof lintScene> & { sceneVersion: number }> {
-    await this.ensureConnected();
-    const result = lintScene(this.liveElements(), options);
-    return { ...result, sceneVersion: this.currentSceneVersion() };
-  }
-
-  private splitLabelPatches(
-    patches: Array<{ id: string } & Partial<ExcalidrawElement>>,
-  ): {
-    updates: Array<{ id: string } & Partial<ExcalidrawElement>>;
-    creations: CreateAttrs[];
-  } {
-    const updates: Array<{ id: string } & Partial<ExcalidrawElement>> = [];
-    const creations: CreateAttrs[] = [];
-    const textStyleKeys = new Set([
-      "fontSize",
-      "fontFamily",
-      "textAlign",
-      "verticalAlign",
-    ]);
-    for (const patch of patches) {
-      const label = (patch as { label?: unknown }).label;
-      if (typeof label !== "string") {
-        updates.push(patch);
-        continue;
-      }
-      const { label: _label, labelColor, ...rest } = patch as {
-        id: string;
-        label?: string;
-        labelColor?: string;
-      } & Partial<ExcalidrawElement>;
-      const container = this.elements.get(patch.id);
-      const labellable =
-        !!container &&
-        !container.isDeleted &&
-        (CONTAINER_TYPES.has(container.type) || isLinear(container));
-      if (!container || !labellable) {
-        // Not a text container: a label has nowhere to go. Forward the rest so
-        // the real fields still apply, but drop the stray `label`/`labelColor`.
-        if (Object.keys(rest).some((key) => key !== "id")) {
-          updates.push({ ...rest, id: patch.id });
-        }
-        continue;
-      }
-      // Text styling rides with the label; box geometry/style stays on the container.
-      const textStyle: Partial<ExcalidrawElement> = {};
-      const containerRest: { id: string } & Partial<ExcalidrawElement> = {
-        ...rest,
-        id: patch.id,
-      };
-      for (const key of textStyleKeys) {
-        if (key in containerRest) {
-          (textStyle as Record<string, unknown>)[key] = (
-            containerRest as Record<string, unknown>
-          )[key];
-          delete (containerRest as Record<string, unknown>)[key];
-        }
-      }
-      const existing = this.boundTextOf(container);
-      const view = existing ? asText(existing) : undefined;
-      const fontSize =
-        typeof textStyle.fontSize === "number"
-          ? textStyle.fontSize
-          : typeof view?.fontSize === "number"
-            ? view.fontSize
-            : DEFAULT_FONT_SIZE;
-      const fontFamily =
-        typeof textStyle.fontFamily === "number"
-          ? textStyle.fontFamily
-          : typeof view?.fontFamily === "number"
-            ? view.fontFamily
-            : DEFAULT_FONT_FAMILY;
-      const rawAlign = textStyle.verticalAlign ?? view?.verticalAlign;
-      const verticalAlign =
-        rawAlign === "top" || rawAlign === "bottom" ? rawAlign : "middle";
-      const strokeColor =
-        typeof labelColor === "string" ? { strokeColor: labelColor } : {};
-
-      if (existing) {
-        // Lay the label out against the container's *final* geometry so a
-        // combined label + resize edit does not leave it mis-wrapped/off-center.
-        const laidContainer = { ...container, ...containerRest } as ExcalidrawElement;
-        const layout = layoutBoundText(
-          laidContainer,
-          label,
-          fontSize,
-          fontFamily,
-          verticalAlign,
-        );
-        updates.push({
-          id: existing.id,
-          text: layout.text,
-          originalText: label,
-          width: layout.width,
-          height: layout.height,
-          x: layout.x,
-          y: layout.y,
-          lineHeight: layout.lineHeight,
-          ...textStyle,
-          ...strokeColor,
-        });
-        const growsHeight =
-          containerRest.height === undefined &&
-          layout.containerHeight !== (laidContainer.height || 0);
-        if (Object.keys(containerRest).length > 1 || growsHeight) {
-          updates.push({
-            ...containerRest,
-            ...(growsHeight ? { height: layout.containerHeight } : {}),
-          });
-        }
-      } else {
-        creations.push({
-          type: "text",
-          containerId: patch.id,
-          text: label,
-          ...textStyle,
-          ...strokeColor,
-        });
-        if (Object.keys(containerRest).length > 1) {
-          updates.push(containerRest);
-        }
-      }
-    }
-    return { updates, creations };
-  }
-
-  async connectElements(
-    fromId: string,
-    toId: string,
-    options: {
-      mode?: "inside" | "orbit" | "skip";
-      startArrowhead?: string | null;
-      endArrowhead?: string | null;
-      waypoints?: [number, number][];
-      route?: RouteMode;
-    } = {},
-  ): Promise<ElementWriteResult> {
-    this.requireEditor();
-    await this.ensureConnected();
-    if (fromId === toId) {
-      throw new Error("cannot connect an element to itself");
-    }
-    const from = this.elements.get(fromId);
-    const to = this.elements.get(toId);
-    if (!from || from.isDeleted) {
-      throw new Error(`element not found: ${fromId}`);
-    }
-    if (!to || to.isDeleted) {
-      throw new Error(`element not found: ${toId}`);
-    }
-    if (!isBindable(from) || !isBindable(to)) {
-      throw new Error("both elements must be bindable shapes to connect");
-    }
-
-    const arrowId = randomUUID();
-    const plan = planConnection(from, to, {
-      arrowId,
-      mode: options.mode,
-      startArrowhead: options.startArrowhead,
-      endArrowhead: options.endArrowhead,
-      waypoints: options.waypoints,
-      route: options.route,
-    });
-    const arrow = buildNewElement(
-      { ...plan.arrow, id: arrowId },
-      [...this.elements.values()],
-    );
-    const pruneBackrefs = (
-      entries: { id: string; type: string }[],
-    ): { id: string; type: string }[] =>
-      entries.filter((entry) => {
-        if (entry.type !== "arrow" || entry.id === arrowId) {
-          return true;
-        }
-        const target = this.elements.get(entry.id);
-        return !!target && !target.isDeleted;
-      });
-    const fromUpdated = applyUpdate(from, {
-      boundElements: pruneBackrefs(plan.fromBoundElements),
-    });
-    const toUpdated = applyUpdate(to, {
-      boundElements: pruneBackrefs(plan.toBoundElements),
-    });
-
-    this.elements.set(arrowId, arrow);
-    this.elements.set(fromId, fromUpdated);
-    this.elements.set(toId, toUpdated);
-    this.claimOwnership([arrow]);
-    const changed = [arrow, fromUpdated, toUpdated];
-    await this.commit(changed, { targets: [arrow], select: true });
-    this.recordWrites(changed, "bot");
-
-    return {
-      element: arrow,
-      sceneVersion: this.currentSceneVersion(),
-      readback: this.readback(arrowId),
-      warnings: lintElement(arrow, this.liveElements()),
-      owned: this.ownedIds.has(arrowId),
-      conflicts: this.conflictsFor([arrowId]),
-    };
-  }
-
-  private withArrowRouting(
-    current: ExcalidrawElement,
-    patch: Partial<ExcalidrawElement>,
-  ): { patch: Partial<ExcalidrawElement>; rerouted: boolean } {
-    const { waypoints, route, ...rest } = patch as Partial<ExcalidrawElement> & {
-      waypoints?: [number, number][];
-      route?: RouteMode;
-    };
-    if (waypoints === undefined && route === undefined) {
-      return { patch, rerouted: false };
-    }
-    if (!isLinear(current)) {
-      return { patch: rest, rerouted: false };
-    }
-    const linear = asLinear(current);
-    const from = linear.startBinding
-      ? this.elements.get(linear.startBinding.elementId)
-      : undefined;
-    const to = linear.endBinding
-      ? this.elements.get(linear.endBinding.elementId)
-      : undefined;
-    if (!from || from.isDeleted || !to || to.isDeleted) {
-      return {
-        patch: { ...rest, ...reshapeArrowPath(current, { waypoints, route }) },
-        rerouted: true,
-      };
-    }
-    return {
-      patch: {
-        ...rest,
-        ...planArrowPath(from, to, {
-          mode: linear.startBinding?.mode,
-          waypoints,
-          route,
-        }),
-      },
-      rerouted: true,
-    };
-  }
-
-  private relayoutBoundText(
-    container: ExcalidrawElement,
-  ): ExcalidrawElement | undefined {
-    const text = this.boundTextOf(container);
-    if (!text) {
-      return undefined;
-    }
-    const view = asText(text);
-    const verticalAlign =
-      view.verticalAlign === "top" || view.verticalAlign === "bottom"
-        ? view.verticalAlign
-        : "middle";
-    const layout = layoutBoundText(
-      container,
-      String(view.originalText ?? view.text ?? ""),
-      view.fontSize ?? DEFAULT_FONT_SIZE,
-      view.fontFamily ?? DEFAULT_FONT_FAMILY,
-      verticalAlign,
-    );
-    return applyUpdate(text, {
-      text: layout.text,
-      width: layout.width,
-      height: layout.height,
-      x: layout.x,
-      y: layout.y,
-      lineHeight: layout.lineHeight,
-    });
-  }
-
-  private withTextSizing(
-    current: ExcalidrawElement,
-    patch: Partial<ExcalidrawElement>,
-  ): Partial<ExcalidrawElement> {
-    if (current.type !== "text" || asText(current).containerId != null) {
-      return patch;
-    }
-    const touched = patch as {
-      text?: unknown;
-      fontSize?: unknown;
-      fontFamily?: unknown;
-      lineHeight?: number;
-    };
-    const touchesText =
-      touched.text !== undefined ||
-      touched.fontSize !== undefined ||
-      touched.fontFamily !== undefined;
-    if (!touchesText) {
-      return patch;
-    }
-    if (typeof patch.width === "number" && typeof patch.height === "number") {
-      return patch;
-    }
-    const raw = String(
-      patch.text !== undefined ? patch.text : asText(current).text ?? "",
-    );
-    const fontSize =
-      typeof patch.fontSize === "number"
-        ? patch.fontSize
-        : asText(current).fontSize ?? DEFAULT_FONT_SIZE;
-    const fontFamily =
-      typeof patch.fontFamily === "number"
-        ? patch.fontFamily
-        : asText(current).fontFamily ?? DEFAULT_FONT_FAMILY;
-    const fixedWidth =
-      typeof patch.width === "number"
-        ? patch.width
-        : asText(current).autoResize === false
-          ? current.width || undefined
-          : undefined;
-    const layout = layoutText(raw, fontSize, fontFamily, fixedWidth);
-    return {
-      ...patch,
-      width: patch.width ?? layout.width,
-      height: patch.height ?? layout.height,
-      text: layout.text,
-      lineHeight: touched.lineHeight ?? layout.lineHeight,
-    };
   }
 
   async sceneDiff(sinceVersion?: number): Promise<{
@@ -1377,97 +762,1161 @@ export class CollabBot {
     };
   }
 
-  async arrange(
-    ids: string[],
-    options: ArrangeOptions,
-  ): Promise<{ moved: ExcalidrawElement[]; sceneVersion: number }> {
+  // ---- the write pipeline -------------------------------------------------
+
+  // Every write goes through here: plan in a SceneTxn against the current
+  // scene, lint what it touched (before/after), and — unless it is a dry run —
+  // commit in one broadcast + persist + history entry.
+  private async write<T>(
+    options: WriteCallOptions,
+    fn: (txn: SceneTxn) => T,
+  ): Promise<Envelope & { result: T }> {
     this.requireEditor();
     await this.ensureConnected();
-    const targets = ids
-      .map((id) => this.elements.get(id))
-      .filter((element): element is ExcalidrawElement => !!element && !element.isDeleted);
-    if (!targets.length) {
-      throw new Error("no matching elements to arrange");
+    const prevSceneVersion = this.currentSceneVersion();
+    if (options.boardProfile === undefined && this.profile) {
+      options = { ...options, boardProfile: this.profile };
     }
-    const positions = arrangePositions(targets, options);
-    const changed: ExcalidrawElement[] = [];
-    for (const target of targets) {
-      const next = positions.get(target.id);
-      if (!next) {
-        continue;
-      }
-      const [minX, minY] = getElementBounds(target);
-      const updated = applyUpdate(target, {
-        x: target.x + (next[0] - minX),
-        y: target.y + (next[1] - minY),
-      });
-      this.elements.set(target.id, updated);
-      changed.push(updated);
+    const planned = planWrite(this.elements, options, fn);
+    if (options.dryRun || !planned.txn.hasChanges()) {
+      return {
+        ...buildEnvelope(planned, {
+          sceneVersion: prevSceneVersion,
+          prevSceneVersion,
+          dryRun: options.dryRun,
+          returnElements: options.returnElements,
+        }),
+        result: planned.result,
+      };
     }
-    if (changed.length) {
-      await this.commit(changed, { targets: changed, select: true });
-      this.recordWrites(changed, "bot");
+    const changed = planned.txn.changed();
+    const report = planned.txn.report;
+    // Copies as they are *before* this write lands in the live map (the
+    // transaction reads through to that map, so this cannot wait).
+    const beforeCopies = changed
+      .map((element) => planned.txn.original(element.id))
+      .filter((element): element is ExcalidrawElement => !!element);
+    this.holdForceWin(report.forceWin);
+    for (const element of changed) {
+      this.elements.set(element.id, element);
     }
-    return { moved: changed, sceneVersion: this.currentSceneVersion() };
+    this.claimOwnership(changed.filter((element) => report.forceWin.has(element.id)));
+    const live = changed.filter((element) => !element.isDeleted);
+    const journal = await this.journalEntry(planned.summary, changed, beforeCopies, prevSceneVersion, options.note);
+    journal.historyEntryId = randomUUID();
+    let committed: { commitId?: string; outcome: PersistOutcome | null };
+    try {
+      committed = await this.enqueue(() =>
+        this.commit(changed, live.length ? { targets: live, select: true } : undefined, journal),
+      );
+    } finally {
+      this.releaseForceWin(report.forceWin);
+    }
+    // Report what is really live now: the persist may have lifted a revived
+    // element's version further, or a stored copy may have won.
+    const final = changed.map((element) => this.elements.get(element.id) ?? element);
+    this.recordWrites(final, "bot");
+    return {
+      ...buildEnvelope(planned, {
+        sceneVersion: this.currentSceneVersion(),
+        prevSceneVersion,
+        commitId: journal.commitId,
+        persisted: this.persistedFor(changed, committed.outcome),
+        conflicts: this.conflictsFor(changed.map((element) => element.id)),
+        returnElements: options.returnElements,
+        finalElements: final,
+      }),
+      result: planned.result,
+    };
   }
 
+  // One journal entry per commit: what changed, by whom, and an encrypted copy
+  // of the affected elements as they were before — that is what makes a revert
+  // possible long after the 24 h tombstones are gone.
+  private async journalEntry(
+    summary: ChangeSummary,
+    changed: ExcalidrawElement[],
+    previous: ExcalidrawElement[],
+    sceneVersionBefore: number,
+    note?: string,
+  ): Promise<SceneLogInput> {
+    const { created, updated, deleted, revived } = summary;
+    const counts = {
+      created: created.length,
+      updated: updated.length,
+      deleted: deleted.length,
+      revived: revived.length,
+    };
+    const ops: SceneLogOp[] = [];
+    if (counts.created) ops.push("create");
+    if (counts.updated) ops.push("update");
+    if (counts.deleted) ops.push("delete");
+    if (counts.revived) ops.push("revive");
+    const entry: SceneLogInput = {
+      commitId: randomUUID(),
+      op: ops.length === 1 ? ops[0] : "mixed",
+      ids: changed.map((element) => element.id),
+      counts,
+      sceneVersionBefore,
+      actor: {
+        kind: "bot",
+        ...(this.botId ? { botId: this.botId } : {}),
+        uid: this.uid,
+        ...(note ? { note } : {}),
+      },
+    };
+    if (previous.length > CollabBot.MAX_JOURNAL_SNAPSHOT) {
+      return { ...entry, beforeOmitted: true };
+    }
+    try {
+      const { ciphertext, iv } = await encryptJSON(this.roomKey, previous);
+      return { ...entry, before: { ciphertext, iv, count: previous.length } };
+    } catch (error) {
+      logWarn("collab.journal.snapshot_failed", {
+        boardId: this.boardId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { ...entry, beforeOmitted: true };
+    }
+  }
+
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.persistQueue.then(task);
+    this.persistQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private holdForceWin(ids: Iterable<string>): void {
+    for (const id of ids) {
+      this.pendingForceWin.set(id, (this.pendingForceWin.get(id) ?? 0) + 1);
+    }
+  }
+
+  private releaseForceWin(ids: Iterable<string>): void {
+    for (const id of ids) {
+      const count = (this.pendingForceWin.get(id) ?? 1) - 1;
+      if (count > 0) this.pendingForceWin.set(id, count);
+      else this.pendingForceWin.delete(id);
+    }
+  }
+
+  private persistedFor(
+    changed: ExcalidrawElement[],
+    outcome: PersistOutcome | null,
+  ): Envelope["persisted"] {
+    if (!outcome) {
+      return undefined;
+    }
+    const ours = new Map(changed.map((element) => [element.id, element] as const));
+    const lost = outcome.storedWins
+      .filter((stored) => ours.has(stored.id) && !this.pendingForceWin.has(stored.id))
+      .map((stored) => ({
+        id: stored.id,
+        storedVersion: stored.version,
+        localVersion: ours.get(stored.id)!.version,
+      }));
+    if (lost.length) {
+      return { ok: false, lost };
+    }
+    // A creation that had to be lifted above a stored tombstone is saved, but
+    // under a higher version than the plan said: report the version to use.
+    const lifted = outcome.bumped
+      .filter((element) => ours.has(element.id))
+      .map((element) => ({ id: element.id, version: element.version }));
+    return lifted.length ? { ok: true, lifted } : { ok: true };
+  }
+
+  // Runs inside the persist queue (see enqueue).
   private async commit(
     changed: ExcalidrawElement[],
-    activity?: { targets: ExcalidrawElement[]; select: boolean },
-  ): Promise<void> {
+    activity: { targets: ExcalidrawElement[]; select: boolean } | undefined,
+    journal?: SceneLogInput,
+  ): Promise<{ commitId?: string; outcome: PersistOutcome | null }> {
     await this.broadcastUpdate(changed);
     // Emit the cursor before the Firestore writes so presence doesn't trail the persist latency.
     if (activity) {
       await this.showActivity(activity.targets, activity.select);
     }
-    const all = [...this.elements.values()];
-    await persistScene(this.boardId, this.roomKey, all);
+    const outcome = await persistScene(
+      this.boardId,
+      this.roomKey,
+      [...this.elements.values()],
+      { reviveIds: new Set(this.pendingForceWin.keys()), ...(journal ? { log: journal } : {}) },
+    );
+    await this.adoptPersistOutcome(outcome);
     // History is recorded independently: a history failure must not lose the
     // user-visible change (already broadcast + persisted), but must be loud.
+    let commitId: string | undefined;
     try {
-      await appendSceneHistory({
+      commitId = await appendSceneHistory({
         roomId: this.boardId,
         roomKey: this.roomKey,
         author: this.authorLabel,
-        elements: all,
+        elements: [...this.elements.values()],
+        ...(journal?.historyEntryId ? { entryId: journal.historyEntryId } : {}),
       });
     } catch (error) {
       logError("collab.commit.history_failed", error, {
         boardId: this.boardId,
         changedCount: changed.length,
-        totalCount: all.length,
       });
     }
     logInfo("collab.commit.succeeded", {
       boardId: this.boardId,
       changedCount: changed.length,
-      totalCount: all.length,
+      totalCount: this.elements.size,
+    });
+    return { commitId, outcome };
+  }
+
+  // The store is the truth: a stored copy that beat ours replaces ours in
+  // memory (so reads never show what a reload would lose), and a creation
+  // lifted above a stored tombstone is re-broadcast at its final version.
+  private async adoptPersistOutcome(outcome: PersistOutcome): Promise<void> {
+    for (const stored of outcome.storedWins) {
+      // A revival still in flight is lifted by its own persist; do not let
+      // someone else's snapshot turn it back into the stored tombstone.
+      if (this.pendingForceWin.has(stored.id)) {
+        continue;
+      }
+      const mine = this.elements.get(stored.id);
+      if (!mine || mine.version < stored.version) {
+        this.elements.set(stored.id, stored);
+      }
+    }
+    if (outcome.bumped.length) {
+      const lifted: ExcalidrawElement[] = [];
+      for (const element of outcome.bumped) {
+        const mine = this.elements.get(element.id);
+        if (!mine || mine.version < element.version) {
+          this.elements.set(element.id, element);
+          lifted.push(element);
+        }
+      }
+      if (lifted.length) {
+        this.recordWrites(lifted, "bot");
+        await this.broadcastUpdate(lifted);
+        logWarn("collab.persist.revived_over_stored_tombstone", {
+          boardId: this.boardId,
+          ids: lifted.map((element) => element.id),
+        });
+      }
+    }
+  }
+
+  private linkFor = (boardId: string, frameId?: string): string | undefined => {
+    const url = getBoardUrl(boardId);
+    return url && frameId ? `${url}?element=${encodeURIComponent(frameId)}` : url;
+  };
+
+  private createContext(onExisting?: OnExisting, profile?: BoardProfile | null): CreateContext {
+    const nowrap = profile ? resolveProfile(profile).nowrap : [];
+    return {
+      onExisting,
+      linkFor: this.linkFor,
+      ...(nowrap.length ? { nowrap } : {}),
+      replace: (txn, id, item) => {
+        const current = txn.live(id);
+        if (!current) {
+          return;
+        }
+        const patch = patchFromItem(current, item, txn);
+        if (patch) {
+          updateItems(txn, [patch], { linkFor: this.linkFor });
+        }
+      },
+    };
+  }
+
+  private targetsIn(txn: SceneTxn, target: Target | undefined, ids?: string[]): ExcalidrawElement[] {
+    if (hasConditions(target)) {
+      return resolveTarget(txn.liveElements(), target as Target);
+    }
+    if (ids?.length) {
+      return resolveTarget(txn.liveElements(), { ids });
+    }
+    return [];
+  }
+
+  async createElements(
+    items: CreateItem[],
+    options: WriteCallOptions & { onExisting?: OnExisting } = {},
+  ): Promise<Envelope & { result: { ids: string[] } }> {
+    return this.write(options, (txn) => {
+      const plain = items.filter((item) => !COMPOSITE_TYPES.has(item.type));
+      const composites = items.filter((item) => COMPOSITE_TYPES.has(item.type));
+      const ids = plain.length
+        ? createItems(txn, plain, this.createContext(options.onExisting, this.profileFor(options))).ids
+        : [];
+      // Code cards, callouts and badges expand into plain elements; they come
+      // after the plain items so they can point at shapes created here.
+      for (const item of composites) {
+        const plan = planComposite(item, txn.liveElements(), this.profileFor(options));
+        for (const warning of plan.warnings ?? []) {
+          txn.report.warnings.push(`${String(item.id)}: ${warning}`);
+        }
+        const result = upsertItems(txn, plan.items as CreateItem[], {
+          removeIds: plan.removeIds,
+          context: this.createContext("replace"),
+        });
+        if (plan.extraPatches?.length) {
+          updateItems(txn, plan.extraPatches.map((entry) => ({ ...entry.patch, id: entry.id })));
+        }
+        ids.push(...result.created, ...result.updated);
+      }
+      return { ids };
     });
   }
 
-  async describeScene(): Promise<ExcalidrawElement[]> {
-    await this.ensureConnected();
-    return [...this.elements.values()].filter((element) => !element.isDeleted);
+  async setTable(
+    input: { tableId: string; spec: TableSpecInput; frameId?: string },
+    options: WriteCallOptions & { reflow?: ReflowOptions } = {},
+  ): Promise<
+    Envelope & {
+      result: {
+        cells: Record<string, Record<string, string>>;
+        bounds: { x: number; y: number; width: number; height: number };
+        diff: { added: string[]; updated: string[]; removed: string[] };
+      };
+    }
+  > {
+    return this.write(options, (txn) => {
+      let plan: TablePlan;
+      try {
+        plan = planTable(input, txn.liveElements(), this.profileFor(options));
+      } catch (error) {
+        throw invalidArgs(error instanceof Error ? error.message : String(error));
+      }
+      const root = txn.live(input.tableId);
+      const result = upsertItems(txn, plan.items as CreateItem[], {
+        removeIds: plan.removeIds,
+        context: this.createContext("replace"),
+      });
+      if (plan.previousBounds) {
+        pushBelow(
+          txn,
+          plan.previousBounds,
+          plan.bounds,
+          new Set(plan.items.map((item) => item.id)),
+          options.reflow ?? { push: "below", growFrame: true },
+          root?.frameId ?? input.frameId ?? null,
+        );
+      }
+      return {
+        cells: plan.cells,
+        bounds: plan.bounds,
+        diff: { added: result.created, updated: result.updated, removed: result.removed },
+      };
+    });
   }
 
-  private async patchMany(
-    items: Array<{ id: string; patch: Partial<ExcalidrawElement> }>,
-  ): Promise<ExcalidrawElement[]> {
-    const changed: ExcalidrawElement[] = [];
-    for (const { id, patch } of items) {
-      const current = this.elements.get(id);
-      if (!current || current.isDeleted) {
+  async setLegend(
+    input: LegendInput,
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { bounds: { x: number; y: number; width: number; height: number }; ids: string[] } }> {
+    return this.write(options, (txn) => {
+      let plan: ComposePlan;
+      try {
+        plan = planLegend(input, txn.liveElements(), this.profileFor(options));
+      } catch (error) {
+        throw invalidArgs(error instanceof Error ? error.message : String(error));
+      }
+      const result = upsertItems(txn, plan.items as CreateItem[], {
+        removeIds: plan.removeIds,
+        context: this.createContext("replace"),
+      });
+      return { bounds: plan.bounds, ids: [...result.created, ...result.updated] };
+    });
+  }
+
+  async updateElements(
+    patches: Patch[],
+    options: WriteCallOptions & {
+      reflow?: ReflowOptions;
+      target?: Target;
+      patch?: Record<string, unknown>;
+    } = {},
+  ): Promise<Envelope & { result: { updated: string[] } }> {
+    return this.write(options, (txn) => {
+      let all = patches;
+      if (options.patch && hasConditions(options.target)) {
+        const targets = resolveTarget(txn.liveElements(), options.target as Target);
+        all = [...patches, ...targets.map((element) => ({ ...options.patch, id: element.id }))];
+      }
+      const before = new Map<string, ExcalidrawElement>();
+      for (const patch of all) {
+        const element = txn.live(String(patch.id));
+        if (element) before.set(element.id, element);
+      }
+      const result = updateItems(txn, all, { linkFor: this.linkFor, strict: options.strict });
+      if (options.reflow) {
+        reflowAfterGrowth(txn, before, options.reflow);
+      }
+      return result;
+    });
+  }
+
+  async moveElements(
+    target: Target,
+    dx: number,
+    dy: number,
+    carry: Carry | undefined,
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { moved: string[]; rerouted: string[] } }> {
+    return this.write(options, (txn) => {
+      const targets = resolveTarget(txn.liveElements(), target);
+      if (!targets.length) {
+        throw notFound("target matched no elements");
+      }
+      return moveElements(txn, targets, dx, dy, carry);
+    });
+  }
+
+  async deleteElements(
+    selector: { ids?: string[]; groupId?: string; target?: Target; force?: boolean },
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { deleted: string[]; detached: string[]; skippedProtected: string[] } }> {
+    return this.write(options, (txn) => {
+      const target: Target = {
+        ...(selector.target ?? {}),
+        ...(selector.groupId ? { groupId: selector.groupId } : {}),
+        ...(selector.ids?.length ? { ids: selector.ids } : {}),
+      };
+      const targets = hasConditions(target) ? resolveTarget(txn.liveElements(), target) : [];
+      return deleteTargets(txn, targets, { force: selector.force, note: options.note });
+    });
+  }
+
+  async createDiagram(
+    input: DiagramInput,
+    options: WriteCallOptions = {},
+  ): Promise<
+    Envelope & {
+      result: { ids: string[] };
+      nodes: Record<string, string>;
+      edges: string[];
+      groups: Record<string, string>;
+      bounds: { x: number; y: number; width: number; height: number };
+    }
+  > {
+    const plan = await planDiagram(input);
+    const envelope = await this.write(options, (txn) => {
+      if (!input.diagramId) {
+        return createItems(txn, plan.items, this.createContext("revive", this.profile));
+      }
+      // Re-running a diagramId re-lays out the same elements in place.
+      const planned = new Set(plan.items.map((item) => item.id as string));
+      const stale = txn
+        .liveElements()
+        .filter(
+          (element) =>
+            (element.customData as { diagramId?: unknown } | undefined)?.diagramId === input.diagramId &&
+            !planned.has(element.id) &&
+            !(element.type === "text" && typeof asText(element).containerId === "string"),
+        )
+        .map((element) => element.id);
+      const upserted = upsertItems(txn, plan.items, {
+        removeIds: stale,
+        context: this.createContext("replace"),
+      });
+      return { ids: [...upserted.created, ...upserted.updated] };
+    });
+    return {
+      ...envelope,
+      nodes: plan.nodeElementIds,
+      edges: plan.edgeElementIds,
+      groups: plan.groupElementIds,
+      bounds: plan.bounds,
+    };
+  }
+
+  async createFrame(
+    opts: {
+      id?: string;
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      name?: string;
+      childIds?: string[];
+      padding?: number;
+      titleGap?: number;
+      kind?: string;
+    },
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { frameId: string; children: string[] } }> {
+    return this.write(options, (txn) => {
+      const children = opts.childIds ? resolveTarget(txn.liveElements(), { ids: opts.childIds }) : [];
+      let bounds: Bounds;
+      if (
+        typeof opts.x === "number" &&
+        typeof opts.y === "number" &&
+        typeof opts.width === "number" &&
+        typeof opts.height === "number"
+      ) {
+        bounds = [opts.x, opts.y, opts.x + opts.width, opts.y + opts.height];
+      } else if (children.length) {
+        const [x1, y1, x2, y2] = getCommonBounds(children);
+        const pad = opts.padding ?? 24;
+        const titleGap = opts.titleGap ?? 0;
+        bounds = [x1 - pad, y1 - pad - titleGap, x2 + pad, y2 + pad];
+      } else {
+        throw invalidArgs("create_frame needs explicit x/y/width/height or childIds");
+      }
+      const frame = putNewElement(txn, {
+        ...(opts.id ? { id: opts.id } : {}),
+        type: "frame",
+        x: bounds[0],
+        y: bounds[1],
+        width: bounds[2] - bounds[0],
+        height: bounds[3] - bounds[1],
+        name: opts.name ?? null,
+        backgroundColor: "transparent",
+        index: bottomFractionalIndex(txn.all()),
+        ...(opts.kind ? { customData: { kind: opts.kind } } : {}),
+      });
+      const moved = this.putIntoFrame(txn, frame.id, children.map((child) => child.id));
+      return { frameId: frame.id, children: moved };
+    });
+  }
+
+  // Set frameId on the children and on their labels (a label always shares
+  // its container's frame).
+  private putIntoFrame(txn: SceneTxn, frameId: string, childIds: string[]): string[] {
+    const ids = new Set(childIds);
+    for (const element of txn.liveElements()) {
+      const containerId = asText(element).containerId;
+      if (typeof containerId === "string" && ids.has(containerId)) {
+        ids.add(element.id);
+      }
+    }
+    const moved: string[] = [];
+    for (const id of ids) {
+      const current = txn.live(id);
+      if (!current || current.id === frameId || current.frameId === frameId) {
         continue;
       }
-      const updated = applyUpdate(current, patch);
-      this.elements.set(id, updated);
-      changed.push(updated);
+      txn.put(applyUpdate(current, { frameId }));
+      moved.push(id);
     }
-    if (changed.length) {
-      await this.commit(changed, { targets: changed, select: true });
-      this.recordWrites(changed, "bot");
+    return moved;
+  }
+
+  async frameAddChildren(
+    frameId: string,
+    childIds: string[],
+    opts: { refit?: boolean; padding?: number; titleGap?: number } = {},
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { frame: string; children: string[] } }> {
+    return this.write(options, (txn) => {
+      const frame = txn.live(frameId);
+      if (!frame || frame.type !== "frame") {
+        throw notFound(`frame not found: ${frameId}`, [frameId]);
+      }
+      const children = this.putIntoFrame(
+        txn,
+        frameId,
+        resolveTarget(txn.liveElements(), { ids: childIds }).map((element) => element.id),
+      );
+      if (opts.refit) {
+        fitFrameToChildren(txn, frameId, { padding: opts.padding, titleGap: opts.titleGap, shrink: false });
+      }
+      return { frame: frameId, children };
+    });
+  }
+
+  async reorder(
+    ids: string[],
+    placement: ReorderPlacement,
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { reordered: string[] } }> {
+    return this.write(options, (txn) => {
+      const changed = planReorder(txn.all(), ids, placement);
+      for (const element of changed) {
+        txn.put(element);
+      }
+      return { reordered: changed.map((element) => element.id) };
+    });
+  }
+
+  async bringToFront(ids: string[], options: WriteCallOptions = {}) {
+    return this.reorder(ids, { to: "front" }, options);
+  }
+
+  async sendToBack(ids: string[], options: WriteCallOptions = {}) {
+    return this.reorder(ids, { to: "back" }, options);
+  }
+
+  async groupElements(
+    ids: string[],
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { groupId: string; updated: string[] } }> {
+    return this.write(options, (txn) => {
+      const targets = resolveTarget(txn.liveElements(), { ids });
+      if (targets.length < 2) {
+        throw invalidArgs("need at least two existing elements to group");
+      }
+      const groupId = randomUUID();
+      const { updated } = updateItems(
+        txn,
+        targets.map((element) => ({ id: element.id, groupIds: [...(element.groupIds ?? []), groupId] })),
+      );
+      return { groupId, updated };
+    });
+  }
+
+  async ungroupElements(
+    selector: { ids?: string[]; groupId?: string },
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { updated: string[] } }> {
+    return this.write(options, (txn) => {
+      const targets = selector.groupId
+        ? resolveTarget(txn.liveElements(), { groupId: selector.groupId })
+        : resolveTarget(txn.liveElements(), { ids: selector.ids ?? [] });
+      return updateItems(
+        txn,
+        targets
+          .filter((element) => !(element.type === "text" && typeof asText(element).containerId === "string"))
+          .map((element) => ({
+            id: element.id,
+            groupIds: selector.groupId
+              ? (element.groupIds ?? []).filter((g) => g !== selector.groupId)
+              : (element.groupIds ?? []).slice(0, -1),
+          })),
+      );
+    });
+  }
+
+  async connectElements(
+    fromId: string,
+    toId: string,
+    options: {
+      mode?: "inside" | "orbit" | "skip";
+      startArrowhead?: string | null;
+      endArrowhead?: string | null;
+      waypoints?: [number, number][];
+      route?: RouteKind;
+      startAnchor?: Anchor;
+      endAnchor?: Anchor;
+      label?: string;
+    } = {},
+    writeOptions: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { ids: string[] } }> {
+    return this.write(writeOptions, (txn) =>
+      createItems(txn, [
+        {
+          type: "arrow",
+          fromId,
+          toId,
+          bindMode: options.mode,
+          startArrowhead: options.startArrowhead,
+          endArrowhead: options.endArrowhead,
+          waypoints: options.waypoints,
+          route: options.route,
+          startAnchor: options.startAnchor,
+          endAnchor: options.endAnchor,
+          ...(options.label !== undefined ? { label: options.label } : {}),
+        },
+      ]),
+    );
+  }
+
+  async arrange(
+    ids: string[],
+    arrangeOptions: ArrangeOptions,
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { moved: string[] } }> {
+    return this.write(options, (txn) => {
+      const targets = resolveTarget(txn.liveElements(), { ids }).filter(
+        (element) => !(element.type === "text" && typeof asText(element).containerId === "string"),
+      );
+      if (!targets.length) {
+        throw notFound("no matching elements to arrange", ids);
+      }
+      const positions = arrangePositions(targets, arrangeOptions);
+      const moved: string[] = [];
+      for (const target of targets) {
+        const next = positions.get(target.id);
+        const current = txn.live(target.id);
+        if (!next || !current) continue;
+        const [minX, minY] = getElementBounds(current);
+        const dx = next[0] - minX;
+        const dy = next[1] - minY;
+        if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) continue;
+        // Moving through move_elements keeps labels and arrows attached.
+        moved.push(...moveElements(txn, [current], dx, dy).moved);
+      }
+      return { moved };
+    });
+  }
+
+  async restore(
+    ids: string[],
+    from: string | undefined,
+    options: WriteCallOptions & { mode?: "restore" | "revert" } = {},
+  ): Promise<Envelope & { result: { restored: string[]; missing: string[]; removed?: string[] } }> {
+    const commit = from && from !== "tombstone" ? await this.commitSource(from) : null;
+    const source = commit?.before ?? null;
+    const mode = options.mode ?? "restore";
+    const wanted = ids.length ? ids : (commit?.touched ?? []);
+    return this.write(options, (txn) => {
+      const result = restoreFrom(txn, wanted, (id) => {
+        if (source) {
+          return source.get(id);
+        }
+        const element = txn.get(id);
+        return element?.isDeleted ? element : undefined;
+      });
+      if (mode !== "revert" || !source) {
+        return result;
+      }
+      // Undoing a commit also means removing what that commit created: ids it
+      // touched that had no previous copy.
+      const created = wanted.filter((id) => !source.has(id) && txn.live(id));
+      const removed = created.length
+        ? deleteTargets(
+            txn,
+            created.map((id) => txn.live(id)!),
+            { force: true },
+          ).deleted
+        : [];
+      return { ...result, ...(removed.length ? { removed } : {}) };
+    });
+  }
+
+  // A commit id from board_log: the journal's pre-commit copies when it kept
+  // them (plus every id that commit touched, so a revert can also remove what
+  // it created), otherwise the shared history snapshot of that entry.
+  private async commitSource(
+    commitId: string,
+  ): Promise<{ before: Map<string, ExcalidrawElement>; touched: string[] }> {
+    await this.ensureConnected();
+    const entry = await getSceneLogEntry(this.boardId, commitId).catch(() => null);
+    const before = await loadSceneLogBefore(this.boardId, this.roomKey, commitId).catch(() => null);
+    if (before) {
+      return {
+        before: new Map(before.map((element) => [element.id, element] as const)),
+        touched: entry?.ids ?? before.map((element) => element.id),
+      };
     }
-    return changed;
+    if (entry && !entry.hasBefore && !entry.historyEntryId) {
+      throw notFound(
+        `commit ${commitId} kept no snapshot (it was too large); restore the ids you need from a neighbouring commit`,
+      );
+    }
+    const snapshot = await this.historySnapshot(entry?.historyEntryId ?? commitId);
+    return { before: snapshot, touched: entry?.ids ?? [...snapshot.keys()] };
+  }
+
+  private async historySnapshot(entryId: string): Promise<Map<string, ExcalidrawElement>> {
+    await this.ensureConnected();
+    const elements = await loadSceneHistoryEntry(this.boardId, this.roomKey, entryId);
+    if (!elements) {
+      throw notFound(`history entry ${entryId} not found (it may have been trimmed); list entries with board_log`);
+    }
+    return new Map(elements.map((element) => [element.id, element] as const));
+  }
+
+  async boardLog(
+    opts: {
+      limit?: number;
+      ids?: string[];
+      ops?: string[];
+      since?: number;
+      sinceVersion?: number;
+      includeGeometry?: boolean;
+    } = {},
+  ): Promise<{
+    entries: Array<Record<string, unknown>>;
+    tombstones: Array<{ id: string; type: string; deletedAt: number; textPreview?: string }>;
+    owned: string[];
+    conflicts: ConflictRecord[];
+    sceneVersion: number;
+  }> {
+    await this.ensureConnected();
+    const limit = Math.min(Math.max(1, opts.limit ?? 20), 100);
+    const journal = await listSceneLog(this.boardId, {
+      limit,
+      since: opts.since,
+      ids: opts.ids,
+      ops: opts.ops,
+    }).catch((error) => {
+      logWarn("collab.board_log.journal_failed", {
+        boardId: this.boardId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [] as SceneLogEntry[];
+    });
+    const filtered = opts.sinceVersion
+      ? journal.filter((entry) => entry.sceneVersionAfter > (opts.sinceVersion as number))
+      : journal;
+    const entries: Array<Record<string, unknown>> = [];
+    for (const entry of filtered) {
+      const row: Record<string, unknown> = {
+        commitId: entry.commitId,
+        at: new Date(entry.ts).toISOString(),
+        op: entry.op,
+        by: entry.actor.botId ? `bot:${entry.actor.botId}` : entry.actor.kind,
+        ...(entry.actor.note ? { note: entry.actor.note } : {}),
+        ids: entry.ids.slice(0, 40),
+        counts: entry.counts,
+        sceneVersion: entry.sceneVersionAfter,
+        restorable: entry.hasBefore,
+      };
+      if (opts.includeGeometry && entry.hasBefore) {
+        const before = await loadSceneLogBefore(this.boardId, this.roomKey, entry.commitId).catch(() => null);
+        if (before) {
+          const wanted = opts.ids?.length ? new Set(opts.ids) : null;
+          row.before = before
+            .filter((element) => !wanted || wanted.has(element.id))
+            .map((element) => ({
+              id: element.id,
+              type: element.type,
+              x: Math.round(element.x),
+              y: Math.round(element.y),
+              width: Math.round(element.width || 0),
+              height: Math.round(element.height || 0),
+              isDeleted: element.isDeleted,
+              version: element.version,
+            }));
+        }
+      }
+      entries.push(row);
+    }
+    // The shared history also records what people did in the browser, which
+    // the bot's own journal never sees.
+    const seen = new Set(filtered.map((entry) => entry.historyEntryId).filter(Boolean));
+    const history = await listSceneHistory(this.boardId).catch(() => [] as SceneHistoryEntry[]);
+    for (const entry of history.slice(0, limit)) {
+      if (seen.has(entry.id) || filtered.some((row) => Math.abs(row.ts - entry.createdAt) < 1500)) {
+        continue;
+      }
+      entries.push({
+        commitId: entry.id,
+        at: new Date(entry.createdAt).toISOString(),
+        op: "snapshot",
+        by: entry.author ?? "unknown",
+        sceneVersion: entry.sceneVersion,
+        source: "history",
+        restorable: true,
+      });
+    }
+    entries.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+    const wanted = opts.ids?.length ? new Set(opts.ids) : null;
+    const tombstones = [...this.elements.values()]
+      .filter((element) => element.isDeleted && (!wanted || wanted.has(element.id)))
+      .sort((a, b) => b.updated - a.updated)
+      .slice(0, 50)
+      .map((element) => {
+        const text = asText(element).text;
+        return {
+          id: element.id,
+          type: element.type,
+          deletedAt: element.updated,
+          ...(typeof text === "string" && text.trim()
+            ? { textPreview: text.replace(/\s+/g, " ").slice(0, 40) }
+            : {}),
+        };
+      });
+    return {
+      entries: entries.slice(0, limit),
+      tombstones,
+      owned: [...this.ownedIds],
+      conflicts: [...this.conflicts.values()],
+      sceneVersion: this.currentSceneVersion(),
+    };
+  }
+
+  // A `reload` marker so a gap in the journal reads as "the process restarted
+  // here" instead of "nothing happened".
+  private async logReload(): Promise<void> {
+    try {
+      await appendSceneLogEntry(this.boardId, {
+        commitId: randomUUID(),
+        op: "reload",
+        ids: [],
+        counts: { created: 0, updated: 0, deleted: 0, revived: 0 },
+        sceneVersionBefore: 0,
+        sceneVersionAfter: this.currentSceneVersion(),
+        actor: { kind: "system", ...(this.botId ? { botId: this.botId } : {}), uid: this.uid },
+      });
+    } catch (error) {
+      logWarn("collab.journal.reload_failed", {
+        boardId: this.boardId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async repairScene(
+    codes: string[],
+    target: Target | undefined,
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { applied: Array<{ code: string; id: string }>; unknownCodes?: string[] } }> {
+    return this.write({ ...options, dryRun: options.dryRun ?? true }, (txn) => {
+      const scope = hasConditions(target)
+        ? resolveTarget(txn.liveElements(), target as Target).map((element) => element.id)
+        : undefined;
+      const wanted = new Set(codes.map(canonicalLintCode));
+      const repairable = new Set<string>([...REPAIRABLE_CODES, ...CORE_REPAIR_CODES]);
+      const unknownCodes = [...wanted].filter((code) => !repairable.has(code));
+      const applied: Array<{ code: string; id: string }> = [];
+      // Data fixes first (they are computed on the whole scene, tombstones
+      // included, and each one on top of the previous), then geometry.
+      const patches = planRepairs(txn.all(), { codes: [...wanted], ids: scope });
+      for (const { code, id, patch } of patches) {
+        const current = txn.live(id);
+        if (!current) continue;
+        txn.put(applyUpdate(current, patch as Partial<ExcalidrawElement>));
+        applied.push({ code, id });
+      }
+      applied.push(
+        ...repairCore(
+          txn,
+          wanted,
+          scope ?? txn.liveElements().map((element) => element.id),
+        ),
+      );
+      return { applied, ...(unknownCodes.length ? { unknownCodes } : {}) };
+    });
+  }
+
+  async upsertComposite(
+    plan: { items: CreateItem[]; removeIds: string[]; extraPatches?: Array<{ id: string; patch: Record<string, unknown> }> },
+    options: WriteCallOptions & { reflow?: ReflowOptions; previousBounds?: { x: number; y: number; width: number; height: number }; bounds?: { x: number; y: number; width: number; height: number } } = {},
+  ): Promise<Envelope & { result: { created: string[]; updated: string[]; removed: string[] } }> {
+    return this.write(options, (txn) => {
+      const result = upsertItems(txn, plan.items, {
+        removeIds: plan.removeIds,
+        context: this.createContext("replace"),
+      });
+      if (plan.extraPatches?.length) {
+        updateItems(txn, plan.extraPatches.map((entry) => ({ ...entry.patch, id: entry.id })));
+      }
+      if (options.reflow && options.previousBounds && options.bounds) {
+        pushBelow(txn, options.previousBounds, options.bounds, new Set(plan.items.map((item) => item.id as string)), options.reflow);
+      }
+      return result;
+    });
+  }
+
+  // ---- reads -------------------------------------------------------------
+
+  async describeScene(): Promise<ExcalidrawElement[]> {
+    await this.ensureConnected();
+    return this.liveElements();
+  }
+
+  async loadStored(): Promise<ExcalidrawElement[]> {
+    await this.ensureConnected();
+    return (await loadScene(this.boardId, this.roomKey)) ?? [];
+  }
+
+  async queryElements(
+    input: QueryOptions & { target?: Target; source?: "memory" | "stored" },
+  ): Promise<QueryResult & { sceneVersion: number; source?: "stored" }> {
+    await this.ensureConnected();
+    const stored = input.source === "stored";
+    const scene = stored
+      ? (await this.loadStored()).filter((element) => !element.isDeleted)
+      : this.liveElements();
+    const selected = hasConditions(input.target) ? resolveTarget(scene, input.target as Target) : scene;
+    const result = runQuery(scene, selected, input);
+    return {
+      ...result,
+      sceneVersion: stored ? getSceneVersion(scene) : this.currentSceneVersion(),
+      ...(stored ? { source: "stored" as const } : {}),
+    };
+  }
+
+  async validateScene(
+    options: LintScopeOptions & {
+      target?: Target;
+      checkPersisted?: boolean;
+      expected?: ExpectedScene;
+    },
+  ): Promise<ReturnType<typeof lintScene> & { sceneVersion: number }> {
+    await this.ensureConnected();
+    const { target, checkPersisted, expected, ...lintOptions } = options;
+    const live = this.liveElements();
+    const ids = hasConditions(target)
+      ? resolveTarget(live, target as Target).map((element) => element.id)
+      : lintOptions.ids;
+    const stored =
+      checkPersisted === false ? undefined : await this.loadStored().catch(() => undefined);
+    const result = lintScene(live, {
+      ...lintOptions,
+      ...(ids ? { ids } : {}),
+      ...(stored ? { stored } : {}),
+      ...(this.profile ? { boardProfile: this.profile } : {}),
+    });
+    if (expected) {
+      const extra = checkExpected(this.elements, expected);
+      result.findings.push(...(lintOptions.summaryOnly ? [] : extra));
+      for (const finding of extra) {
+        if (finding.severity === "error") result.summary.errors++;
+        else if (finding.severity === "warning") result.summary.warnings++;
+        else result.summary.infos++;
+      }
+    }
+    return { ...result, sceneVersion: this.currentSceneVersion() };
+  }
+
+  async createStack(
+    input: CreateStackInput,
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { stackId: string; members: string[] } }> {
+    return this.write(options, (txn) => createStack(txn, input));
+  }
+
+  // The elements a copy needs: the selection itself, plus the labels and
+  // frame children planCopy pulls in.
+  liveSnapshot(): ExcalidrawElement[] {
+    return this.liveElements();
+  }
+
+  async copyInto(
+    items: CreateItem[],
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { ids: string[] } }> {
+    return this.write(options, (txn) => createItems(txn, items, this.createContext("revive", this.profileFor(options))));
+  }
+
+  async applyOps(
+    ops: Array<Record<string, unknown>>,
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { applied: Array<{ op: string; ids: string[] }> } }> {
+    // Anything that needs a read (a restore source) is fetched before the
+    // transaction, so the ops themselves run without an await between them.
+    const sources = new Map<string, Map<string, ExcalidrawElement>>();
+    for (const op of ops) {
+      if (op.op === "restore" && typeof op.from === "string" && op.from !== "tombstone") {
+        sources.set(op.from, (await this.commitSource(op.from)).before);
+      }
+    }
+    return this.write(options, (txn) => {
+      const applied: Array<{ op: string; ids: string[] }> = [];
+      for (const op of ops) {
+        const kind = String(op.op);
+        switch (kind) {
+          case "create": {
+            const result = createItems(txn, (op.elements ?? []) as CreateItem[], this.createContext(op.onExisting as OnExisting, this.profileFor(options)));
+            applied.push({ op: kind, ids: result.ids });
+            break;
+          }
+          case "update": {
+            const result = updateItems(txn, (op.elements ?? []) as Patch[], { linkFor: this.linkFor });
+            applied.push({ op: kind, ids: result.updated });
+            break;
+          }
+          case "delete": {
+            const target: Target = {
+              ...((op.target as Target) ?? {}),
+              ...(Array.isArray(op.ids) ? { ids: op.ids as string[] } : {}),
+            };
+            const targets = hasConditions(target) ? resolveTarget(txn.liveElements(), target) : [];
+            applied.push({ op: kind, ids: deleteTargets(txn, targets, { force: !!op.force }).deleted });
+            break;
+          }
+          case "move": {
+            const targets = resolveTarget(txn.liveElements(), (op.target as Target) ?? {});
+            const result = moveElements(txn, targets, Number(op.dx ?? 0), Number(op.dy ?? 0), op.carry as Carry);
+            applied.push({ op: kind, ids: result.moved });
+            break;
+          }
+          case "restore": {
+            const source = typeof op.from === "string" ? sources.get(op.from) : undefined;
+            const result = restoreFrom(txn, (op.ids ?? []) as string[], (id) => {
+              if (source) return source.get(id);
+              const element = txn.get(id);
+              return element?.isDeleted ? element : undefined;
+            });
+            applied.push({ op: kind, ids: result.restored });
+            break;
+          }
+          default:
+            throw invalidArgs(`unknown op "${kind}"; use create, update, delete, move or restore`, {
+              field: "op",
+            });
+        }
+      }
+      return { applied };
+    });
+  }
+
+  async layoutFrames(
+    input: FrameLayoutOptions,
+    options: WriteCallOptions = {},
+  ): Promise<Envelope & { result: { moved: string[] } }> {
+    return this.write(options, (txn) => layoutFrames(txn, input));
+  }
+
+  async render(
+    options: RenderOptions & { format?: "png" | "svg"; groupId?: string; target?: Target },
+  ): Promise<{
+    format: "png" | "svg";
+    png?: string;
+    svg?: string;
+    tiles?: Array<{ region: Bounds; png?: string; svg?: string; width: number; height: number }>;
+    transform: RenderResult["transform"];
+    legend?: RenderResult["legend"];
+    legendOrder: RenderResult["legendOrder"];
+    fidelity: RenderResult["fidelity"];
+    readability: RenderResult["readability"];
+    sheet?: RenderResult["sheet"];
+    width: number;
+    height: number;
+    sceneVersion: number;
+  }> {
+    await this.ensureConnected();
+    const live = this.liveElements();
+    let ids = options.ids;
+    let region = options.region;
+    if (options.groupId) {
+      ids = resolveTarget(live, { groupId: options.groupId }).map((element) => element.id);
+    }
+    if (hasConditions(options.target)) {
+      const matched = resolveTarget(live, options.target as Target);
+      if (!matched.length) {
+        throw notFound("render target matched no elements");
+      }
+      region = getCommonBounds(matched);
+      ids = undefined;
+    }
+    const rendered: RenderResult = renderSvg([...this.elements.values()], {
+      ...options,
+      ids,
+      region,
+      legend: options.legend ?? "none",
+    });
+    const wantPng = options.format !== "svg";
+    const png = wantPng ? svgToPngBase64(rendered.svg) : null;
+    const tiles = rendered.tiles?.map((tile) => {
+      const tilePng = wantPng ? svgToPngBase64(tile.svg) : null;
+      return {
+        region: tile.region,
+        width: tile.width,
+        height: tile.height,
+        ...(tilePng ? { png: tilePng } : { svg: tile.svg }),
+      };
+    });
+    return {
+      format: png ? "png" : "svg",
+      ...(png ? { png } : { svg: rendered.svg }),
+      ...(tiles ? { tiles } : {}),
+      transform: rendered.transform,
+      ...(rendered.legend !== undefined ? { legend: rendered.legend } : {}),
+      legendOrder: rendered.legendOrder,
+      fidelity: rendered.fidelity,
+      readability: rendered.readability,
+      ...(rendered.sheet ? { sheet: rendered.sheet } : {}),
+      width: rendered.width,
+      height: rendered.height,
+      sceneVersion: this.currentSceneVersion(),
+    };
   }
 
   async getBounds(ids?: string[]): Promise<{
@@ -1478,10 +1927,7 @@ export class CollabBot {
   }> {
     await this.ensureConnected();
     const live = this.liveElements();
-    const targets =
-      ids && ids.length
-        ? live.filter((element) => ids.includes(element.id))
-        : live;
+    const targets = ids && ids.length ? resolveTarget(live, { ids }) : live;
     const bounds = getCommonBounds(targets);
     return {
       bounds,
@@ -1494,83 +1940,6 @@ export class CollabBot {
   async elementAt(x: number, y: number): Promise<ExcalidrawElement | null> {
     await this.ensureConnected();
     return elementAtPoint([...this.elements.values()], x, y);
-  }
-
-  private resolveTargets(selector: {
-    ids?: string[];
-    groupId?: string;
-  }): ExcalidrawElement[] {
-    const live = this.liveElements();
-    if (selector.groupId) {
-      const groupId = selector.groupId;
-      return live.filter((element) => (element.groupIds ?? []).includes(groupId));
-    }
-    if (selector.ids) {
-      const set = new Set(selector.ids);
-      return live.filter((element) => set.has(element.id));
-    }
-    return [];
-  }
-
-  private async commitCreations(
-    created: ExcalidrawElement[],
-    containerUpdates: ExcalidrawElement[],
-    opts: { select: boolean },
-  ): Promise<void> {
-    const all = [...containerUpdates, ...created];
-    if (!all.length) {
-      return;
-    }
-    for (const element of all) {
-      this.elements.set(element.id, element);
-    }
-    this.claimOwnership(created);
-    await this.commit(all, {
-      targets: created.length ? created : all,
-      select: opts.select,
-    });
-    this.recordWrites(all, "bot");
-  }
-
-  // Deleting a container cascades to its bound text, matching the live editor.
-  private async deleteResolved(
-    targets: ExcalidrawElement[],
-  ): Promise<{
-    deleted: string[];
-    detached: string[];
-    sceneVersion: number;
-  }> {
-    const ids = new Set(targets.map((element) => element.id));
-    for (const element of this.liveElements()) {
-      const container = asText(element).containerId;
-      if (typeof container === "string" && ids.has(container)) {
-        ids.add(element.id);
-      }
-    }
-    const deleted: ExcalidrawElement[] = [];
-    for (const id of ids) {
-      const current = this.elements.get(id);
-      if (!current || current.isDeleted) {
-        continue;
-      }
-      const removed = markDeleted(current);
-      this.elements.set(id, removed);
-      deleted.push(removed);
-    }
-    const detached = detachDeleted(this.liveElements(), ids);
-    for (const element of detached) {
-      this.elements.set(element.id, element);
-    }
-    const changed = [...deleted, ...detached];
-    if (changed.length) {
-      await this.commit(changed);
-      this.recordWrites(changed, "bot");
-    }
-    return {
-      deleted: deleted.map((element) => element.id),
-      detached: detached.map((element) => element.id),
-      sceneVersion: this.currentSceneVersion(),
-    };
   }
 
   private reconcileIncoming(elements: ExcalidrawElement[]): void {
@@ -1669,20 +2038,25 @@ export class CollabBot {
   }
 
   private scheduleResurrectionFlush(resurrected: ExcalidrawElement[]): void {
-    this.persistQueue = this.persistQueue
-      .then(() => this.flushResurrection(resurrected))
+    const ids = resurrected.map((element) => element.id);
+    this.holdForceWin(ids);
+    void this.enqueue(() => this.flushResurrection(resurrected))
       .catch((error) =>
         logError("collab.reconcile.resurrection_flush_failed", error, {
           boardId: this.boardId,
         }),
-      );
+      )
+      .finally(() => this.releaseForceWin(ids));
   }
 
   private async flushResurrection(
     resurrected: ExcalidrawElement[],
   ): Promise<void> {
     await this.broadcastUpdate(resurrected);
-    await persistScene(this.boardId, this.roomKey, [...this.elements.values()]);
+    const outcome = await persistScene(this.boardId, this.roomKey, [...this.elements.values()], {
+      reviveIds: new Set(this.pendingForceWin.keys()),
+    });
+    await this.adoptPersistOutcome(outcome);
     logInfo("collab.reconcile.resurrection_flushed", {
       boardId: this.boardId,
       count: resurrected.length,
@@ -1739,15 +2113,6 @@ export class CollabBot {
       }
     }
     return "bot";
-  }
-
-  private readback(
-    id: string,
-  ): { found: boolean; version?: number } {
-    const element = this.elements.get(id);
-    return element && !element.isDeleted
-      ? { found: true, version: element.version }
-      : { found: false };
   }
 
   private async connect(): Promise<void> {

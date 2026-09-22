@@ -36,8 +36,11 @@ import {
   listFolders,
 } from "./folders";
 import {buildMcpServer, type CreateBoardInput} from "./mcp";
+import {loadBoardScene, loadBoardSummary} from "./scene";
+import {type BoardProfile, loadProfile, type ProfileScope, saveProfile} from "./profile";
 import {createRateLimiter} from "./rateLimit";
 import {getFile, putFile} from "./files";
+import {exportRoute, pruneExports} from "./exports";
 import {
   logError,
   logInfo,
@@ -459,6 +462,19 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     }
     // decideBotBoardCreation only allows bot-scoped tokens, so botId is set.
     const botId = doc.botId as string;
+    if (input.dryRun) {
+      const quota = boardCreateLimiter.peek(botId);
+      return {
+        dryRun: true,
+        allowed: quota.used < quota.limit,
+        quota: {
+          limit: quota.limit,
+          used: quota.used,
+          resetAt: quota.resetAt ? new Date(quota.resetAt).toISOString() : null,
+        },
+        ...(targetFolder ? { folder: { folderId: targetFolder.folderId, name: targetFolder.name } } : {}),
+      };
+    }
     const verdict = boardCreateLimiter.take(botId);
     if (!verdict.allowed) {
       const retryAfterMin = Math.max(1, Math.ceil(verdict.retryAfterMs / 60_000));
@@ -583,36 +599,169 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     };
   };
 
-  const listBoards = async () => {
-    const boards = await listAccessibleBoards(account);
+  const listBoards = async (
+    input: { folderId?: string; query?: string; details?: boolean } = {},
+  ) => {
+    let boards = (await listAccessibleBoards(account)).map((board) => {
+      const url = getBoardUrl(board.boardId);
+      return url ? { ...board, url } : board;
+    });
     // Folder names are the owner's private organization: only bots allowed to
     // work with folders get to see which folder holds each board.
+    if (decideBotFolderAccess(!!doc.botId, botDoc).allowed) {
+      try {
+        const folders = await listFolders(account);
+        const folderOf = new Map<string, { folderId: string; name: string }>();
+        for (const folder of folders) {
+          for (const boardId of folder.boardIds) {
+            folderOf.set(boardId, { folderId: folder.folderId, name: folder.name });
+          }
+        }
+        boards = boards.map((board) => {
+          const folder = folderOf.get(board.boardId);
+          return folder ? { ...board, folder } : board;
+        });
+      } catch (error) {
+        // The board list is what the agent needs; folders are a bonus.
+        logError("mcp.list_boards.folders_failed", error);
+      }
+    } else if (input.folderId) {
+      requireFolderAccess("list_boards");
+    }
+    if (input.folderId) {
+      boards = boards.filter((board) => board.folder?.folderId === input.folderId);
+    }
+    if (input.query) {
+      const needle = input.query.toLowerCase();
+      boards = boards.filter((board) =>
+        `${board.title} ${board.description ?? ""}`.toLowerCase().includes(needle),
+      );
+    }
+    if (!input.details) {
+      return boards;
+    }
+    return Promise.all(
+      boards.map(async (board) => {
+        // Contents are only read for boards this bot is bound to — the same
+        // allow-list the drawing tools enforce.
+        if (doc.botId && !bindingFor(botDoc, board.boardId)) {
+          return board;
+        }
+        try {
+          return { ...board, ...(await boardDetails(board.boardId)) };
+        } catch (error) {
+          logWarn("mcp.list_boards.details_failed", {
+            boardId: board.boardId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return board;
+        }
+      }),
+    );
+  };
+
+  const boardDetails = (boardId: string) => loadBoardSummary(boardId);
+
+  // A board inherits the style profile of the folder it sits in, so the
+  // lookup needs that folder — resolved once per request.
+  let folderOfBoard: Promise<Map<string, string>> | null = null;
+  const folderIdFor = async (boardId: string): Promise<string | undefined> => {
     if (!decideBotFolderAccess(!!doc.botId, botDoc).allowed) {
-      return boards;
+      return undefined;
     }
-    let folders: Awaited<ReturnType<typeof listFolders>>;
-    try {
-      folders = await listFolders(account);
-    } catch (error) {
-      // The board list is what the agent needs; folders are a bonus.
-      logError("mcp.list_boards.folders_failed", error);
-      return boards;
+    if (!folderOfBoard) {
+      folderOfBoard = listFolders(account)
+        .then((folders) => {
+          const map = new Map<string, string>();
+          for (const folder of folders) {
+            for (const id of folder.boardIds) {
+              map.set(id, folder.folderId);
+            }
+          }
+          return map;
+        })
+        .catch(() => new Map<string, string>());
     }
-    const folderOf = new Map<string, { folderId: string; name: string }>();
-    for (const folder of folders) {
-      for (const boardId of folder.boardIds) {
-        folderOf.set(boardId, { folderId: folder.folderId, name: folder.name });
+    return (await folderOfBoard).get(boardId);
+  };
+
+  const loadBoardProfile = async (boardId: string): Promise<BoardProfile | null> =>
+    loadProfile({ boardId, folderId: await folderIdFor(boardId) });
+
+  const saveBoardProfile = async (scope: ProfileScope, profile: BoardProfile) => {
+    if (scope.folderId) {
+      requireFolderAccess("set_board_profile");
+      const folder = await getFolder(account, scope.folderId);
+      if (!folder) {
+        throw new FolderPermissionDeniedError(
+          `folder "${scope.folderId}" does not exist on this account; pick an id from list_folders`,
+        );
       }
     }
-    return boards.map((board) => {
-      const folder = folderOf.get(board.boardId);
-      return folder ? { ...board, folder } : board;
-    });
+    if (scope.boardId) {
+      // Changing how a board looks is a write to that board.
+      await resolveBot(scope.boardId);
+    }
+    return saveProfile(scope, profile);
+  };
+
+  // Same access decision as resolveBot, but reads the stored scene instead of
+  // joining the board's room — for queries across many boards.
+  const readBoardSnapshot = async (boardId: string) => {
+    const binding = doc.botId ? bindingFor(botDoc, boardId) : undefined;
+    const access = await authorize(boardId, account, { asBot: true });
+    if (!decideBotBoardAccess(!!doc.botId, binding, access).allowed) {
+      throw new BotAccessDeniedError(boardId);
+    }
+    return (await loadBoardScene(boardId)).filter((element) => !element.isDeleted);
+  };
+
+  const folderBoardIds = async (folderId: string): Promise<string[]> => {
+    requireFolderAccess("folder scope");
+    const folder = await getFolder(account, folderId);
+    if (!folder) {
+      throw new FolderPermissionDeniedError(
+        `folder "${folderId}" does not exist on this account; pick an id from list_folders`,
+      );
+    }
+    const reachable = new Set((await listAccessibleBoards(account)).map((board) => board.boardId));
+    return folder.boardIds.filter(
+      (boardId) => reachable.has(boardId) && (!doc.botId || !!bindingFor(botDoc, boardId)),
+    );
+  };
+
+  const getBotInfo = async () => {
+    const botId = doc.botId ?? null;
+    const quota = (limiter: typeof boardCreateLimiter) => {
+      const window = botId ? limiter.peek(botId) : { limit: 0, used: 0, resetAt: null };
+      return {
+        limit: window.limit,
+        used: window.used,
+        resetAt: window.resetAt ? new Date(window.resetAt).toISOString() : null,
+      };
+    };
+    return {
+      botId,
+      permissions: {
+        createBoards: decideBotBoardCreation(!!doc.botId, botDoc).allowed,
+        createFolders: decideBotFolderAccess(!!doc.botId, botDoc).allowed,
+      },
+      ...(botDoc ? { boards: (botDoc.boards ?? []).map((binding) => ({ boardId: binding.boardId, access: binding.role })) } : {}),
+      quotas: {
+        boardsPerHour: quota(boardCreateLimiter),
+        foldersPerHour: quota(folderCreateLimiter),
+      },
+    };
   };
 
   const server = buildMcpServer({
     resolveBot,
     listBoards,
+    getBotInfo,
+    folderBoardIds,
+    readBoardSnapshot,
+    loadBoardProfile,
+    saveBoardProfile,
     createBoard,
     setBoardDescription,
     renameBoard,
@@ -638,6 +787,10 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     throw error;
   }
 }));
+
+// The token in the path is the only credential: an export link is meant to be
+// pasted into a doc. It carries its own expiry and signature (src/exports.ts).
+app.get("/exports/:token", exportRoute);
 
 app.put(
   "/files/*",
@@ -667,7 +820,13 @@ app.use(
   },
 );
 
+const EXPORT_PRUNE_INTERVAL_MS = 60 * 60_000;
+
 app.listen(config.port, () => {
+  void pruneExports().catch(() => undefined);
+  setInterval(() => {
+    void pruneExports().catch(() => undefined);
+  }, EXPORT_PRUNE_INTERVAL_MS).unref();
   logInfo("backend.started", {
     port: config.port,
     firebaseProjectId: config.firebaseProjectId,

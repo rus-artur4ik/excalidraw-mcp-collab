@@ -297,6 +297,23 @@ const clipToEllipse = (
   return enter < exit ? [enter, exit] : null;
 };
 
+// Parametric range [enter, exit] ⊂ [0, 1] of segment a→b inside the element
+// (rectangle-like, diamond or ellipse), or null when it misses.
+export const segmentElementRange = (
+  element: ExcalidrawElement,
+  a: Point,
+  b: Point,
+): [number, number] | null => {
+  if ((element.width || 0) <= 0 || (element.height || 0) <= 0) {
+    return null;
+  }
+  const localA = unrotateToLocal(element, a[0], a[1]);
+  const localB = unrotateToLocal(element, b[0], b[1]);
+  return element.type === "ellipse"
+    ? clipToEllipse(element, localA, localB)
+    : clipToHalfPlanes(halfPlanesFor(element), localA, localB);
+};
+
 // Length of the part of segment a→b that runs inside the element, in scene units.
 export const segmentElementOverlap = (
   element: ExcalidrawElement,

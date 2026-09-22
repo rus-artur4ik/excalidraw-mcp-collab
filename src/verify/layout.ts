@@ -2,8 +2,8 @@ import ELK, {type ElkExtendedEdge, type ElkNode} from "elkjs";
 
 import {BOUND_TEXT_PADDING, DEFAULT_FONT_FAMILY} from "./model";
 import {containerSizeForText, measureText, wrapText} from "./textMetrics";
-import {ROLE_NAMES, ROLE_SHAPES, SIZE_LADDER} from "./styles";
-import type {CreateAttrs} from "../elements";
+import {MUTED_TEXT_COLOR, ROLE_NAMES, ROLE_SHAPES, SIZE_LADDER} from "./styles";
+import type {CreateItem} from "../engine/create";
 
 export type DiagramNode = {
   id: string;
@@ -13,9 +13,12 @@ export type DiagramNode = {
   width?: number;
   height?: number;
   group?: string;
+  layer?: number;
+  order?: number;
 };
 
 export type DiagramEdge = {
+  id?: string;
   from: string;
   to: string;
   label?: string;
@@ -27,22 +30,34 @@ export type DiagramEdge = {
 export type DiagramGroup = {
   id: string;
   label?: string;
+  strokeStyle?: "solid" | "dashed" | "dotted";
 };
 
+export type DiagramConstraint =
+  | { sameRank: string[] }
+  | { before: [string, string] };
+
 export type DiagramInput = {
+  diagramId?: string;
+  idPrefix?: string;
   nodes: DiagramNode[];
   edges: DiagramEdge[];
   groups?: DiagramGroup[];
   direction?: "DOWN" | "RIGHT" | "UP" | "LEFT";
   spacing?: number;
+  layout?: { nodeSpacing?: number; layerSpacing?: number; groupPadding?: number };
+  constraints?: DiagramConstraint[];
   origin?: { x: number; y: number };
   fontSize?: number;
   roughness?: number;
+  frameId?: string;
 };
 
 export type DiagramPlan = {
-  items: CreateAttrs[];
+  items: CreateItem[];
   nodeElementIds: Record<string, string>;
+  edgeElementIds: string[];
+  groupElementIds: Record<string, string>;
   bounds: { x: number; y: number; width: number; height: number };
 };
 
@@ -52,9 +67,9 @@ const NODE_MAX_LABEL_WIDTH = 220;
 const DEFAULT_SPACING = 48;
 const DEFAULT_FONT_SIZE = 16;
 const EDGE_LABEL_FONT_RATIO = 0.85;
-const GROUP_PADDING = 24;
-const GROUP_TITLE_SPACE = 36;
-const GROUP_STROKE = "#868e96";
+const DEFAULT_GROUP_PADDING = 32;
+const GROUP_STROKE = MUTED_TEXT_COLOR;
+const EDGE_LABEL_COLOR = "#495057";
 
 const MAX_DIAGRAM_NODES = 60;
 
@@ -128,11 +143,17 @@ const validateInput = (input: DiagramInput): void => {
     }
   }
   const groupIds = new Set((input.groups ?? []).map((group) => group.id));
+  for (const group of input.groups ?? []) {
+    if (ids.has(group.id)) {
+      throw new Error(`group id ${group.id} is also a node id; ids must be unique`);
+    }
+  }
   for (const node of input.nodes) {
     if (node.group && !groupIds.has(node.group)) {
       throw new Error(`node ${node.id} references unknown group ${node.group}`);
     }
   }
+  const edgeIds = new Set<string>();
   for (const edge of input.edges) {
     if (!ids.has(edge.from)) {
       throw new Error(`edge references unknown node: ${edge.from}`);
@@ -140,15 +161,93 @@ const validateInput = (input: DiagramInput): void => {
     if (!ids.has(edge.to)) {
       throw new Error(`edge references unknown node: ${edge.to}`);
     }
+    if (edge.id) {
+      if (edgeIds.has(edge.id) || ids.has(edge.id) || groupIds.has(edge.id)) {
+        throw new Error(`duplicate id: ${edge.id}`);
+      }
+      edgeIds.add(edge.id);
+    }
+  }
+  for (const constraint of input.constraints ?? []) {
+    const referenced = "sameRank" in constraint ? constraint.sameRank : constraint.before;
+    for (const id of referenced) {
+      if (!ids.has(id)) {
+        throw new Error(`constraint references unknown node: ${id}`);
+      }
+    }
   }
 };
 
+const spacingOptions = (input: DiagramInput): Record<string, string> => {
+  const nodeSpacing = input.layout?.nodeSpacing ?? input.spacing ?? DEFAULT_SPACING;
+  const layerSpacing = input.layout?.layerSpacing ?? Math.round(nodeSpacing * 1.5);
+  return {
+    "elk.spacing.nodeNode": String(nodeSpacing),
+    "elk.layered.spacing.nodeNodeBetweenLayers": String(layerSpacing),
+    "elk.spacing.edgeNode": String(Math.round(nodeSpacing / 2)),
+    "elk.layered.spacing.edgeNodeBetweenLayers": String(Math.round(nodeSpacing / 2)),
+    "elk.spacing.edgeLabel": "6",
+    "elk.edgeLabels.placement": "CENTER",
+  };
+};
+
+// Layer (partition) per node: explicit `layer`, then sameRank groups share
+// the smallest layer given to any of their members (or a fresh one).
+const partitionsOf = (input: DiagramInput): Map<string, number> => {
+  const partitions = new Map<string, number>();
+  for (const node of input.nodes) {
+    if (typeof node.layer === "number") partitions.set(node.id, Math.max(0, Math.round(node.layer)));
+  }
+  let next = Math.max(-1, ...partitions.values()) + 1;
+  for (const constraint of input.constraints ?? []) {
+    if (!("sameRank" in constraint)) continue;
+    const given = constraint.sameRank.map((id) => partitions.get(id)).filter((v): v is number => v !== undefined);
+    const layer = given.length ? Math.min(...given) : next++;
+    for (const id of constraint.sameRank) partitions.set(id, layer);
+  }
+  return partitions;
+};
+
+// Model order: nodes with `order` first by it; `before` pairs are enforced by
+// moving the later node right after the earlier one.
+const orderedNodes = (input: DiagramInput): DiagramNode[] => {
+  const nodes = [...input.nodes].sort((a, b) => {
+    const oa = typeof a.order === "number" ? a.order : Number.MAX_SAFE_INTEGER;
+    const ob = typeof b.order === "number" ? b.order : Number.MAX_SAFE_INTEGER;
+    return oa - ob;
+  });
+  for (const constraint of input.constraints ?? []) {
+    if (!("before" in constraint)) continue;
+    const [first, second] = constraint.before;
+    const i = nodes.findIndex((node) => node.id === first);
+    const j = nodes.findIndex((node) => node.id === second);
+    if (i > j) {
+      const [moved] = nodes.splice(i, 1);
+      nodes.splice(j, 0, moved);
+    }
+  }
+  return nodes;
+};
+
+const edgeLabelFont = (fontSize: number): number => Math.round(fontSize * EDGE_LABEL_FONT_RATIO);
+
 const buildElkGraph = (input: DiagramInput, fontSize: number): ElkNode => {
-  const spacing = input.spacing ?? DEFAULT_SPACING;
+  const groupPadding = input.layout?.groupPadding ?? DEFAULT_GROUP_PADDING;
+  const partitions = partitionsOf(input);
+  const usesOrder =
+    input.nodes.some((node) => typeof node.order === "number") ||
+    (input.constraints ?? []).some((constraint) => "before" in constraint);
   const groupChildren = new Map<string, ElkNode[]>();
   const rootChildren: ElkNode[] = [];
-  for (const node of input.nodes) {
-    const elkNode: ElkNode = { id: node.id, ...nodeSize(node, fontSize) };
+  for (const node of orderedNodes(input)) {
+    const partition = partitions.get(node.id);
+    const elkNode: ElkNode = {
+      id: node.id,
+      ...nodeSize(node, fontSize),
+      ...(partition !== undefined
+        ? { layoutOptions: { "elk.partitioning.partition": String(partition) } }
+        : {}),
+    };
     if (node.group) {
       const list = groupChildren.get(node.group) ?? [];
       list.push(elkNode);
@@ -157,44 +256,79 @@ const buildElkGraph = (input: DiagramInput, fontSize: number): ElkNode => {
       rootChildren.push(elkNode);
     }
   }
+  const spacing = spacingOptions(input);
   for (const group of input.groups ?? []) {
+    const titleSpace = group.label ? Math.ceil(measureText(group.label, fontSize, DEFAULT_FONT_FAMILY).height) + BOUND_TEXT_PADDING * 2 : 0;
     rootChildren.push({
       id: group.id,
       layoutOptions: {
-        "elk.padding": `[top=${GROUP_TITLE_SPACE + GROUP_PADDING},left=${GROUP_PADDING},bottom=${GROUP_PADDING},right=${GROUP_PADDING}]`,
+        // Spacing is per parent in ELK: without repeating it here the nodes
+        // inside a group fall back to ELK's cramped defaults.
+        ...spacing,
+        "elk.padding": `[top=${groupPadding + titleSpace},left=${groupPadding},bottom=${groupPadding},right=${groupPadding}]`,
       },
       children: groupChildren.get(group.id) ?? [],
     });
   }
-  const edges: ElkExtendedEdge[] = input.edges.map((edge, i) => ({
-    id: `edge_${i}`,
-    sources: [edge.from],
-    targets: [edge.to],
-  }));
+  const labelFont = edgeLabelFont(fontSize);
+  const edges: ElkExtendedEdge[] = input.edges.map((edge, i) => {
+    const measured = edge.label ? measureText(edge.label, labelFont, DEFAULT_FONT_FAMILY) : null;
+    return {
+      id: `edge_${i}`,
+      sources: [edge.from],
+      targets: [edge.to],
+      ...(measured
+        ? {
+            labels: [
+              {
+                id: `edge_${i}_label`,
+                text: edge.label,
+                width: Math.ceil(measured.width) + 8,
+                height: Math.ceil(measured.height) + 4,
+              },
+            ],
+          }
+        : {}),
+    };
+  });
   return {
     id: "root",
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": input.direction ?? "DOWN",
       "elk.hierarchyHandling": "INCLUDE_CHILDREN",
-      "elk.spacing.nodeNode": String(spacing),
-      "elk.layered.spacing.nodeNodeBetweenLayers": String(Math.round(spacing * 1.5)),
-      "elk.spacing.componentComponent": String(spacing * 2),
+      ...spacing,
+      "elk.spacing.componentComponent": String(
+        (input.layout?.nodeSpacing ?? input.spacing ?? DEFAULT_SPACING) * 2,
+      ),
+      ...(partitions.size ? { "elk.partitioning.activate": "true" } : {}),
+      ...(usesOrder
+        ? {
+            "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+            "elk.layered.crossingMinimization.forceNodeModelOrder": "true",
+          }
+        : {}),
     },
     children: rootChildren,
     edges,
   };
 };
 
-export const planDiagram = async (
-  input: DiagramInput,
-  newElementId: () => string,
-): Promise<DiagramPlan> => {
+const edgeIdFor = (edge: DiagramEdge, prefix: string, used: Set<string>): string => {
+  if (edge.id) return `${prefix}${edge.id}`;
+  const base = `${prefix}${edge.from}->${edge.to}`;
+  let id = base;
+  for (let n = 2; used.has(id); n++) id = `${base}#${n}`;
+  return id;
+};
+
+export const planDiagram = async (input: DiagramInput): Promise<DiagramPlan> => {
   validateInput(input);
   const fontSize = input.fontSize ?? DEFAULT_FONT_SIZE;
   const roughness = input.roughness ?? 1;
   const originX = input.origin?.x ?? 0;
   const originY = input.origin?.y ?? 0;
+  const prefix = input.idPrefix ?? (input.diagramId ? `${input.diagramId}:` : "");
 
   const graph = await new ELK().layout(buildElkGraph(input, fontSize));
 
@@ -205,37 +339,48 @@ export const planDiagram = async (
 
   const nodeElementIds: Record<string, string> = {};
   for (const node of input.nodes) {
-    nodeElementIds[node.id] = newElementId();
+    nodeElementIds[node.id] = `${prefix}${node.id}`;
   }
+  const groupElementIds: Record<string, string> = {};
+  const tag = (kind?: string): Record<string, unknown> => ({
+    ...(input.diagramId ? { customData: { diagramId: input.diagramId } } : {}),
+    ...(kind ? { kind } : {}),
+    ...(input.frameId ? { frameId: input.frameId } : {}),
+  });
 
-  const items: CreateAttrs[] = [];
+  const items: CreateItem[] = [];
 
   for (const group of input.groups ?? []) {
     const placed = groupPlacements.get(group.id);
     if (!placed) {
       continue;
     }
+    const id = `${prefix}${group.id}`;
+    groupElementIds[group.id] = id;
     items.push({
+      ...tag("group-frame"),
+      id,
       type: "rectangle",
       x: placed.x,
       y: placed.y,
       width: placed.width,
       height: placed.height,
       strokeColor: GROUP_STROKE,
-      strokeStyle: "dashed",
+      // Dashed means "[planned]" on these boards; a cluster is solid.
+      strokeStyle: group.strokeStyle ?? "solid",
       backgroundColor: "transparent",
       roughness,
-    });
-    if (group.label) {
-      items.push({
-        type: "text",
-        text: group.label,
-        x: placed.x + GROUP_PADDING,
-        y: placed.y + (GROUP_TITLE_SPACE - fontSize) / 2,
-        fontSize,
-        strokeColor: GROUP_STROKE,
-      });
-    }
+      ...(group.label
+        ? {
+            label: group.label,
+            textAlign: "left",
+            verticalAlign: "top",
+            labelFontSize: fontSize,
+            labelColor: "#495057",
+            fit: "none",
+          }
+        : {}),
+    } as CreateItem);
   }
 
   for (const node of input.nodes) {
@@ -244,6 +389,7 @@ export const planDiagram = async (
       throw new Error(`layout produced no position for node ${node.id}`);
     }
     items.push({
+      ...tag(),
       id: nodeElementIds[node.id],
       type: node.shape ?? ROLE_SHAPES[node.role ?? ""] ?? "rectangle",
       role: node.role ?? "process",
@@ -254,11 +400,19 @@ export const planDiagram = async (
       height: placed.height,
       fontSize,
       roughness,
-    });
+    } as CreateItem);
   }
 
+  const edgeElementIds: string[] = [];
+  const used = new Set<string>();
+  const labelFont = edgeLabelFont(fontSize);
   for (const edge of input.edges) {
+    const id = edgeIdFor(edge, prefix, used);
+    used.add(id);
+    edgeElementIds.push(id);
     items.push({
+      ...tag(),
+      id,
       type: "arrow",
       fromId: nodeElementIds[edge.from],
       toId: nodeElementIds[edge.to],
@@ -266,28 +420,18 @@ export const planDiagram = async (
       roughness,
       ...(edge.startArrowhead !== undefined ? { startArrowhead: edge.startArrowhead } : {}),
       ...(edge.endArrowhead !== undefined ? { endArrowhead: edge.endArrowhead } : {}),
-    });
-    if (edge.label) {
-      const from = nodePlacements.get(edge.from) as Placed;
-      const to = nodePlacements.get(edge.to) as Placed;
-      const labelFontSize = Math.round(fontSize * EDGE_LABEL_FONT_RATIO);
-      const measured = measureText(edge.label, labelFontSize, DEFAULT_FONT_FAMILY);
-      const midX = (from.x + from.width / 2 + to.x + to.width / 2) / 2;
-      const midY = (from.y + from.height / 2 + to.y + to.height / 2) / 2;
-      items.push({
-        type: "text",
-        text: edge.label,
-        x: midX - measured.width / 2 + 8,
-        y: midY - measured.height / 2,
-        fontSize: labelFontSize,
-        strokeColor: "#495057",
-      });
-    }
+      // Edge labels are bound to their arrow (they ride along and stay on it).
+      ...(edge.label
+        ? { label: edge.label, labelFontSize: labelFont, labelColor: EDGE_LABEL_COLOR }
+        : {}),
+    } as CreateItem);
   }
 
   return {
     items,
     nodeElementIds,
+    edgeElementIds,
+    groupElementIds,
     bounds: {
       x: originX,
       y: originY,

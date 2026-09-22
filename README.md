@@ -110,37 +110,88 @@ returns them verbatim.
   into one of the owner's folders, or with `folderId: null` takes it out of
   every folder; a board sits in at most one folder, so the move is one batch.
   Needs the same folders permission. Returns `{ boardId, title, folder }`.
-- `describe_scene`, `query_elements` — current elements (viewer + editor).
-  `fields` projects the columns you need and `limit`/`offset` page a large scene.
-- `batch_create`, `update_elements`, `delete_elements`, `delete_region` —
-  single-commit batch writes (editor only; a viewer token gets `read-only
-  access`). Batch covers N=1, so there are no singular create/update/delete tools.
-  `batch_create` also binds arrows to shapes inline (`fromId`/`toId`) and drops
-  elements into a frame (`frameId`); `update_elements` edits a container's label
-  (`{ id, label }`) and honors an explicit `index`, and skips ids that no longer
-  exist (returning them in `missing`) instead of aborting the batch.
-- `bring_to_front`, `send_to_back`, `reorder` — z-order by re-indexing only, so
-  ids/bindings/frame membership stay stable and a container's label rides along.
-- `group_elements`, `ungroup_elements`, `create_frame`, `frame_add_children` —
-  grouping/frames. New frames sink to the bottom of the z-order.
+- `get_bot_info` — the bot's permissions (create boards / folders), bound
+  boards and quotas with usage and reset time, before it tries anything.
+- `query_elements` — reads with the shared
+  `target` selector (ids, frameIds, frameName, groupId, region, type, role,
+  kind, slot, textContains, textRegex, hasLink, after), compact summaries with
+  labels inline, `format` rows/md/graph, `aggregate:"bounds"`, a `maxChars` cut
+  with `nextCursor`, `source:"stored"` for the persisted copy, and `scope`
+  (folder or board list) to search a whole series from stored scenes.
+- `batch_create`, `update_elements`, `move_elements`, `delete_elements`,
+  `restore`, `repair_scene`, `create_diagram`, `set_table`, `set_legend`,
+  `layout_frames`, `create_frame`, `frame_add_children`, `arrange`,
+  `group_elements`, `ungroup_elements`, `reorder`, `replace_text` — writes. Each one plans
+  in a staged transaction (`src/engine/`), lints what it touched before and
+  after, and commits once. They all take `options` (`dryRun`, `strict`,
+  `lint`, `expect`, `snap`, `verify`, `note`) and return one envelope:
+  `changed {created, updated, deleted, revived}`, `labels`, `persisted`,
+  `ignoredFields`, `relaidOut`/`rerouted`/`collateral`, `lint {new, resolved,
+  persisting}`. See `read_me` (`src/guide.ts`) for the agent-facing contract.
+- `validate_scene`, `measure_text`, `render`, `board_log`, `export` — read-only
+  (MCP `readOnlyHint`). `render` covers the whole board, a rectangle, a
+  `target` (e.g. a frame by name) or a set of ids, with tiles and sheets for
+  large areas; `export` writes the picture to disk and returns a link that
+  expires instead of pushing bytes through the conversation.
+- `copy_elements`, `create_stack`, `apply_ops` — duplicate a block (also onto
+  another board), keep a column's gaps through later edits, and run several
+  operations as one commit.
+- `set_board_profile` — the style contract of a board or a whole folder
+  (`boardProfiles/{board:<id>|folder:<id>}`, server-only): the type scale,
+  spacing, what each palette role and stroke style means, and the patterns that
+  must never wrap. Planners take their defaults from it (so a table on the
+  seventh board matches the first), `set_legend {fromProfile:true}` draws the
+  legend from it, and `validate_scene {profile:"visual-qa"}` checks the board
+  against it (`style_font_size_off_profile`, `type_scale_violation`,
+  `hierarchy_inverted`, `semantic_conflict`, `role_color_mismatch`). A board's
+  own profile wins field by field over its folder's; passing only `scope` reads
+  it back. Without a profile those rules are skipped, not guessed at.
 
-See `docs/verification-tools.md` for the read/measure/render/validate tools,
-bound text (`containerId`/`label`), line `points`, and the lint rules.
+Tools that were folded into others (the `read_me` "Which tool" section carries
+the table for agents): `describe_scene`, `get_bounds`, `element_at`,
+`render_scene`/`render_region`/`render_element`, `delete_region`,
+`bring_to_front`/`send_to_back`, `connect`, `scene_diff`, `get_diagram_guide`.
 
-Each mutating tool: applies the change (bumps `version`, fresh `versionNonce`,
-`updated`, fractional `index` after the last element), broadcasts a
-`SCENE_UPDATE` over `server-broadcast`, merge-persists the scene into Firestore
-in a transaction (so a concurrent human session is never clobbered), and appends
-a history entry attributed `Бот <name>`.
+Errors are structured: `{error:{code, message, retryable, retryAfterSec?,
+details}}` with codes not_found, forbidden, rate_limited, conflict,
+invalid_args, unsupported_field, internal.
+
+See `docs/verification-tools.md` for the engine, the lint, the renderer and the
+composite planners.
+
+Each commit broadcasts a `SCENE_UPDATE` over `server-broadcast`, merge-persists
+the scene into Firestore in a transaction (so a concurrent human session is
+never clobbered), writes a journal entry in that same transaction, and appends
+a history entry attributed `Бот <name>`. Commits of one bot are serialized
+through a queue, so a persist never snapshots another write half-way through.
+
+The journal lives in `scenes/{roomId}/log/{commitId}`: what changed, by whom,
+with the note the agent passed, and an encrypted copy of the affected elements
+**as they were before** that commit (skipped for very large commits). That is
+what `board_log` reads and what lets `restore {from: commitId}` (and
+`mode:"revert"`) put a board back long after the 24 h tombstones are gone.
+Entries carry `expiresAt` for a Firestore TTL policy — enable it once per
+project:
+
+```bash
+gcloud firestore fields ttls update expiresAt \
+  --collection-group=log --enable-ttl --project=excalidraw-team
+``` The
+persist step reports back which stored copies won the version race; the bot
+adopts them into memory, so its reads never show what a reload would lose, and
+an element the write deliberately created (or revived) is lifted above any
+stored tombstone of the same id. A re-created id always gets a version above
+its tombstone.
 
 The bot keeps stable ownership of the ids it creates. Only for a short grace
-window after it last wrote an element (`RESURRECTION_WINDOW_MS`) does it resist
-an incoming deletion — that window covers the stale-tombstone race where an
-out-of-sync live session drops a just-created element. Once the window passes,
-a human deleting or editing a bot element is respected and wins immediately, so
-edits made after the bot is done are never rolled back. `scene_diff` reports
-ownership (`byOrigin.bot`, `owned`) and any contested ids (`conflicts`);
-`batch_create` surfaces the same `conflicts`.
+window after it last wrote an element (`RESURRECTION_WINDOW_MS`, 12 s, at most
+3 times) does it resist an incoming deletion — that window covers the
+stale-tombstone race where an out-of-sync live session drops a just-created
+element. Once the window passes, a human deleting or editing a bot element is
+respected and wins immediately.
+
+Text metrics and the PNG renderer use the client's fonts, vendored as TTF in
+`assets/fonts/` (regenerate with `assets/fonts/build.py`).
 
 ## Setup
 
@@ -190,7 +241,12 @@ The agent connecting with that config draws on the board as the token's user.
 
 - Run behind TLS and set `PUBLIC_BASE_URL` so `mcpUrl` in token responses is
   correct.
-- Mount `DATA_DIR` on persistent storage (it replaces Firebase Storage).
+- Mount `DATA_DIR` on persistent storage (it replaces Firebase Storage, and
+  holds `exports/` — the files behind `export` links).
+- Set `INTERNAL_SECRET`: it signs export links. With it empty the server signs
+  with a per-process key, so every export link dies on restart.
+- The proxy must route `/exports/` to the backend (both `proxy/nginx.conf` and
+  `k8s/proxy.conf` in the stack repo do).
 - The service holds in-memory `CollabBot` instances keyed by connect token; it
   is intended to run as a single process. Horizontal scaling would need a
   shared bot registry / sticky routing (not implemented).

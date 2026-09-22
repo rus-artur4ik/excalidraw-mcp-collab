@@ -1,158 +1,114 @@
-# Verification & self-review MCP tools
+# Engine, verification and rendering
 
-Tools that let an AI agent inspect, measure, validate, render and safely mutate a
-collab board so it can review its own drawing. All logic lives in `src/verify/`
-as pure functions over the in-memory element model; `CollabBot` exposes them and
-`mcp.ts` registers the tools.
+How the drawing tools work inside. The agent-facing contract is `read_me`
+(`src/guide.ts`); this is for people changing the server.
 
-## Tools
+## Layout of the code
 
-| Tool | Access | Purpose |
-| --- | --- | --- |
-| `validate_scene` | read | Deterministic lint; scope with `ids`/`region`, trim with `codes`/`minSeverity`/`summaryOnly`. Returns machine-actionable findings with element ids + suggested fixes. |
-| `measure_text` | read | Wrapped text width/height for a font, plus the container size needed to fit it. |
-| `get_bounds` | read | Rotation-aware bounding box of the whole board or a set of ids. |
-| `element_at` | read | Top-most element under a scene point (z-order aware hit-test). |
-| `scene_diff` | read | Elements changed since a given `sceneVersion`, split by origin (bot vs incoming human edits). |
-| `render_scene` | read | SVG (always) + PNG (when `@resvg/resvg-js` is present) of the board, with Set-of-Mark id labels, an optional grid, a coordinate transform and an element legend sorted by z-order (`legendOrder: "z-ascending"`; each entry carries its `z` rank and fractional `index`). |
-| `render_region` | read | Same, clipped to a scene rectangle. |
-| `render_element` | read | Same, cropped to one or more elements by `ids` or `groupId` (focus render). |
-| `get_diagram_guide` | read | Static style/workflow guide for agents: semantic roles + palette, size ladder, density caps, the mandatory render→validate loop and a worked `create_diagram` example. Also served as MCP resources (`guide://excalidraw-team/diagram-guide.md`, `guide://excalidraw-team/palette.json`). |
-| `batch_create` | write | Create N elements in a single broadcast/persist/history commit. Supports semantic `role` styling (palette colors applied server-side), bound text (`containerId`/`label`), line/arrow `points`, `frameId` (drop into a frame) and arrows bound to shapes inline via `fromId`/`toId`. Covers N=1, so there is no singular `create_element`. `return:"ids"` keeps the response small. |
-| `create_diagram` | write | Graph-shaped diagrams without coordinates: takes `nodes` (+`role`/`shape`/`group`) and `edges` (+labels), sizes nodes to their labels via the text engine, runs ELK layered layout (direction, spacing, clusters as dashed containers) and commits everything as role-styled shapes with bound labels and bound arrows. Returns the created elements, a `nodes` input-id→element-id map and the diagram `bounds` for `render_region`. Rejects >60 nodes. |
-| `update_elements` | write | Patch N elements in a single commit. Patch a container with `{ id, label }` to edit/add its bound-text label without knowing the text id; an explicit `index` is honored (re-stacks). Covers N=1. `return:"ids"` supported. |
-| `delete_elements` | write | Delete N elements by `ids` or by `groupId` in a single commit (bound text cascades with its container). Covers N=1. |
-| `delete_region` | write | Delete everything inside a scene rectangle (`mode` intersect/contain, optional `type` filter). |
-| `bring_to_front` / `send_to_back` | write | Raise/lower elements in the z-order by re-indexing only (ids, bindings, frame membership preserved; a container's label rides along). |
-| `reorder` | write | Move elements just above/below an `anchorId` in the z-order (re-indexing only). |
-| `group_elements` / `ungroup_elements` | write | Assign / remove a shared `groupId` so a set moves, renders and deletes as one unit. |
-| `create_frame` | write | Create a frame from explicit bounds or sized to fit `childIds`; the frame sinks to the bottom of the z-order so it never covers content, and children keep their stacking. |
-| `frame_add_children` | write | Add existing elements (and their labels) to an existing frame by setting `frameId`. |
-| `connect` | write | Create a properly bound arrow between two shapes (`FixedPointBinding` + back-references). For many arrows, prefer `fromId`/`toId` in `batch_create`. |
-| `arrange` | write | Re-layout a set of elements (grid / row / column / align / distribute). |
-
-`update_elements` / `batch_create` / `create_diagram` / `connect` additionally
-return inline `warnings` (a focused lint pass on the affected element) so the
-agent gets self-review feedback without a separate call, plus a `next` hint
-steering it into the render→validate self-review loop. The server also ships
-these workflow rules in the MCP initialize `instructions`.
-Inline warnings are computed at commit time: when several writes race in parallel,
-a warning may reflect state a sibling write has not applied yet — re-run
-`validate_scene` for the authoritative picture.
-
-### Text, labels and lines
-- **Text auto-sizes.** A `text` element with no explicit `width` is sized to its
-  content via the same engine as `measure_text` (no more magic `100×100`). Pass
-  `width` to get a fixed wrapping box (`autoResize` is turned off and the height
-  follows the wrapped content).
-- **Bound text.** Set `containerId` on a `text` to bind it to an existing
-  rectangle/ellipse/diamond, or set `label` on the container itself to create the
-  bound text in the same call. Bound text is centered, sized to the container,
-  grows the container height if needed, moves with it, and is excluded from
-  `overlap` warnings.
-- **Lines/arrows.** Pass `points` (relative to `x,y`) for real polylines. A
-  line/arrow created from `width`/`height` only is auto-converted to a 2-point
-  segment so it is never an invisible zero-length element.
-
-Every write tool also returns `sceneVersion` and a `readback` confirmation
-(re-read of the element from the authoritative in-memory map after commit), which
-surfaces dropped or concurrently-superseded writes.
-
-## Grounding: how the agent maps a visual problem to an element id
-
-`render_scene` returns three things together:
-
-1. **image** — SVG/PNG the model looks at, with a **Set-of-Mark** badge drawn on
-   each element (`①`, `②`, … or `A1`).
-2. **transform** — `{ scale, offsetX, offsetY, width, height }` so any pixel maps
-   back to scene coordinates: `sceneX = pixelX/scale - offsetX`.
-3. **legend** — `[{ label, id, type, bbox, textPreview }]` mapping each badge to
-   its element id.
-
-So the agent never localizes from raw pixels: a visual issue → badge → legend →
-id. Most geometric issues never need the image at all because `validate_scene`
-already returns the offending ids.
-
-## Render fidelity
-
-The SVG emitter is a **schematic** renderer (clean vector rectangles/ellipses/
-diamonds/arrows/text), not the hand-drawn rough.js look of the live editor. It is
-geometrically faithful (positions, sizes, text wrapping with measured widths,
-colors, z-order), which is what self-review needs — overlaps, overflow,
-misalignment and occlusion are all visible. Embeddables/iframes render as
-placeholder boxes. Text width uses a pure-JS advance-width table (≈5–10% error vs
-the browser); height is exact. If `@resvg/resvg-js` is not installed, PNG is
-omitted and the SVG string is still returned.
-
-PNG rasterization needs fonts in the runtime image — the Dockerfile installs
-`fontconfig` + `font-dejavu` and resvg falls back to `DejaVu Sans`. Render scale
-is clamped to `[0.1, 4]` and total output capped at 4 megapixels so a large board
-or a huge `scale` cannot block the event loop. Color values are XML-escaped, so
-hostile/malformed colors cannot corrupt the SVG.
-
-## Deterministic lint rules (`validate_scene`)
-
-Each finding: `{ code, severity, elementIds, message, suggestion? }`.
-`severity ∈ {error, warning, info}`. `suggestion` is machine-actionable **with
-concrete values** — apply it as-is instead of re-deriving numbers:
-`overlap` → `{ action:"move", id, dx, dy }` (smallest single-axis move that
-separates, +20px margin), `text_overflow` → `{ action:"resize", id, height, width? }`,
-`low_contrast` → `{ action:"recolor", id, strokeColor }` (closest palette color
-passing the threshold), `alignment_near_miss` → `{ action:"align", edge, ids,
-patch:{ id, x|y } }` (feed `patch` straight to `update_elements`),
-`style_many_stroke_colors` → `{ action:"recolor", palette }`.
-
-### Structural (error)
-| code | trigger |
+| Path | What |
 | --- | --- |
-| `degenerate_size` | rectangle/ellipse/diamond/image/frame/text with `width<=0` or `height<=0`. |
-| `empty_text` | text element whose `text` is empty/whitespace. |
-| `arrow_dangling_binding` | `startBinding`/`endBinding.elementId` not present (or deleted) — dropped on load. |
-| `binding_backref_missing` | arrow bound to S but `S.boundElements` lacks `{id:arrow,type:"arrow"}`, or S lists an arrow that has no matching binding — breaks move-tracking. |
-| `binding_invalid` | binding present but missing `mode` or `fixedPoint` — dropped by `restore.ts`. |
-| `bound_text_below_container` | bound text has `index <= container.index`, so the container fill paints over the label and hides it. Fix with `bring_to_front` on the text. |
+| `src/engine/txn.ts` | `SceneTxn`: a staged view over the bot's element map, plus the `WriteReport` every write fills. |
+| `src/engine/write.ts` | `planWrite` (expect check → plan → strict check → snap → lint delta → change summary) and the response `Envelope`. |
+| `src/engine/create.ts` | Creation: ids, revive semantics, labels (`<id>:label`), bound arrows, anchors, `fit`, `wrap`, `link`, `styleFrom`. |
+| `src/engine/update.ts` | Patches: field whitelist and `ignoredFields`, type changes, label edits, rebinding, `containerId`, `fit`, `fitToChildren`, `expect`. |
+| `src/engine/follow.ts` | What follows a changed shape: its label is re-laid out, bound arrow ends are re-aimed. |
+| `src/engine/boundText.ts` | Client-parity label box: `computeBoundTextPosition`, `getContainerCoords`, the arrow-label anchor, container growth, opt-in balanced wrap. |
+| `src/engine/arrows.ts` | Bound arrow paths: anchors, `straight`/`orthogonal` routes, the client's `updateBoundPoint` for moved shapes. |
+| `src/engine/move.ts` | `move_elements`: frames carry children, containers labels, arrows translate or re-aim. |
+| `src/engine/selector.ts` | The shared `target` selector. |
+| `src/engine/query.ts` | `query_elements` projections and formats (json, rows, md, graph). |
+| `src/engine/lifecycle.ts` | Delete (cascade, detach, protected), restore (tombstone / history), core repairs. |
+| `src/engine/upsert.ts` | Desired-state apply for composites and diagram re-runs (patch only what differs, keep z-order). |
+| `src/engine/reflow.ts`, `frames.ts`, `expected.ts` | Push-below reflow, `layout_frames`, `validate_scene {expected}`. |
+| `src/engine/stack.ts`, `copy.ts` | Stacks that keep their gaps across writes, and `copy_elements` planning (id remap, arrows re-bound to the copies). |
+| `src/exports.ts` | `export`: the file on disk plus the signed, expiring link (`GET /exports/:token`). |
+| `src/profile.ts` | The board/folder style profile: load, merge (board over folder), validate, resolve against `DEFAULT_PROFILE`. |
+| `src/compose/*` | Pure planners: `set_table`, `set_legend`, code card, callout, badge. |
+| `src/verify/*` | Metrics (`textMetrics.ts` + `fonts.ts`), lint, renderer, ELK layout, palette. |
 
-### Visual defects (warning)
-| code | trigger | threshold |
-| --- | --- | --- |
-| `overlap` | two eligible shapes' rotated AABBs overlap | `intersection / min(areaA,areaB) > 0.15`; excludes container↔bound-text, frame↔child, same-group pairs, lines/arrows, and any text whose box is fully inside a shape (treated as a label). |
-| `text_overflow` | bound text exceeds container's bound-text max box, or non-autoResize standalone text exceeds its box | wrapped measured size vs `getBoundTextMaxWidth/Height`. |
-| `occlusion` | opaque solid element fully covers a lower-z element with content | `E.index > O.index`, `opacity>=90`, AABB-contains. |
-| `off_canvas_outlier` | element entirely outside the cluster of all others | gap `> max(4000, 2×clusterDiagonal)`, only with `>=3` elements. |
-| `duplicate` | same-type near-identical twin | `|Δx|,|Δy|<=1.5`, `|Δw|,|Δh|<=1.5`, same colors + text. |
-| `arrow_unbound_endpoint` | unbound arrow endpoint within binding range of a shape | warning `<=6px` (gap), info `<=15px` (`maxBindingDistance`). |
-| `arrow_zero_length` | arrow whose points are coincident / 0×0 bbox. | |
-| `invisible_opacity` | `opacity<=0`. | |
-| `out_of_range` | `opacity∉[0,100]`, `roughness∉{0,1,2}`, `strokeWidth<=0`, `fontSize<=0`. | |
-| `invalid_enum` | unknown `fillStyle`/`strokeStyle`/`fontFamily`/arrowhead. | |
-| `low_contrast` | text vs its background contrast below WCAG | `<4.5` normal, `<3.0` for `fontSize>=24`. Background is the top-most solid opaque shape below the text in z-order (so white-on-a-colored-header is judged against the header), falling back to the canvas color when nothing backs it. |
+## The write pipeline
 
-### Style / layout hints (info)
-| code | trigger |
-| --- | --- |
-| `alignment_near_miss` | an edge/center coordinate differs by `1px <= d <= 4px` (probably meant to align). Suppressed when the pair is already aligned (`<1px`) on another anchor of the same axis — e.g. centered shapes of different sizes no longer nag about their top edges. |
-| `style_many_fonts` | more than 2 distinct font families among text. |
-| `style_many_stroke_colors` | more than 6 distinct stroke colors. |
+1. `CollabBot.write(options, fn)` checks write access and the socket.
+2. `planWrite` builds a `SceneTxn` over the live map, checks `options.expect`
+   (element versions), runs `fn`, rejects the write on `strict:"error"` if any
+   field would be ignored, applies `snap`, lints the touched ids before and
+   after (`lint.new` = findings the write introduced), and snapshots the change
+   summary.
+3. A dry run returns here. Otherwise the staged elements go into the live map,
+   are broadcast, and `persistScene` merges them into Firestore in a
+   transaction. Ids the write (re)created are passed as `reviveIds`, so a
+   stored tombstone with a higher version cannot swallow them (that was the
+   cause of the lost elements: a re-created id used to get version 1). Stored
+   copies that won the merge replace the bot's copies (`persisted.lost` when
+   that hit something the write changed); re-versioned creations are
+   re-broadcast.
+4. A journal entry (`scenes/{roomId}/log/{commitId}`) is written inside the same
+   transaction: op, ids, counts, actor, note, and an encrypted copy of the
+   affected elements as they were before the commit. `board_log` reads it (with
+   the shared history), `restore {from: commitId}` restores from it, and
+   `mode:"revert"` also deletes what that commit created. Entries carry
+   `expiresAt` for the Firestore TTL policy (30 days).
+5. `commitId` in the envelope is the journal entry id; the matching history
+   snapshot has the same id under `historyEntryId`.
 
-`validate_scene` returns `{ sceneVersion, summary:{errors,warnings,infos}, findings, graph }`
-where `graph` is an informational connectivity summary `{ nodes, edges, isolated }`
-built from shapes + bound arrows (useful for flowchart review). Rule categories
-and thresholds can be toggled via tool params.
+Commits of one bot run through a queue (`enqueue`), and every id a write
+(re)creates is held in `pendingForceWin` until its commit finishes, so a
+concurrent write's snapshot cannot push a fresh revival back into a tombstone.
 
-**Scoping (keeps the response small on big/shared boards).** `ids` or `region`
-restrict findings to those touching the selected elements (the lint still runs
-against the whole scene, so an overlap with an out-of-scope element still
-surfaces); when scoped, the response also carries `scope:{ kind, matched }`.
-`codes` keeps only the listed rule codes, `minSeverity` drops anything below the
-given severity, and `summaryOnly` returns the counts/graph with an empty
-`findings` list. All filters compose, and `summary` reflects the filtered set.
+Creation always gives a previously deleted id `tombstone.version + 1` and keeps
+its stacking slot, frame and groups unless the item sets them.
 
-## Versioning / consistency notes
-- `sceneVersion` = sum of element `version`s (`scene.ts:getSceneVersion`); it is
-  monotonic because versions only increase, so `scene_diff(since)` thresholds on
-  the per-write `sceneVersionAfter` recorded in a capped write-log.
-- Every mutating tool bumps `version` (`= prior+1`) with a fresh `versionNonce`
-  so the change propagates through other clients' `reconcileIncoming`
-  (`version >` check).
-- Session-scoped (in-memory): the write-log lives with the bot and is lost on
-  `dispose`.
+## Following shapes
+
+A patch that changes a shape's geometry re-lays out its label with the
+client's formula (alignment and font kept; the box grows the way the client
+grows it unless the same patch sets the size) and re-aims every bound arrow:
+the moved end is recomputed from the stored `fixedPoint` toward the
+neighbouring point (both ends for a 2-point arrow), middle points stay. Arrow
+labels sit where the client draws them: the middle point for an odd number of
+points, otherwise the middle of the middle segment.
+
+## Rendering and metrics
+
+Text is measured with glyph advances (+ GPOS kerning) read from the client's
+fonts, vendored in `assets/fonts/` (`build.py` regenerates them from the
+frontend's woff2 files). The same files are handed to resvg, so PNG widths
+match the browser. Each render reports `fidelity` (texts whose font or glyphs
+had to fall back) and `readability` (scale, smallest text in pixels). The
+renderer also masks arrow strokes under their labels, keeps whitespace, draws
+real arrowhead types, frame names and clipping, and supports `highlight`,
+`legend` modes, `tiles` and `sheet` layouts.
+
+## Composites
+
+`src/compose/*` planners are pure: they read the live scene and return the
+full desired state (`items`, `removeIds`, `extraPatches`, bounds). The core
+applies it with `upsertItems`, which patches only what differs and restacks the
+composite in planned order. Tables keep their merged spec in the root
+element's `customData.tableSpec`; cell ids are `<tableId>:<row>:<col>`.
+
+## The board profile
+
+`boardProfiles/{board:<id>|folder:<id>}` — its own collection, because
+`firestore.rules` validates board and folder documents field by field for
+browser writes, so an extra key on them would break the app's own renames.
+Only the server (Admin SDK) touches it.
+
+`loadProfile({boardId, folderId})` merges the folder's document under the
+board's, field by field; `resolveProfile` fills the gaps from
+`DEFAULT_PROFILE`. The MCP layer looks a board's profile up once per server
+(`profileOf`, cleared by `set_board_profile`) and hands it to the bot
+(`useProfile`), which passes it to the planners (`planTable`, `planLegend`,
+`planCodeCard`, `planCallout`), to label wrapping (`nowrap`) and to
+`lintScene` as `boardProfile`. A call can override it per write
+(`options.boardProfile`). The profile rules are `needsProfile` and live in the
+`visual-qa` lint profile, so a board without a contract is never linted
+against guessed defaults.
+
+## Lint
+
+`lintScene` / `validate_scene` — see the rule list in `read_me` (section
+`lint`) and `src/verify/lint.ts`. Every suggestion is `{tool, args, risk}` with
+`args` valid for `SUGGESTION_TOOL_SCHEMAS[tool]` in `src/toolSchemas.ts`, or
+`{reason}`. Deterministic integrity fixes run through `repair_scene`
+(`src/verify/repair.ts` + `repairCore` in `src/engine/lifecycle.ts`).

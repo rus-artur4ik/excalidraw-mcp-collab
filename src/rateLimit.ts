@@ -5,6 +5,8 @@ export type RateLimitVerdict =
 export type RateLimiter = {
   /** Records a hit and reports whether it fit inside the window. */
   take: (key: string, now?: number) => RateLimitVerdict;
+  /** Reads the window without recording a hit. */
+  peek: (key: string, now?: number) => { limit: number; used: number; resetAt: number | null };
 };
 
 // In-memory sliding window. The service is single-process by design (see
@@ -44,6 +46,14 @@ export const createRateLimiter = (opts: {
       recent.push(now);
       hits.set(key, recent);
       return { allowed: true };
+    },
+    peek: (key, now = Date.now()) => {
+      const recent = (hits.get(key) ?? []).filter((at) => at > now - windowMs);
+      return {
+        limit,
+        used: recent.length,
+        resetAt: recent.length ? recent[0] + windowMs : null,
+      };
     },
   };
 };

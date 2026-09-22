@@ -148,7 +148,7 @@ describe("planCreations arrow binding", () => {
   it("throws when a bound endpoint is missing", () => {
     expect(() =>
       planCreations([{ type: "arrow", fromId: "ghost", toId: "s2" }], []),
-    ).toThrow(/connect source not found/);
+    ).toThrow(/arrow source not found/);
   });
 
   it("throws when an arrow is bound to itself", () => {
@@ -459,7 +459,7 @@ describe("deleting never leaves a dangling binding", () => {
   it("regression guard: deleting the arrow without detaching leaves two errors", () => {
     const scene = deleteWithoutDetaching(connectedScene(), new Set(["hunt"]));
     const { findings } = lintScene(scene);
-    const backrefs = findings.filter((f) => f.code === "binding_backref_missing");
+    const backrefs = findings.filter((f) => f.code === "binding_backref_stale");
     expect(backrefs).toHaveLength(2);
   });
 

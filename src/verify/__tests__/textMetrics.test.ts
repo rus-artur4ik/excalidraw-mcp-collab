@@ -6,12 +6,24 @@ import {
     getBoundTextMaxHeight,
     getBoundTextMaxWidth,
     largestFittingFontSize,
-    layoutBoundText,
     layoutText,
     measureText,
     wrapText,
 } from "../textMetrics";
 import {el} from "./factory";
+import {type LabelStyle, layoutLabel} from "../../engine/boundText";
+
+// The label layout the write engine uses (client formula).
+const layoutBoundText = (
+  container: Parameters<typeof layoutLabel>[0],
+  text: string,
+  fontSize: number,
+  fontFamily: number,
+  verticalAlign: LabelStyle["verticalAlign"] = "middle",
+) => {
+  const layout = layoutLabel(container, text, { fontSize, fontFamily, textAlign: "center", verticalAlign });
+  return { ...layout, containerHeight: layout.containerHeight };
+};
 
 describe("measureText", () => {
   it("computes height as fontSize * lineHeight * lineCount (Excalifont 1.25)", () => {

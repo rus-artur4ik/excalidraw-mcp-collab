@@ -10,6 +10,7 @@ import {
     MONOSPACE_FAMILIES,
 } from "./model";
 import {getElementBounds} from "./geometry";
+import {isFontFamilyAvailable, lineWidthEm} from "./fonts";
 import type {ExcalidrawElement} from "../types";
 
 const ADVANCE_PER_MILLE: Record<string, number> = {
@@ -114,7 +115,7 @@ const DEFAULT_ADVANCE_PER_MILLE = 560;
 const MONOSPACE_ADVANCE_PER_MILLE = 600;
 const WIDE_GLYPH_ADVANCE_PER_MILLE = 1000;
 
-const charAdvanceEm = (char: string, monospace: boolean): number => {
+const legacyCharAdvanceEm = (char: string, monospace: boolean): number => {
   if (monospace) {
     return MONOSPACE_ADVANCE_PER_MILLE / 1000;
   }
@@ -129,18 +130,38 @@ export interface TextMetricsProvider {
   getLineWidth(text: string, fontSize: number, fontFamily?: number): number;
 }
 
-const builtInProvider: TextMetricsProvider = {
+/**
+ * The Helvetica-like advance table used before the real fonts were vendored.
+ * Still measures glyphs no vendored font has (emoji, CJK) and everything when
+ * the font files cannot be loaded.
+ */
+export const legacyTextMetricsProvider: TextMetricsProvider = {
   getLineWidth(text, fontSize, fontFamily) {
     const monospace = MONOSPACE_FAMILIES.has(fontFamily ?? 0);
     let total = 0;
     for (const char of text) {
-      total += charAdvanceEm(char, monospace);
+      total += legacyCharAdvanceEm(char, monospace);
     }
     return total * fontSize;
   },
 };
 
-let activeProvider: TextMetricsProvider = builtInProvider;
+// Same numbers as the browser's canvas measureText: the client's own font files,
+// advances plus pair kerning.
+export const fontTextMetricsProvider: TextMetricsProvider = {
+  getLineWidth(text, fontSize, fontFamily) {
+    if (!isFontFamilyAvailable(fontFamily)) {
+      return legacyTextMetricsProvider.getLineWidth(text, fontSize, fontFamily);
+    }
+    const monospace = MONOSPACE_FAMILIES.has(fontFamily ?? 0);
+    return (
+      lineWidthEm(text, fontFamily, (char) => legacyCharAdvanceEm(char, monospace)) *
+      fontSize
+    );
+  },
+};
+
+let activeProvider: TextMetricsProvider = fontTextMetricsProvider;
 
 export const setTextMetricsProvider = (provider: TextMetricsProvider): void => {
   activeProvider = provider;
@@ -286,68 +307,6 @@ export const layoutText = (
     height: Math.ceil(measured.height),
     lineHeight: lineHeightForFamily(fontFamily),
     text: wrapped,
-  };
-};
-
-export type BoundTextLayout = TextLayout & {
-  x: number;
-  y: number;
-  containerHeight: number;
-};
-
-const layoutLinearLabel = (
-  container: ExcalidrawElement,
-  wrapped: string,
-  width: number,
-  height: number,
-  fontFamily: number,
-): BoundTextLayout => {
-  const [minX, minY, maxX, maxY] = getElementBounds(container);
-  return {
-    width,
-    height,
-    lineHeight: lineHeightForFamily(fontFamily),
-    text: wrapped,
-    x: (minX + maxX) / 2 - width / 2,
-    y: (minY + maxY) / 2 - height / 2,
-    containerHeight: container.height || 0,
-  };
-};
-
-export const layoutBoundText = (
-  container: ExcalidrawElement,
-  text: string,
-  fontSize: number = DEFAULT_FONT_SIZE,
-  fontFamily: number = DEFAULT_FONT_FAMILY,
-  verticalAlign: "top" | "middle" | "bottom" = "middle",
-): BoundTextLayout => {
-  const maxWidth = getBoundTextMaxWidth(container, fontSize);
-  const wrapped = wrapText(text, fontSize, fontFamily, maxWidth);
-  const measured = measureText(wrapped, fontSize, fontFamily);
-  const width = Math.min(Math.ceil(measured.width), Math.floor(maxWidth));
-  const height = Math.ceil(measured.height);
-  if (isLinear(container)) {
-    return layoutLinearLabel(container, wrapped, width, height, fontFamily);
-  }
-  const containerHeight = Math.max(
-    container.height || 0,
-    height + BOUND_TEXT_PADDING * 2,
-  );
-  const top = container.y || 0;
-  const y =
-    verticalAlign === "top"
-      ? top + BOUND_TEXT_PADDING
-      : verticalAlign === "bottom"
-        ? top + containerHeight - height - BOUND_TEXT_PADDING
-        : top + (containerHeight - height) / 2;
-  return {
-    width,
-    height,
-    lineHeight: lineHeightForFamily(fontFamily),
-    text: wrapped,
-    x: (container.x || 0) + ((container.width || 0) - width) / 2,
-    y,
-    containerHeight,
   };
 };
 

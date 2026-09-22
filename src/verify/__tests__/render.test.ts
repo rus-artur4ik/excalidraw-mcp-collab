@@ -65,11 +65,9 @@ describe("renderSvg linear fallback", () => {
     const result = renderSvg([
       el({ type: "line", id: "rail", x: 10, y: 20, width: 150, height: 0 }),
     ]);
-    const match = result.svg.match(/<polyline points="([^"]+)"/);
+    const match = result.svg.match(/<path d="M([^"L]+)L([^"LC]+)"/);
     expect(match).toBeTruthy();
-    const coords = match![1].trim().split(" ");
-    expect(coords).toHaveLength(2);
-    expect(coords[0]).not.toBe(coords[1]);
+    expect(match![1].trim()).not.toBe(match![2].trim());
   });
 });
 

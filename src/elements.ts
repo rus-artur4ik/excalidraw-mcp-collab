@@ -2,17 +2,10 @@ import {randomBytes, randomUUID} from "crypto";
 
 import {generateKeyBetween, generateNKeysBetween} from "fractional-indexing";
 
-import {
-  asLinear,
-  CONTAINER_TYPES,
-  DEFAULT_FONT_FAMILY,
-  DEFAULT_FONT_SIZE,
-  isBindable,
-  isLinear,
-} from "./verify/model";
-import {planConnection, type RouteMode} from "./verify/bindings";
-import {layoutBoundText, layoutText} from "./verify/textMetrics";
-import {applyRole} from "./verify/styles";
+import {asLinear, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE} from "./verify/model";
+import {layoutText} from "./verify/textMetrics";
+import {createItems, type CreateItem} from "./engine/create";
+import {SceneTxn} from "./engine/txn";
 import type {ExcalidrawElement} from "./types";
 
 export type CreateAttrs = Partial<ExcalidrawElement> & {
@@ -25,7 +18,7 @@ export type CreateAttrs = Partial<ExcalidrawElement> & {
   lintIgnore?: string[];
   points?: [number, number][];
   waypoints?: [number, number][];
-  route?: RouteMode;
+  route?: "direct" | "orthogonal" | "straight";
   containerId?: string;
   frameId?: string | null;
   fromId?: string;
@@ -36,11 +29,6 @@ export type CreateAttrs = Partial<ExcalidrawElement> & {
 };
 
 const randomInteger = (): number => randomBytes(4).readUInt32BE(0);
-
-const boundVerticalAlign = (
-  value: unknown,
-): "top" | "middle" | "bottom" =>
-  value === "top" || value === "bottom" ? value : "middle";
 
 const elementDefaults = (): Omit<
   ExcalidrawElement,
@@ -252,98 +240,9 @@ export const reassertElement = (
   updated: Date.now(),
 });
 
-const addBackref = (
-  element: ExcalidrawElement,
-  refId: string,
-  refType: string,
-): { id: string; type: string }[] => {
-  const existing = Array.isArray(element.boundElements)
-    ? element.boundElements
-    : [];
-  return existing.some((entry) => entry.id === refId)
-    ? existing
-    : [...existing, { id: refId, type: refType }];
-};
-
-const buildBoundText = (
-  container: ExcalidrawElement,
-  attrs: CreateAttrs,
-  existing: readonly ExcalidrawElement[],
-): { text: ExcalidrawElement; container: ExcalidrawElement } => {
-  const fontSize =
-    typeof attrs.fontSize === "number" ? attrs.fontSize : DEFAULT_FONT_SIZE;
-  const fontFamily =
-    typeof attrs.fontFamily === "number" ? attrs.fontFamily : DEFAULT_FONT_FAMILY;
-  const raw = String(attrs.text ?? attrs.label ?? "");
-  const verticalAlign = boundVerticalAlign(attrs.verticalAlign);
-  const layout = layoutBoundText(container, raw, fontSize, fontFamily, verticalAlign);
-  const { label, labelColor, ...textAttrs } = attrs;
-  const text = buildNewElement(
-    {
-      ...textAttrs,
-      type: "text",
-      containerId: container.id,
-      text: layout.text,
-      originalText: raw,
-      x: layout.x,
-      y: layout.y,
-      width: layout.width,
-      height: layout.height,
-      fontSize,
-      fontFamily,
-      lineHeight: layout.lineHeight,
-      strokeColor: attrs.strokeColor ?? labelColor ?? "#1e1e1e",
-      textAlign: attrs.textAlign ?? "center",
-      verticalAlign,
-      autoResize: false,
-    },
-    existing,
-  );
-  return {
-    text,
-    container: applyUpdate(container, {
-      boundElements: addBackref(container, text.id, "text"),
-      ...(isLinear(container) ? {} : { height: layout.containerHeight }),
-    }),
-  };
-};
-
-type LabelStyle = {
-  labelColor?: string;
-  fontSize?: number;
-  fontFamily?: number;
-  textAlign?: string;
-  verticalAlign?: string;
-};
-
-// A container carries no text of its own, so these style its label.
-const labelStyleOf = (raw: CreateAttrs): LabelStyle => ({
-  labelColor: raw.labelColor,
-  fontSize: raw.labelFontSize ?? (raw.fontSize as number | undefined),
-  fontFamily: raw.labelFontFamily ?? (raw.fontFamily as number | undefined),
-  textAlign: raw.textAlign as string | undefined,
-  verticalAlign: raw.verticalAlign as string | undefined,
-});
-
-const LABEL_KEYS = [
-  "label",
-  "labelColor",
-  "labelFontSize",
-  "labelFontFamily",
-  "fontSize",
-  "fontFamily",
-  "textAlign",
-  "verticalAlign",
-] as const;
-
-const withoutLabelKeys = (raw: CreateAttrs): CreateAttrs => {
-  const rest = { ...raw };
-  for (const key of LABEL_KEYS) {
-    delete rest[key];
-  }
-  return rest;
-};
-
+// Plan creations against an existing scene without committing them: the
+// engine's createItems on a throwaway transaction. `created` are new elements,
+// `containerUpdates` existing ones it had to touch (back-references, sizes).
 export const planCreations = (
   rawItems: CreateAttrs[],
   existing: readonly ExcalidrawElement[],
@@ -352,154 +251,19 @@ export const planCreations = (
   containerUpdates: ExcalidrawElement[];
   labels: Record<string, string>;
 } => {
-  const items = rawItems.map((item) => applyRole(item) as CreateAttrs);
-  const working = [...existing];
+  const txn = new SceneTxn(existing);
+  createItems(txn, rawItems as CreateItem[]);
   const created: ExcalidrawElement[] = [];
-  const createdIndex = new Map<string, number>();
-  const containerUpdates = new Map<string, ExcalidrawElement>();
-  const labels: Record<string, string> = {};
-  const replace = (element: ExcalidrawElement) => {
-    const i = working.findIndex((w) => w.id === element.id);
-    if (i >= 0) {
-      working[i] = element;
-    }
-  };
-  const pushCreated = (element: ExcalidrawElement) => {
-    createdIndex.set(element.id, created.length);
-    created.push(element);
-    working.push(element);
-  };
-  // A container the same batch is creating is patched in place; only a
-  // pre-existing one becomes a separate containerUpdate.
-  const recordContainerUpdate = (container: ExcalidrawElement) => {
-    const at = createdIndex.get(container.id);
-    if (at !== undefined) {
-      created[at] = container;
+  const containerUpdates: ExcalidrawElement[] = [];
+  for (const element of txn.changed()) {
+    const before = txn.original(element.id);
+    if (before && !before.isDeleted) {
+      containerUpdates.push(element);
     } else {
-      containerUpdates.set(container.id, container);
+      created.push(element);
     }
-    replace(container);
-  };
-  const find = (id: string): ExcalidrawElement | undefined =>
-    working.find((w) => w.id === id);
-
-  const attachLabel = (
-    container: ExcalidrawElement,
-    label: string,
-    style: LabelStyle,
-  ) => {
-    const bound = buildBoundText(
-      container,
-      { type: "text", text: label, ...style },
-      working,
-    );
-    recordContainerUpdate(bound.container);
-    pushCreated(bound.text);
-    labels[container.id] = bound.text.id;
-  };
-
-  const isBindingArrow = (raw: CreateAttrs): boolean =>
-    raw.type === "arrow" &&
-    typeof raw.fromId === "string" &&
-    typeof raw.toId === "string";
-
-  const endpointsPresent = (raw: CreateAttrs): boolean => {
-    const from = raw.fromId ? find(raw.fromId) : undefined;
-    const to = raw.toId ? find(raw.toId) : undefined;
-    return !!from && !from.isDeleted && !!to && !to.isDeleted;
-  };
-
-  const processItem = (raw: CreateAttrs) => {
-    if (isBindingArrow(raw)) {
-      if (raw.fromId === raw.toId) {
-        throw new Error("cannot connect an element to itself");
-      }
-      const from = find(raw.fromId as string);
-      const to = find(raw.toId as string);
-      if (!from || from.isDeleted) {
-        throw new Error(`connect source not found: ${raw.fromId}`);
-      }
-      if (!to || to.isDeleted) {
-        throw new Error(`connect target not found: ${raw.toId}`);
-      }
-      if (!isBindable(from) || !isBindable(to)) {
-        throw new Error("both endpoints must be bindable shapes to connect");
-      }
-      const arrowId = typeof raw.id === "string" ? raw.id : randomUUID();
-      const plan = planConnection(from, to, {
-        arrowId,
-        mode: raw.bindMode,
-        startArrowhead: raw.startArrowhead,
-        endArrowhead: raw.endArrowhead,
-        waypoints: raw.waypoints,
-        route: raw.route,
-      });
-      const {
-        fromId,
-        toId,
-        bindMode,
-        startArrowhead,
-        endArrowhead,
-        waypoints,
-        route,
-        label,
-        ...rest
-      } = raw;
-      const arrowAttrs = withoutLabelKeys(rest as CreateAttrs);
-      const arrow = buildNewElement(
-        { ...arrowAttrs, ...plan.arrow, id: arrowId },
-        working,
-      );
-      pushCreated(arrow);
-      recordContainerUpdate(
-        applyUpdate(from, { boundElements: plan.fromBoundElements }),
-      );
-      recordContainerUpdate(
-        applyUpdate(to, { boundElements: plan.toBoundElements }),
-      );
-      if (typeof label === "string") {
-        attachLabel(arrow, label, labelStyleOf(raw));
-      }
-      return;
-    }
-    if (raw.type === "text" && typeof raw.containerId === "string") {
-      const container = find(raw.containerId);
-      if (!container || container.isDeleted) {
-        throw new Error(`container not found: ${raw.containerId}`);
-      }
-      if (!CONTAINER_TYPES.has(container.type) && !isLinear(container)) {
-        throw new Error(`element ${container.id} is not a text container`);
-      }
-      const bound = buildBoundText(container, raw, working);
-      pushCreated(bound.text);
-      recordContainerUpdate(bound.container);
-      labels[container.id] = bound.text.id;
-      return;
-    }
-    if (typeof raw.label === "string" && CONTAINER_TYPES.has(raw.type)) {
-      const container = buildNewElement(withoutLabelKeys(raw), working);
-      pushCreated(container);
-      attachLabel(container, raw.label, labelStyleOf(raw));
-      return;
-    }
-    pushCreated(buildNewElement(raw, working));
-  };
-
-  // Bind arrows whose endpoints are created later in the same batch in a second
-  // pass, so `[arrow, shapeA, shapeB]` ordering binds instead of aborting.
-  const deferredArrows: CreateAttrs[] = [];
-  for (const raw of items) {
-    if (isBindingArrow(raw) && !endpointsPresent(raw)) {
-      deferredArrows.push(raw);
-      continue;
-    }
-    processItem(raw);
   }
-  for (const raw of deferredArrows) {
-    processItem(raw);
-  }
-
-  return { created, containerUpdates: [...containerUpdates.values()], labels };
+  return { created, containerUpdates, labels: { ...txn.report.labels } };
 };
 
 // A survivor still pointing at a deleted id is a `binding_backref_missing` error.

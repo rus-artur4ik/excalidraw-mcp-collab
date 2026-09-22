@@ -63,6 +63,7 @@ describe("create_board tool", () => {
       "description",
       "visibility",
       "folderId",
+      "dryRun",
     ]);
   });
 
