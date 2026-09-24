@@ -208,7 +208,11 @@ describe.skipIf(!isPngAvailable())("rasterized text", () => {
     const { Resvg } = require("@resvg/resvg-js");
     const options = resvgRenderOptions();
     // Vendored fonts only: faster, and nothing else could draw the text.
-    return new Resvg(svg, { ...options, font: { ...options.font, loadSystemFonts: false } }).render();
+    const image = new Resvg(svg, { ...options, font: { ...options.font, loadSystemFonts: false } }).render();
+    // `pixels` is a getter that copies the whole RGBA buffer on every access: read it
+    // once. Indexing it per pixel allocated width*height copies (8 GB peak, which got
+    // the CI agent OOMKilled).
+    return { pixels: image.pixels, width: image.width, height: image.height };
   };
 
   const inkColumns = (image: RawImage): [number, number] => {
