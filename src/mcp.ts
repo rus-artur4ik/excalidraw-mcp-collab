@@ -6,6 +6,7 @@ import {BOARD_DESCRIPTION_MAX_LENGTH, BoardEditDeniedError} from "./boards";
 import {BoardCreationDeniedError} from "./bots";
 import {type CreatedFolder, FolderPermissionDeniedError, type FolderSummary} from "./folders";
 import {logError, logInfo, logWarn} from "./logger";
+import {countToolCall} from "./metrics";
 import {type ArrangeOptions, containerSizeForText, measureText, ROLE_NAMES, wrapText,} from "./verify";
 import {ELEMENT_KINDS} from "./customData";
 import {
@@ -948,6 +949,7 @@ const retryAfterFrom = (message: string): Record<string, unknown> => {
 };
 
 const toolError = (name: string, error: unknown, startedAt: number) => {
+  countToolCall(name, "error");
   if (error instanceof ToolError) {
     logWarn("mcp.tool.rejected", { tool: name, code: error.code });
     return errorResult(error.toJSON());
@@ -993,6 +995,7 @@ const runTool = async (name: string, fn: () => Promise<unknown>) => {
   try {
     const result = await fn();
     logInfo("mcp.tool.succeeded", { tool: name, durationMs: Date.now() - startedAt });
+    countToolCall(name, "ok");
     return textResult(result);
   } catch (error) {
     return toolError(name, error, startedAt);
@@ -1016,6 +1019,7 @@ const runRawTool = async (
   try {
     const result = await fn();
     logInfo("mcp.tool.succeeded", { tool: name, durationMs: Date.now() - startedAt });
+    countToolCall(name, "ok");
     return result;
   } catch (error) {
     return toolError(name, error, startedAt);

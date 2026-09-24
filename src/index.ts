@@ -41,6 +41,8 @@ import {type BoardProfile, loadProfile, type ProfileScope, saveProfile} from "./
 import {createRateLimiter} from "./rateLimit";
 import {getFile, putFile} from "./files";
 import {exportRoute, pruneExports} from "./exports";
+import {loadBoardStats} from "./boardStats";
+import {countConnect, startBoardStatsRefresher, startMetricsServer} from "./metrics";
 import {
   logError,
   logInfo,
@@ -322,6 +324,7 @@ const resolveConnectToken = (req: Request): string | undefined => {
 app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
   const connectToken = resolveConnectToken(req);
   if (!connectToken) {
+    countConnect("missing_token");
     logWarn("mcp.connect.missing_token");
     res.status(401).json({ error: "missing connect token" });
     return;
@@ -336,6 +339,7 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
 
   const doc = await getToken(connectToken);
   if (!doc || doc.revoked) {
+    countConnect("invalid_token");
     logWarn("mcp.connect.invalid_token", {
       tokenFound: !!doc,
       revoked: doc?.revoked ?? false,
@@ -351,6 +355,7 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
   // (no botId) stay account-wide.
   const botDoc = doc.botId ? await getBot(doc.botId) : null;
   if (doc.botId && (!botDoc || botDoc.disabled)) {
+    countConnect("bot_unavailable");
     logWarn("mcp.connect.bot_unavailable", {
       botMissing: !botDoc,
       disabled: botDoc?.disabled ?? false,
@@ -358,6 +363,8 @@ app.all("/mcp", express.json(), asyncRoute(async (req, res) => {
     res.status(403).json({ error: "bot is disabled or no longer exists" });
     return;
   }
+
+  countConnect("ok");
 
   if (!doc.lastUsedAt || Date.now() - doc.lastUsedAt > 60_000) {
     void touchToken(connectToken);
@@ -821,12 +828,17 @@ app.use(
 );
 
 const EXPORT_PRUNE_INTERVAL_MS = 60 * 60_000;
+const BOARD_STATS_INTERVAL_MS = 5 * 60_000;
 
 app.listen(config.port, () => {
   void pruneExports().catch(() => undefined);
   setInterval(() => {
     void pruneExports().catch(() => undefined);
   }, EXPORT_PRUNE_INTERVAL_MS).unref();
+  startMetricsServer(Number(process.env.METRICS_PORT ?? 9464));
+  startBoardStatsRefresher(loadBoardStats, BOARD_STATS_INTERVAL_MS, (error) =>
+    logError("metrics.board_stats.failed", error),
+  );
   logInfo("backend.started", {
     port: config.port,
     firebaseProjectId: config.firebaseProjectId,
